@@ -167,6 +167,7 @@ export interface VerifiedOrderQuote {
   confirmed_at: string;
   upi_uri: string;
   public_bill_id: string;
+  bill_page_url?: string;
   payment_qr_snapshot?: PaymentQrSnapshot | null;
   pdf_ready: boolean;
   bill_status: BillStatus;
@@ -176,6 +177,7 @@ export interface VerifiedOrderQuote {
   customer_session_id: string;
   server_signature: string;
   notes: string;
+  idempotent_replay?: boolean;
 }
 
 export interface GeneratedBillResult {

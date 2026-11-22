@@ -1222,6 +1222,13 @@ app.post('/api/owner/upload-image', async (req, res) => {
  * Idempotency Protection (prevents duplicate orders), Offer Discount Calculation,
  * and Cryptographic Signing. Bill PDF + QR Snapshot is generated upon Owner Confirmation.
  */
+app.get('/api/orders/verify', (_req, res) => {
+  res.status(405).json({
+    success: false,
+    error: 'Use POST /api/orders/verify with order items and customer details.',
+  });
+});
+
 app.post('/api/orders/verify', async (req, res) => {
   try {
     pruneOrderIdempotencyCache();
@@ -1696,7 +1703,9 @@ app.get('/api/bills/file/:orderId/:filename', (req, res) => {
 app.get('/api/public/bills/:billId', (req, res) => {
   try {
     const billId = String(req.params.billId || '').trim();
-    if (!/^RK[0-9]{4,8}-[a-fA-F0-9]{8,24}$/.test(billId)) {
+    const isPublicBillId = /^RK[0-9]{4,8}-[a-fA-F0-9]{8,24}$/.test(billId);
+    const isOrderDocId = /^ord_[a-zA-Z0-9_-]{20,124}$/.test(billId);
+    if (!isPublicBillId && !isOrderDocId) {
       res.status(404).json({
         success: false,
         error: 'Bill not found. Please check the bill link or ask at the counter.',
@@ -1704,7 +1713,9 @@ app.get('/api/public/bills/:billId', (req, res) => {
       return;
     }
 
-    const record = readPublicBillRecord(billId);
+    const record = isPublicBillId
+      ? readPublicBillRecord(billId)
+      : readExistingOrderSnapshot(path.join(BILLS_DIR, billId));
     if (!record) {
       res.status(404).json({
         success: false,

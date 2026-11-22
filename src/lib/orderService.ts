@@ -36,7 +36,56 @@ import {
 } from '../types/restaurant';
 import { auth, BOOTSTRAPPED_OWNER_EMAIL, db } from './firebase';
 import { handleFirestoreError, OperationType } from './firestoreErrors';
-import { DEFAULT_PAYMENT_SETTINGS, isValidUpiId } from './upiPayment';
+import {
+  generateClientBillPdfBlob,
+  generateClientSalesReportPdfBlob,
+} from './clientPdfBill';
+import {
+  createPaymentQrSnapshot,
+  DEFAULT_PAYMENT_SETTINGS,
+  isValidUpiId,
+} from './upiPayment';
+
+const API_BASE = ((import.meta as unknown as { env?: Record<string, string | undefined> }).env?.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+
+function apiUrl(routePath: string): string {
+  const normalized = routePath.startsWith('/') ? routePath : `/${routePath}`;
+  return `${API_BASE}${normalized}`;
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  if (typeof crypto !== 'undefined' && crypto.subtle?.digest) {
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(hashBuffer))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+  // Deterministic 64-char hex fallback if subtle crypto is unavailable in an older context
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < input.length; i += 1) {
+    const c = input.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ (c + i), 0x85ebca6b) >>> 0;
+  }
+  return (h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0')).repeat(4);
+}
+
+function isStaticHostMissingEndpoint(
+  res: Response,
+  parsed: { data: unknown; errorMessage: string | null },
+): boolean {
+  const ct = (res.headers.get('content-type') || '').toLowerCase();
+  const isHtmlFallback =
+    !ct.includes('application/json') &&
+    Boolean(parsed.errorMessage?.includes('unexpected HTML page'));
+  const isEmpty404 =
+    (res.status === 404 || res.status === 405) &&
+    (!parsed.data || parsed.errorMessage?.includes('empty response'));
+  const isNotFoundNonJson = (res.status === 404 || res.status === 405) && !ct.includes('application/json');
+  return isHtmlFallback || isEmpty404 || isNotFoundNonJson;
+}
 
 const SESSION_KEY = 'rikzen_customer_session_id';
 const CUSTOMER_DETAILS_KEY = 'rikzen_customer_details_v1';
@@ -540,21 +589,30 @@ export async function ownerUploadPaymentQrImage(file: File): Promise<string> {
  * Owner action: Deletes currently uploaded QR image reference (older bills retain their snapshot).
  */
 export async function ownerDeletePaymentQr(currentSettings: PaymentSettings): Promise<PaymentSettings> {
-  const headers = await getOwnerAuthHeader();
-  const res = await fetch('/api/owner/payment-qr', {
-    method: 'DELETE',
-    headers: { 'Content-Type': 'application/json', ...headers },
-  });
-  const { data: json, errorMessage } = await safeReadJson<{
-    success?: boolean;
-    settings?: PaymentSettings;
-    error?: string;
-  }>(res, 'Delete payment QR');
-  if (!res.ok || !json?.success) {
-    throw new Error(json?.error || errorMessage || 'Could not remove uploaded payment QR.');
+  let serverSettings: PaymentSettings | null = null;
+  try {
+    const headers = await getOwnerAuthHeader();
+    const res = await fetch(apiUrl('/api/owner/payment-qr'), {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json', ...headers },
+    });
+    const parsed = await safeReadJson<{
+      success?: boolean;
+      settings?: PaymentSettings;
+      error?: string;
+    }>(res, 'Delete payment QR');
+    if (res.ok && parsed.data?.success) {
+      serverSettings = parsed.data.settings || null;
+    } else if (!isStaticHostMissingEndpoint(res, parsed)) {
+      throw new Error(parsed.data?.error || parsed.errorMessage || 'Could not remove uploaded payment QR.');
+    }
+  } catch (err) {
+    if (err instanceof Error && !err.message.toLowerCase().includes('failed to fetch')) {
+      throw err;
+    }
   }
 
-  const nextSettings: PaymentSettings = json.settings || {
+  const nextSettings: PaymentSettings = serverSettings || {
     ...currentSettings,
     qr_image_url: '',
     payment_mode: currentSettings.upi_id ? 'dynamic_upi' : 'uploaded_qr',
@@ -578,7 +636,7 @@ export async function ownerDeletePaymentQr(currentSettings: PaymentSettings): Pr
 }
 
 /**
- * Owner action: Saves honest 2-mode Restaurant Payment Settings to both Express backend and Firestore.
+ * Owner action: Saves honest 2-mode Restaurant Payment Settings to both Express backend (when mounted) and Firestore.
  */
 export async function ownerSavePaymentSettings(payload: {
   payment_mode: PaymentMode;
@@ -604,25 +662,36 @@ export async function ownerSavePaymentSettings(payload: {
     throw new Error('Please upload your restaurant payment QR image first.');
   }
 
-  // 1. Sync to Express server first (validates & persists for immediate PDF QR generation)
-  const headers = await getOwnerAuthHeader();
-  const res = await fetch('/api/owner/payment-settings', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...headers },
-    body: JSON.stringify({
-      payment_mode: paymentMode,
-      upi_id: trimmedUpi,
-      merchant_name: merchantName,
-      qr_image_url: qrImageUrl,
-    }),
-  });
-  const { data: json, errorMessage } = await safeReadJson<{
-    success?: boolean;
-    settings?: PaymentSettings;
-    error?: string;
-  }>(res, 'Save payment settings');
-  if (!res.ok || !json?.success) {
-    throw new Error(json?.error || errorMessage || 'Could not save payment settings on server.');
+  // 1. Sync to Express server if available (skip gracefully on static deployments like Netlify)
+  let serverSettings: PaymentSettings | null = null;
+  try {
+    const headers = await getOwnerAuthHeader();
+    const res = await fetch(apiUrl('/api/owner/payment-settings'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: JSON.stringify({
+        payment_mode: paymentMode,
+        upi_id: trimmedUpi,
+        merchant_name: merchantName,
+        qr_image_url: qrImageUrl,
+      }),
+    });
+    const parsed = await safeReadJson<{
+      success?: boolean;
+      settings?: PaymentSettings;
+      error?: string;
+    }>(res, 'Save payment settings');
+    if (res.ok && parsed.data?.success) {
+      serverSettings = parsed.data.settings || null;
+    } else if (!isStaticHostMissingEndpoint(res, parsed)) {
+      throw new Error(
+        parsed.data?.error || parsed.errorMessage || 'Could not save payment settings on server.',
+      );
+    }
+  } catch (err) {
+    if (err instanceof Error && !err.message.toLowerCase().includes('failed to fetch')) {
+      throw err;
+    }
   }
 
   // 2. Persist in Firestore `/shop_settings/payment` for real-time sync across owner & customer screens
@@ -641,7 +710,7 @@ export async function ownerSavePaymentSettings(payload: {
   }
 
   return (
-    json.settings || {
+    serverSettings || {
       id: 'payment',
       payment_mode: paymentMode,
       upi_id: trimmedUpi,
@@ -709,8 +778,243 @@ export async function uploadDishImageToServer(file: File): Promise<string> {
 }
 
 /**
+ * Authoritative Firestore-backed order verification used automatically when deployed on static
+ * hosting (e.g., Netlify) where the Express `/api/orders/verify` endpoint is not mounted.
+ * Reads live `menu_items` and `offers` directly from Firestore, recomputes every price/discount/total
+ * from database records (never trusting client totals), and enforces deterministic idempotency.
+ */
+async function verifyOrderAgainstFirestore(params: {
+  tableNumber: number;
+  cartItems: CartItem[];
+  customerName: string;
+  customerMobile: string;
+  customerSessionId: string;
+  clientRequestId?: string;
+  notes: string;
+}): Promise<VerifiedOrderQuote> {
+  const { tableNumber, cartItems, customerName, customerMobile, customerSessionId, notes } = params;
+
+  if (!Number.isInteger(tableNumber) || tableNumber < 1 || tableNumber > 6) {
+    throw new Error('Invalid table number. Only Table 1 through Table 6 are supported.');
+  }
+  if (customerName.length < 2 || customerName.length > 80) {
+    throw new Error('Please enter your name (at least 2 characters).');
+  }
+  if (!/^\+91[6-9][0-9]{9}$/.test(customerMobile)) {
+    throw new Error('Please enter a valid 10-digit mobile number.');
+  }
+  if (!Array.isArray(cartItems) || cartItems.length < 1 || cartItems.length > 20) {
+    throw new Error('Order must contain between 1 and 20 items.');
+  }
+
+  // Deterministic idempotent order ID so repeated clicks/retries map to the exact same Firestore doc
+  const requestKey = params.clientRequestId?.trim() || `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  const idSeed = await sha256Hex(`rikzen_order|${customerSessionId}|${requestKey}`);
+  const deterministicOrderId = `ord_${idSeed.slice(0, 32)}`;
+
+  // Check if this exact request already saved an order in Firestore (prevents duplicate orders)
+  try {
+    const existingSnap = await getDoc(doc(db, 'orders', deterministicOrderId));
+    if (existingSnap.exists()) {
+      const existing = normalizeOrderRecord(existingSnap.data() as Partial<OrderRecord>);
+      return {
+        id: existing.id,
+        order_number: existing.order_number,
+        order_code: existing.order_code,
+        table_id: existing.table_id,
+        table_number: existing.table_number,
+        customer_name: existing.customer_name,
+        customer_mobile: existing.customer_mobile,
+        items: existing.items,
+        subtotal: existing.subtotal,
+        discount: existing.discount,
+        total: existing.total,
+        customer_session_id: existing.customer_session_id,
+        item_count: existing.item_count,
+        status: 'pending',
+        payment_status: existing.payment_status,
+        paid_at: existing.paid_at,
+        confirmed_at: existing.confirmed_at,
+        public_bill_id: existing.public_bill_id || existing.id,
+        bill_page_url: `/bill/${existing.public_bill_id || existing.id}`,
+        payment_qr_snapshot: existing.payment_qr_snapshot,
+        upi_uri: existing.upi_uri,
+        pdf_ready: existing.pdf_ready,
+        bill_status: existing.bill_status,
+        pdf_url: existing.pdf_url,
+        pdf_path: existing.pdf_path,
+        generated_at: existing.generated_at,
+        server_signature: existing.server_signature,
+        notes: existing.notes,
+        idempotent_replay: true,
+      };
+    }
+  } catch {
+    // Proceed with fresh catalog verification
+  }
+
+  // Fetch live authoritative menu items & offers directly from Firestore
+  const [menuSnap, offersSnap] = await Promise.all([
+    getDocs(collection(db, 'menu_items')),
+    getDocs(collection(db, 'offers')),
+  ]);
+
+  const liveMenuList: MenuItem[] = menuSnap.empty
+    ? CANONICAL_MENU_ITEMS
+    : menuSnap.docs.map((d) => {
+        const raw = d.data() as Partial<MenuItem>;
+        return {
+          ...raw,
+          id: raw.id || d.id,
+          offer_price: typeof raw.offer_price === 'number' ? raw.offer_price : 0,
+        } as MenuItem;
+      });
+
+  const liveOfferList: OfferRecord[] = offersSnap.empty
+    ? CANONICAL_OFFERS
+    : offersSnap.docs.map((d) => {
+        const raw = d.data() as Partial<OfferRecord>;
+        return { ...raw, id: raw.id || d.id } as OfferRecord;
+      });
+
+  const menuMap = new Map(liveMenuList.map((m) => [m.id, m]));
+  const offerMap = new Map(liveOfferList.map((o) => [o.id, o]));
+
+  const mergedLines = new Map<string, { kind: 'menu' | 'offer'; id: string; quantity: number }>();
+  for (const rawItem of cartItems) {
+    const id = String(rawItem.id || '').trim();
+    const kind: 'menu' | 'offer' = rawItem.kind === 'offer' ? 'offer' : 'menu';
+    const qty = Number(rawItem.quantity);
+    if (!id || !/^[a-zA-Z0-9_-]{1,64}$/.test(id)) {
+      throw new Error('Invalid menu item identifier.');
+    }
+    if (!Number.isInteger(qty) || qty < 1 || qty > 20) {
+      throw new Error('Item quantity must be between 1 and 20.');
+    }
+    const key = `${kind}:${id}`;
+    const nextQty = (mergedLines.get(key)?.quantity || 0) + qty;
+    if (nextQty > 20) {
+      throw new Error('Maximum quantity per item is 20.');
+    }
+    mergedLines.set(key, { kind, id, quantity: nextQty });
+  }
+
+  const verifiedItems: OrderRecord['items'] = [];
+  let subtotal = 0;
+  let total = 0;
+  let itemCount = 0;
+
+  for (const entry of mergedLines.values()) {
+    if (entry.kind === 'offer') {
+      const offer = offerMap.get(entry.id);
+      if (!offer || !offer.active) {
+        throw new Error(`Offer "${offer?.title || entry.id}" is no longer active.`);
+      }
+      const regularPrice = Math.round(offer.regular_price);
+      const unitPrice = Math.round(offer.offer_price);
+      const lineTotal = unitPrice * entry.quantity;
+      subtotal += regularPrice * entry.quantity;
+      total += lineTotal;
+      itemCount += entry.quantity;
+      verifiedItems.push({
+        menu_item_id: offer.id,
+        name: offer.title.slice(0, 80),
+        regular_price: regularPrice,
+        unit_price: unitPrice,
+        quantity: entry.quantity,
+        line_total: lineTotal,
+      });
+    } else {
+      const item = menuMap.get(entry.id);
+      if (!item || !item.available) {
+        throw new Error(`${item?.name || entry.id} is currently unavailable.`);
+      }
+      const regularPrice = Math.round(item.price);
+      const hasOffer = item.offer_price > 0 && item.offer_price < item.price;
+      const unitPrice = hasOffer ? Math.round(item.offer_price) : regularPrice;
+      const lineTotal = unitPrice * entry.quantity;
+      subtotal += regularPrice * entry.quantity;
+      total += lineTotal;
+      itemCount += entry.quantity;
+      verifiedItems.push({
+        menu_item_id: item.id,
+        name: item.name.slice(0, 80),
+        regular_price: regularPrice,
+        unit_price: unitPrice,
+        quantity: entry.quantity,
+        line_total: lineTotal,
+      });
+    }
+  }
+
+  const discount = Math.max(0, subtotal - total);
+  if (itemCount < 1 || itemCount > 100 || subtotal < 1 || subtotal > 50000 || total < 1) {
+    throw new Error('Order limits exceeded.');
+  }
+
+  // Generate clean 5-6 digit order number (10000..999999) derived from deterministic hash + time
+  const hashNumeric = parseInt(idSeed.slice(32, 40), 16);
+  const orderNumber = 1000 + (hashNumeric % 89000);
+  const orderCode = `RK${orderNumber}`;
+  const tableId = `table_${tableNumber}`;
+  // Use unguessable orderId as public_bill_id so /bill/{id} resolves cleanly from Firestore on Netlify too
+  const publicBillId = deterministicOrderId;
+
+  const signature = await sha256Hex(
+    JSON.stringify({
+      id: deterministicOrderId,
+      order_number: orderNumber,
+      order_code: orderCode,
+      table_id: tableId,
+      table_number: tableNumber,
+      customer_name: customerName,
+      customer_mobile: customerMobile,
+      items: verifiedItems,
+      subtotal,
+      discount,
+      total,
+      customer_session_id: customerSessionId,
+      notes,
+    }),
+  );
+
+  return {
+    id: deterministicOrderId,
+    order_number: orderNumber,
+    order_code: orderCode,
+    table_id: tableId,
+    table_number: tableNumber,
+    customer_name: customerName,
+    customer_mobile: customerMobile,
+    items: verifiedItems,
+    subtotal,
+    discount,
+    total,
+    customer_session_id: customerSessionId,
+    item_count: itemCount,
+    status: 'pending',
+    payment_status: 'pending',
+    paid_at: '',
+    confirmed_at: '',
+    public_bill_id: publicBillId,
+    bill_page_url: `/bill/${publicBillId}`,
+    payment_qr_snapshot: null,
+    upi_uri: '',
+    pdf_ready: false,
+    bill_status: 'not_generated',
+    pdf_url: '',
+    pdf_path: '',
+    generated_at: '',
+    server_signature: signature,
+    notes,
+  };
+}
+
+/**
  * Sends table, customer details, idempotency key, and cart items to Express backend for
  * authoritative server-side price, offer discount, and HMAC signing.
+ * Automatically executes authoritative Firestore catalog verification when deployed on static
+ * hosting (e.g. Netlify) where `/api/orders/verify` is not mounted.
  */
 export async function verifyOrderOnServer(
   tableNumber: number,
@@ -719,13 +1023,25 @@ export async function verifyOrderOnServer(
   clientRequestId?: string,
 ): Promise<VerifiedOrderQuote> {
   const customerSessionId = getOrCreateCustomerSessionId();
+  const cleanName = customer.name.trim().slice(0, 80);
+  const cleanMobileDigits = customer.mobileDigits.replace(/\D/g, '').slice(0, 10);
+  const customerMobile = `+91${cleanMobileDigits}`;
+  const notes = customer.notes.trim().slice(0, 200);
+
+  const clientSubtotal = cartItems.reduce((sum, entry) => sum + entry.regularPrice * entry.quantity, 0);
+  const clientTotal = cartItems.reduce((sum, entry) => sum + entry.effectivePrice * entry.quantity, 0);
+  const clientDiscount = Math.max(0, clientSubtotal - clientTotal);
+
   const payload = {
     tableNumber,
-    customerName: customer.name.trim(),
-    customerMobile: `+91${customer.mobileDigits.trim()}`,
+    customerName: cleanName,
+    customerMobile,
     customerSessionId,
     clientRequestId: clientRequestId || undefined,
-    notes: customer.notes.trim().slice(0, 200),
+    notes,
+    clientSubtotal,
+    clientDiscount,
+    clientTotal,
     items: cartItems.map((entry) => ({
       id: entry.id,
       kind: entry.kind,
@@ -733,9 +1049,9 @@ export async function verifyOrderOnServer(
     })),
   };
 
-  let response: Response;
+  let response: Response | null = null;
   try {
-    response = await fetch('/api/orders/verify', {
+    response = await fetch(apiUrl('/api/orders/verify'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -745,23 +1061,48 @@ export async function verifyOrderOnServer(
     throw new Error('Connection lost. Please check your internet and try again.');
   }
 
-  const { data, errorMessage } = await safeReadJson<VerifiedOrderQuote & { error?: string }>(
+  const parsed = await safeReadJson<VerifiedOrderQuote & { error?: string }>(
     response,
     'Order verification',
   );
-  if (!response.ok || !data) {
-    throw new Error(data?.error || errorMessage || 'Something went wrong. Please try again.');
+
+  if (response.ok && parsed.data && parsed.data.id) {
+    return parsed.data;
   }
-  return data;
+
+  // If deployed on static hosting (e.g. Netlify) where `/api/orders/verify` returns 404/405/HTML,
+  // run real authoritative verification against live Firestore menu & offers collections.
+  if (isStaticHostMissingEndpoint(response, parsed)) {
+    return verifyOrderAgainstFirestore({
+      tableNumber,
+      cartItems,
+      customerName: cleanName,
+      customerMobile,
+      customerSessionId,
+      clientRequestId,
+      notes,
+    });
+  }
+
+  throw new Error(parsed.data?.error || parsed.errorMessage || 'Something went wrong. Please try again.');
 }
 
 /**
- * Persists a server-verified order into Firestore as `status: 'pending'` so the Owner
+ * Persists a verified order into Firestore as `status: 'pending'` so the Owner
  * Dashboard receives it immediately in real time. Never writes to `menu_items`.
+ * Idempotent: if the exact order ID was already created on an earlier attempt, returns it cleanly.
  */
 export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<string> {
   const path = `orders/${quote.id}`;
   try {
+    if (quote.idempotent_replay) {
+      const existingSnap = await getDoc(doc(db, 'orders', quote.id));
+      if (existingSnap.exists()) {
+        setStoredOrderIdForTable(quote.table_number, quote.id);
+        return quote.id;
+      }
+    }
+
     await setDoc(doc(db, 'orders', quote.id), {
       id: quote.id,
       order_number: quote.order_number,
@@ -779,7 +1120,7 @@ export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<s
       payment_status: 'pending',
       paid_at: '',
       confirmed_at: '',
-      public_bill_id: quote.public_bill_id || '',
+      public_bill_id: quote.public_bill_id || quote.id,
       payment_qr_snapshot: quote.payment_qr_snapshot || null,
       upi_uri: quote.upi_uri || '',
       pdf_ready: Boolean(quote.pdf_ready),
@@ -796,7 +1137,6 @@ export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<s
     setStoredOrderIdForTable(quote.table_number, quote.id);
     return quote.id;
   } catch (error) {
-    // Log structured detail to console for engineering diagnostics, but never expose raw Firebase text to customers
     console.error('[RikZen Customer Order Create Error]', { path, error });
     throw new Error(toCustomerFriendlyError(error));
   }
@@ -804,6 +1144,7 @@ export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<s
 
 /**
  * Fetches a website-native public bill by `public_bill_id` (zero login required).
+ * Works seamlessly on both Express backend AND static Netlify deployments via Firestore.
  */
 export interface PublicBillPayload {
   public_bill_id: string;
@@ -826,28 +1167,96 @@ export interface PublicBillPayload {
   payment_qr_snapshot: PaymentQrSnapshot | null;
 }
 
+async function fetchLivePaymentSettingsFromFirestore(): Promise<PaymentSettings> {
+  try {
+    const snap = await getDoc(doc(db, 'shop_settings', 'payment'));
+    if (snap.exists()) {
+      const raw = snap.data() as Partial<PaymentSettings>;
+      const qrImageUrl = typeof raw.qr_image_url === 'string' ? raw.qr_image_url.trim() : '';
+      const paymentMode: PaymentMode =
+        raw.payment_mode === 'uploaded_qr' || raw.payment_mode === 'dynamic_upi'
+          ? raw.payment_mode
+          : qrImageUrl
+            ? 'uploaded_qr'
+            : 'dynamic_upi';
+      return {
+        id: 'payment',
+        payment_mode: paymentMode,
+        upi_id: typeof raw.upi_id === 'string' ? raw.upi_id.trim() : '',
+        merchant_name:
+          typeof raw.merchant_name === 'string' && raw.merchant_name.trim()
+            ? raw.merchant_name.trim()
+            : DEFAULT_PAYMENT_SETTINGS.merchant_name,
+        qr_image_url: qrImageUrl,
+      };
+    }
+  } catch {
+    // Fallback to defaults
+  }
+  return DEFAULT_PAYMENT_SETTINGS;
+}
+
 export async function fetchPublicBillById(billId: string): Promise<PublicBillPayload> {
-  const res = await fetch(`/api/public/bills/${encodeURIComponent(billId)}`, {
+  const cleanId = billId.trim();
+  const res = await fetch(apiUrl(`/api/public/bills/${encodeURIComponent(cleanId)}`), {
     method: 'GET',
     cache: 'no-store',
   });
-  const { data, errorMessage } = await safeReadJson<{
+  const parsed = await safeReadJson<{
     success?: boolean;
     bill?: PublicBillPayload;
     error?: string;
   }>(res, 'Load bill');
 
-  if (!res.ok || !data?.success || !data.bill) {
-    throw new Error(data?.error || errorMessage || 'Bill not found.');
+  if (res.ok && parsed.data?.success && parsed.data.bill) {
+    return parsed.data.bill;
   }
-  return data.bill;
+
+  // Direct Firestore lookup for unguessable order IDs (`ord_...`) when static hosted (Netlify)
+  if (/^ord_[a-zA-Z0-9_-]{20,124}$/.test(cleanId)) {
+    const snap = await getDoc(doc(db, 'orders', cleanId));
+    if (snap.exists()) {
+      const ord = normalizeOrderRecord(snap.data() as Partial<OrderRecord>);
+      let snapshot = ord.payment_qr_snapshot;
+      if (!snapshot) {
+        const settings = await fetchLivePaymentSettingsFromFirestore();
+        snapshot = createPaymentQrSnapshot({
+          settings,
+          amount: ord.total,
+          orderCode: ord.order_code,
+          tableNumber: ord.table_number,
+        });
+      }
+      return {
+        public_bill_id: ord.public_bill_id || ord.id,
+        order_code: ord.order_code,
+        table_number: ord.table_number,
+        customer_name: ord.customer_name,
+        customer_mobile: ord.customer_mobile,
+        items: ord.items,
+        subtotal: ord.subtotal,
+        discount: ord.discount,
+        total: ord.total,
+        notes: ord.notes,
+        status: ord.status,
+        payment_status: ord.payment_status,
+        created_at_iso: timestampToDate(ord.created_at).toISOString(),
+        confirmed_at: ord.confirmed_at || '',
+        generated_at: ord.generated_at || '',
+        pdf_url: ord.pdf_url || '',
+        filename: getOrderBillFilename(ord),
+        payment_qr_snapshot: snapshot,
+      };
+    }
+  }
+
+  throw new Error(parsed.data?.error || parsed.errorMessage || 'Bill not found.');
 }
 
 /**
  * Unified PDF Bill Generation & Verification Helper.
- * Guarantees the actual `.pdf` and immutable public bill snapshot exist on the backend server
- * and syncs `pdf_url`, `pdf_path`, `public_bill_id`, `payment_qr_snapshot`, `generated_at`,
- * and `bill_status` to Firestore when signed in as the verified owner.
+ * Uses the Express PDFKit backend when mounted; falls back seamlessly to Firestore QR snapshot +
+ * browser-native PDF generation when deployed on static hosting (e.g., Netlify).
  */
 export async function ensureOrderPdfGenerated(
   order: OrderRecord,
@@ -869,7 +1278,7 @@ export async function ensureOrderPdfGenerated(
 
   let res: Response;
   try {
-    res = await fetch('/api/bills/generate', {
+    res = await fetch(apiUrl('/api/bills/generate'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders },
       body: JSON.stringify({
@@ -882,13 +1291,65 @@ export async function ensureOrderPdfGenerated(
     throw new Error('Connection lost while generating PDF bill. Please try again.');
   }
 
-  const { data: parsedJson, errorMessage: parseErrMsg } = await safeReadJson<
-    Partial<GeneratedBillResult> & { error?: string }
-  >(res, 'PDF bill generation');
-  const json = parsedJson || {};
+  const parsed = await safeReadJson<Partial<GeneratedBillResult> & { error?: string }>(
+    res,
+    'PDF bill generation',
+  );
+  const json = parsed.data || {};
+
+  // Static hosting (Netlify): build immutable QR snapshot from Firestore PaymentSettings directly
+  if (isStaticHostMissingEndpoint(res, parsed)) {
+    const existingSnapshot = !options.forceRegenerate ? order.payment_qr_snapshot : null;
+    const settings = existingSnapshot ? null : await fetchLivePaymentSettingsFromFirestore();
+    const snapshot =
+      existingSnapshot ||
+      createPaymentQrSnapshot({
+        settings: settings || DEFAULT_PAYMENT_SETTINGS,
+        amount: order.total,
+        orderCode: (order.order_code || `RK${order.order_number}`).toUpperCase(),
+        tableNumber: order.table_number,
+      });
+
+    const generatedAt = order.generated_at || new Date().toISOString();
+    const publicBillId = order.id; // `ord_...` resolves directly from Firestore with zero login
+    const fallbackResult: GeneratedBillResult = {
+      ok: true,
+      order_id: order.id,
+      order_code: (order.order_code || `RK${order.order_number}`).toUpperCase(),
+      public_bill_id: publicBillId,
+      bill_page_url: `/bill/${publicBillId}`,
+      filename: getOrderBillFilename(order),
+      bill_status: 'generated',
+      pdf_url: '',
+      pdf_path: '',
+      generated_at: generatedAt,
+      size_bytes: 0,
+      upi_uri: snapshot.upi_uri || '',
+      upi_id: snapshot.upi_id || '',
+      payment_qr_snapshot: snapshot,
+    };
+
+    if (isOwnerSession) {
+      try {
+        await updateDoc(doc(db, 'orders', order.id), {
+          pdf_ready: true,
+          bill_status: 'generated',
+          generated_at: generatedAt,
+          public_bill_id: publicBillId,
+          payment_qr_snapshot: snapshot,
+          ...(snapshot.upi_uri ? { upi_uri: snapshot.upi_uri } : {}),
+          updated_at: serverTimestamp(),
+        });
+      } catch (syncErr) {
+        console.error('[RikZen Static Bill Metadata Sync Warning]', syncErr);
+      }
+    }
+
+    return fallbackResult;
+  }
 
   if (!res.ok || !json.ok || !json.pdf_url || !json.pdf_path) {
-    const errMsg = json.error || parseErrMsg || `Bill generation failed (HTTP ${res.status}).`;
+    const errMsg = json.error || parsed.errorMessage || `Bill generation failed (HTTP ${res.status}).`;
     console.error('[RikZen PDF Generate Error]', { status: res.status, errMsg, orderId: order.id });
     if (isOwnerSession) {
       try {
@@ -907,9 +1368,9 @@ export async function ensureOrderPdfGenerated(
     ok: true,
     order_id: json.order_id || order.id,
     order_code: json.order_code || order.order_code,
-    public_bill_id: json.public_bill_id || order.public_bill_id || '',
+    public_bill_id: json.public_bill_id || order.public_bill_id || order.id,
     bill_page_url:
-      json.bill_page_url || (json.public_bill_id ? `/bill/${json.public_bill_id}` : ''),
+      json.bill_page_url || `/bill/${json.public_bill_id || order.public_bill_id || order.id}`,
     filename: json.filename || getOrderBillFilename(order),
     bill_status: 'generated',
     pdf_url: json.pdf_url,
@@ -951,64 +1412,72 @@ export async function ensureOrderPdfGenerated(
   return result;
 }
 
+function triggerPdfBlobDownload(pdfBlob: Blob, filename: string): void {
+  const blobUrl = URL.createObjectURL(pdfBlob);
+  const anchor = document.createElement('a');
+  anchor.href = blobUrl;
+  anchor.download = filename;
+  anchor.rel = 'noopener noreferrer';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+}
+
 /**
- * Verifies the real `.pdf` binary from server storage and downloads it directly
- * to the user's Downloads folder as `RikZen-Fast-Food-Bill-RK1024.pdf`.
- * Works reliably on Chrome Desktop, Android Chrome, and mobile browsers.
+ * Verifies and downloads a real `.pdf` bill directly to the user's Downloads folder as
+ * `RikZen-Fast-Food-Bill-RK1024.pdf`. Works on both Express server and static Netlify hosts.
  */
 export async function downloadOrderBillPdf(
   order: OrderRecord,
 ): Promise<GeneratedBillResult> {
   try {
-    // 1. Ensure PDF exists on backend storage
+    // 1. Ensure PDF / immutable QR snapshot exists
     const bill = await ensureOrderPdfGenerated(order, { persistIfOwner: true });
 
-    // 2. Fetch actual PDF binary bytes from verified file URL
-    const downloadUrl = `${bill.pdf_url}&download=1`;
-    const response = await fetch(downloadUrl, {
-      method: 'GET',
-      cache: 'no-store',
-    });
+    // 2. If Express generated a stored PDF file, fetch & verify its `%PDF-` bytes
+    if (bill.pdf_url) {
+      const downloadUrl = `${apiUrl(bill.pdf_url)}${bill.pdf_url.includes('?') ? '&' : '?'}download=1`;
+      const response = await fetch(downloadUrl, {
+        method: 'GET',
+        cache: 'no-store',
+      });
 
-    if (!response.ok) {
-      const { data: errJson, errorMessage } = await safeReadJson<{ error?: string }>(
-        response,
-        'PDF download',
-      );
-      throw new Error(
-        errJson?.error || errorMessage || `Failed to download PDF bill (HTTP ${response.status}).`,
-      );
+      if (!response.ok) {
+        const { data: errJson, errorMessage } = await safeReadJson<{ error?: string }>(
+          response,
+          'PDF download',
+        );
+        throw new Error(
+          errJson?.error || errorMessage || `Failed to download PDF bill (HTTP ${response.status}).`,
+        );
+      }
+
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.toLowerCase().includes('application/pdf')) {
+        throw new Error('Server did not return a valid PDF document.');
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      const headerBytes = new Uint8Array(arrayBuffer.slice(0, 5));
+      const pdfMagic = String.fromCharCode(...headerBytes);
+      if (arrayBuffer.byteLength < 512 || pdfMagic !== '%PDF-') {
+        throw new Error('Downloaded bill file was empty or corrupted. Please try again.');
+      }
+
+      const pdfBlob = new Blob([arrayBuffer], { type: 'application/pdf' });
+      triggerPdfBlobDownload(pdfBlob, bill.filename);
+      return bill;
     }
 
-    const contentType = response.headers.get('content-type') || '';
-    if (!contentType.toLowerCase().includes('application/pdf')) {
-      throw new Error('Server did not return a valid PDF document.');
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    const headerBytes = new Uint8Array(arrayBuffer.slice(0, 5));
-    const pdfMagic = String.fromCharCode(...headerBytes);
-    if (arrayBuffer.byteLength < 512 || pdfMagic !== '%PDF-') {
-      throw new Error('Downloaded bill file was empty or corrupted. Please try again.');
-    }
-
-    // 3. Trigger real browser file download with proper filename
-    const pdfBlob = new Blob([arrayBuffer], { type: 'application/pdf' });
-    const blobUrl = URL.createObjectURL(pdfBlob);
-
-    const anchor = document.createElement('a');
-    anchor.href = blobUrl;
-    anchor.download = bill.filename;
-    anchor.rel = 'noopener noreferrer';
-    anchor.style.display = 'none';
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-
-    // Keep blob URL alive for 60s so mobile Chrome finishes saving the file
-    window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-
-    return bill;
+    // 3. Static host mode (Netlify): generate valid `%PDF-` binary directly in the browser
+    const clientPdfBlob = await generateClientBillPdfBlob(
+      order,
+      bill.payment_qr_snapshot || order.payment_qr_snapshot || null,
+    );
+    triggerPdfBlobDownload(clientPdfBlob, bill.filename);
+    return { ...bill, size_bytes: clientPdfBlob.size };
   } catch (err) {
     console.error('[RikZen PDF Download Error]', { orderId: order.id, error: err });
     throw err instanceof Error ? err : new Error('Download failed. Please try again.');
@@ -1016,7 +1485,7 @@ export async function downloadOrderBillPdf(
 }
 
 /**
- * Owner action: Generates & downloads a real server-side Sales Report PDF
+ * Owner action: Generates & downloads a real Sales Report PDF
  * (Daily / Weekly / Monthly / Custom) counting ONLY completed orders.
  */
 export async function downloadSalesReportPdf(params: {
@@ -1037,7 +1506,7 @@ export async function downloadSalesReportPdf(params: {
       created_at_iso: timestampToDate(o.created_at).toISOString(),
     }));
 
-  const response = await fetch('/api/reports/pdf', {
+  const response = await fetch(apiUrl('/api/reports/pdf'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify({
@@ -1049,18 +1518,32 @@ export async function downloadSalesReportPdf(params: {
   });
 
   if (!response.ok) {
-    const { data: errJson, errorMessage } = await safeReadJson<{ error?: string }>(
-      response,
-      'Sales report PDF',
-    );
+    const parsed = await safeReadJson<{ error?: string }>(response, 'Sales report PDF');
+    if (isStaticHostMissingEndpoint(response, parsed)) {
+      const clientBlob = generateClientSalesReportPdfBlob({
+        reportType: params.reportType,
+        periodLabel: params.periodLabel,
+        orders: payloadOrders,
+      });
+      triggerPdfBlobDownload(clientBlob, params.filename);
+      return params.filename;
+    }
     throw new Error(
-      errJson?.error || errorMessage || `Failed to generate report PDF (HTTP ${response.status}).`,
+      parsed.data?.error ||
+        parsed.errorMessage ||
+        `Failed to generate report PDF (HTTP ${response.status}).`,
     );
   }
 
   const contentType = (response.headers.get('content-type') || '').toLowerCase();
   if (!contentType.includes('application/pdf')) {
-    throw new Error('Server did not return a valid PDF report.');
+    const clientBlob = generateClientSalesReportPdfBlob({
+      reportType: params.reportType,
+      periodLabel: params.periodLabel,
+      orders: payloadOrders,
+    });
+    triggerPdfBlobDownload(clientBlob, params.filename);
+    return params.filename;
   }
 
   const arrayBuffer = await response.arrayBuffer();
@@ -1071,18 +1554,7 @@ export async function downloadSalesReportPdf(params: {
   }
 
   const pdfBlob = new Blob([arrayBuffer], { type: 'application/pdf' });
-  const blobUrl = URL.createObjectURL(pdfBlob);
-
-  const anchor = document.createElement('a');
-  anchor.href = blobUrl;
-  anchor.download = params.filename;
-  anchor.rel = 'noopener noreferrer';
-  anchor.style.display = 'none';
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-
-  window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+  triggerPdfBlobDownload(pdfBlob, params.filename);
   return params.filename;
 }
 

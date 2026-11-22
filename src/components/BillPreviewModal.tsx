@@ -28,6 +28,7 @@ import {
   shareBillNative,
   shareBillPdfNative,
 } from '../lib/billShare';
+import { generateClientBillPdfBlob } from '../lib/clientPdfBill';
 import {
   downloadOrderBillPdf,
   ensureOrderPdfGenerated,
@@ -68,6 +69,8 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
   const [shareToast, setShareToast] = useState<string | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
 
+  const [clientPdfBlobUrl, setClientPdfBlobUrl] = useState<string>('');
+
   const loadOrGeneratePdf = useCallback(
     async (targetOrder: OrderRecord, forceRegenerate = false) => {
       setLoadingPdf(true);
@@ -78,6 +81,17 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
           persistIfOwner: isOwnerView,
         });
         setBillMeta(result);
+        if (!result.pdf_url) {
+          const blob = await generateClientBillPdfBlob(
+            targetOrder,
+            result.payment_qr_snapshot || targetOrder.payment_qr_snapshot || null,
+          );
+          const nextBlobUrl = URL.createObjectURL(blob);
+          setClientPdfBlobUrl((prev) => {
+            if (prev) URL.revokeObjectURL(prev);
+            return nextBlobUrl;
+          });
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Bill generation failed.';
         console.error('[RikZen Bill Viewer Error]', err);
@@ -90,17 +104,31 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
   );
 
   useEffect(() => {
+    return () => {
+      if (clientPdfBlobUrl) URL.revokeObjectURL(clientPdfBlobUrl);
+    };
+  }, [clientPdfBlobUrl]);
+
+  useEffect(() => {
     if (!order) {
       setBillMeta(null);
       setPdfError(null);
       setDownloadError(null);
       setShareToast(null);
+      setClientPdfBlobUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return '';
+      });
       return;
     }
     setBillMeta(null);
     setPdfError(null);
     setDownloadError(null);
     setShareToast(null);
+    setClientPdfBlobUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return '';
+    });
     setViewMode('receipt');
     if (order.pdf_url || order.pdf_ready || order.bill_status !== 'not_generated') {
       void loadOrGeneratePdf(order, false);
@@ -118,10 +146,13 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
 
   const { date, time } = formatOrderDate(order.created_at);
   const orderCode = (order.order_code || `RK${order.order_number}`).toUpperCase();
-  const activePdfUrl = billMeta?.pdf_url || order.pdf_url || '';
-  const activeDownloadUrl = activePdfUrl ? `${activePdfUrl}&download=1` : '';
+  const activePdfUrl = billMeta?.pdf_url || order.pdf_url || clientPdfBlobUrl || '';
+  const activeDownloadUrl =
+    activePdfUrl && !activePdfUrl.startsWith('blob:')
+      ? `${activePdfUrl}${activePdfUrl.includes('?') ? '&' : '?'}download=1`
+      : activePdfUrl;
   const activeFilename = billMeta?.filename || `RikZen-Fast-Food-Bill-${orderCode}.pdf`;
-  const activePublicBillId = billMeta?.public_bill_id || order.public_bill_id || '';
+  const activePublicBillId = billMeta?.public_bill_id || order.public_bill_id || order.id || '';
   const publicBillUrl = activePublicBillId ? getPublicBillUrl(activePublicBillId) : '';
 
   const isNotGeneratedYet =
@@ -324,7 +355,7 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
             </div>
 
             <div className="flex items-center gap-2">
-              {publicBillUrl && activePdfUrl && (
+              {publicBillUrl && (
                 <a
                   href={publicBillUrl}
                   target="_blank"

@@ -108,6 +108,12 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const checkoutRequestIdRef = useRef<string>('');
+  const submittingLockRef = useRef<boolean>(false);
+  const [justPlacedOrder, setJustPlacedOrder] = useState<{
+    code: string;
+    total: number;
+    tableNumber: number;
+  } | null>(null);
 
   // Active real-time order state
   const [activeOrderId, setActiveOrderId] = useState<string | null>(() =>
@@ -127,6 +133,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     const stored = getStoredOrderIdForTable(tableNumber);
     setActiveOrderId(stored);
     setActiveOrder(null);
+    setJustPlacedOrder(null);
     setShowThankYouManual(false);
   }, [tableNumber]);
 
@@ -312,7 +319,8 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
   };
 
   const handleConfirmOrder = async () => {
-    if (cartList.length === 0 || isSubmitting) return;
+    if (cartList.length === 0 || isSubmitting || submittingLockRef.current) return;
+    submittingLockRef.current = true;
     setIsSubmitting(true);
     setSubmitError(null);
     try {
@@ -327,6 +335,11 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
       );
       const orderId = await createConfirmedOrder(verifiedQuote);
       checkoutRequestIdRef.current = '';
+      setJustPlacedOrder({
+        code: verifiedQuote.order_code || `RK${verifiedQuote.order_number}`,
+        total: verifiedQuote.total,
+        tableNumber: verifiedQuote.table_number,
+      });
       setActiveOrderId(orderId);
       setCart({});
       setCheckoutStage('cart');
@@ -336,6 +349,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
       console.error('[Customer Place Order Error]', err);
       setSubmitError(toCustomerFriendlyError(err));
     } finally {
+      submittingLockRef.current = false;
       setIsSubmitting(false);
     }
   };
@@ -375,7 +389,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
       table_number: activeOrder.table_number,
       customer_name: activeOrder.customer_name,
       total: activeOrder.total,
-      public_bill_id: activeOrder.public_bill_id,
+      public_bill_id: activeOrder.public_bill_id || activeOrder.id,
       pdf_url: activeOrder.pdf_url,
     });
     if (outcome.method !== 'cancelled') {
@@ -390,6 +404,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     setStoredOrderIdForTable(tableNumber, null);
     setActiveOrderId(null);
     setActiveOrder(null);
+    setJustPlacedOrder(null);
     setShowThankYouManual(false);
     setCheckoutStage('cart');
     setActiveTab('menu');
@@ -1217,24 +1232,60 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
         {/* ============================================================ */}
         {activeTab === 'order' && (
           <div className="max-w-2xl mx-auto space-y-5">
-            {!activeOrder ? (
-              <div className="bg-white rounded-3xl border border-neutral-200 p-10 text-center">
-                <div className="w-14 h-14 rounded-2xl bg-neutral-100 text-neutral-500 flex items-center justify-center mx-auto mb-4">
-                  <Receipt className="w-7 h-7" />
+            {justPlacedOrder && (!activeOrder || activeOrder.status === 'pending') && (
+              <div
+                role="status"
+                className="rounded-2xl bg-emerald-50 border border-emerald-200 px-5 py-4 flex items-center justify-between gap-3"
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-10 h-10 rounded-xl bg-emerald-700 text-white flex items-center justify-center shrink-0">
+                    <CheckCircle2 className="w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-sm font-extrabold text-emerald-900">
+                      Order Placed Successfully!
+                    </p>
+                    <p className="text-xs font-medium text-emerald-800 tabular-nums">
+                      Order <span className="font-mono font-bold">#{justPlacedOrder.code}</span> ·
+                      Table {justPlacedOrder.tableNumber} · {formatRupees(justPlacedOrder.total)}
+                    </p>
+                  </div>
                 </div>
-                <h2 className="text-xl font-bold text-neutral-900 mb-2">No active order yet</h2>
-                <p className="text-sm text-neutral-600 mb-6">
-                  Once you confirm an order for Table {tableNumber}, its live status and PDF bill
-                  will appear here automatically.
-                </p>
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('menu')}
-                  className="min-h-[48px] px-6 py-3 rounded-xl bg-[#E5391B] text-white font-semibold text-sm hover:bg-[#C82E14] transition-colors cursor-pointer"
-                >
-                  Open Menu
-                </button>
               </div>
+            )}
+
+            {!activeOrder ? (
+              activeOrderId ? (
+                <div className="bg-white rounded-3xl border border-neutral-200 p-10 text-center space-y-3">
+                  <div className="w-12 h-12 rounded-2xl bg-emerald-50 text-emerald-700 flex items-center justify-center mx-auto">
+                    <CheckCircle2 className="w-6 h-6 animate-pulse" />
+                  </div>
+                  <h2 className="text-lg font-bold text-neutral-900">
+                    Loading live order status...
+                  </h2>
+                  <p className="text-sm text-neutral-600">
+                    Syncing your order details with the RikZen kitchen.
+                  </p>
+                </div>
+              ) : (
+                <div className="bg-white rounded-3xl border border-neutral-200 p-10 text-center">
+                  <div className="w-14 h-14 rounded-2xl bg-neutral-100 text-neutral-500 flex items-center justify-center mx-auto mb-4">
+                    <Receipt className="w-7 h-7" />
+                  </div>
+                  <h2 className="text-xl font-bold text-neutral-900 mb-2">No active order yet</h2>
+                  <p className="text-sm text-neutral-600 mb-6">
+                    Once you confirm an order for Table {tableNumber}, its live status and PDF bill
+                    will appear here automatically.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('menu')}
+                    className="min-h-[48px] px-6 py-3 rounded-xl bg-[#E5391B] text-white font-semibold text-sm hover:bg-[#C82E14] transition-colors cursor-pointer"
+                  >
+                    Open Menu
+                  </button>
+                </div>
+              )
             ) : activeOrder.status === 'completed' || showThankYouManual ? (
               <ThankYouScreen
                 tableNumber={activeOrder.table_number}
@@ -1478,10 +1529,12 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                           </div>
 
                           <div className="flex flex-wrap gap-2 shrink-0">
-                            {activeOrder.public_bill_id ? (
+                            {activeOrder.public_bill_id || activeOrder.id ? (
                               <button
                                 type="button"
-                                onClick={() => onNavigate(`/bill/${activeOrder.public_bill_id}`)}
+                                onClick={() =>
+                                  onNavigate(`/bill/${activeOrder.public_bill_id || activeOrder.id}`)
+                                }
                                 className="flex-1 sm:flex-none min-h-[44px] px-4 py-2 rounded-xl bg-[#E5391B] text-white font-bold text-xs hover:bg-[#C82E14] inline-flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
                               >
                                 <ExternalLink className="w-4 h-4" />

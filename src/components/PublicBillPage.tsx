@@ -24,6 +24,7 @@ import {
   shareBillNative,
   shareBillPdfNative,
 } from '../lib/billShare';
+import { generateClientBillPdfBlob } from '../lib/clientPdfBill';
 import {
   fetchPublicBillById,
   formatIndianMobileDisplay,
@@ -76,20 +77,44 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
   };
 
   const handleDownloadPdf = async () => {
-    if (!bill?.pdf_url) return;
+    if (!bill) return;
     setDownloading(true);
     try {
-      const downloadUrl = `${bill.pdf_url}${bill.pdf_url.includes('?') ? '&' : '?'}download=1`;
-      const response = await fetch(downloadUrl, { method: 'GET', cache: 'no-store' });
-      if (!response.ok) {
-        throw new Error('Could not download PDF bill right now.');
+      let blob: Blob | null = null;
+      if (bill.pdf_url) {
+        try {
+          const downloadUrl = `${bill.pdf_url}${bill.pdf_url.includes('?') ? '&' : '?'}download=1`;
+          const response = await fetch(downloadUrl, { method: 'GET', cache: 'no-store' });
+          if (response.ok) {
+            const buf = await response.arrayBuffer();
+            const header = String.fromCharCode(...new Uint8Array(buf.slice(0, 5)));
+            if (buf.byteLength >= 512 && header === '%PDF-') {
+              blob = new Blob([buf], { type: 'application/pdf' });
+            }
+          }
+        } catch {
+          blob = null;
+        }
       }
-      const buf = await response.arrayBuffer();
-      const header = String.fromCharCode(...new Uint8Array(buf.slice(0, 5)));
-      if (buf.byteLength < 512 || header !== '%PDF-') {
-        throw new Error('PDF bill file was invalid.');
+      if (!blob) {
+        blob = await generateClientBillPdfBlob(
+          {
+            order_code: bill.order_code,
+            order_number: Number(bill.order_code.replace(/\D/g, '')) || 1000,
+            table_number: bill.table_number,
+            customer_name: bill.customer_name,
+            customer_mobile: bill.customer_mobile,
+            items: bill.items,
+            subtotal: bill.subtotal,
+            discount: bill.discount,
+            total: bill.total,
+            notes: '',
+            payment_status: bill.payment_status,
+            created_at: bill.created_at_iso,
+          },
+          bill.payment_qr_snapshot || null,
+        );
       }
-      const blob = new Blob([buf], { type: 'application/pdf' });
       const blobUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = blobUrl;
@@ -459,7 +484,7 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                 <button
                   type="button"
-                  disabled={downloading || !bill.pdf_url}
+                  disabled={downloading}
                   onClick={handleDownloadPdf}
                   className="min-h-[48px] px-4 py-2.5 rounded-xl bg-neutral-900 text-white font-bold text-sm hover:bg-neutral-800 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
                 >
