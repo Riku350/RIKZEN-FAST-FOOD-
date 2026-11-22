@@ -26,6 +26,8 @@ import {
   OfferRecord,
   OrderRecord,
   OrderStatus,
+  PaymentSettings,
+  PaymentStatus,
   TableRecord,
   TableStatus,
   VerifiedOrderQuote,
@@ -33,10 +35,39 @@ import {
 } from '../types/restaurant';
 import { auth, BOOTSTRAPPED_OWNER_EMAIL, db } from './firebase';
 import { handleFirestoreError, OperationType } from './firestoreErrors';
+import { DEFAULT_PAYMENT_SETTINGS, isValidUpiId } from './upiPayment';
 
 const SESSION_KEY = 'rikzen_customer_session_id';
 const CUSTOMER_DETAILS_KEY = 'rikzen_customer_details_v1';
 const ACTIVE_ORDER_PREFIX = 'rikzen_active_order_table_';
+const MENU_CACHE_KEY = 'rikzen_menu_cache_v1';
+const OFFERS_CACHE_KEY = 'rikzen_offers_cache_v1';
+
+export function getCachedMenuItems(): MenuItem[] {
+  try {
+    const raw = localStorage.getItem(MENU_CACHE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as MenuItem[];
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+  } catch {
+    // Fallback to canonical catalog
+  }
+  return CANONICAL_MENU_ITEMS;
+}
+
+export function getCachedOffers(): OfferRecord[] {
+  try {
+    const raw = localStorage.getItem(OFFERS_CACHE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as OfferRecord[];
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {
+    // Fallback to canonical offers
+  }
+  return CANONICAL_OFFERS;
+}
 
 export function getOrCreateCustomerSessionId(): string {
   try {
@@ -188,6 +219,10 @@ export function normalizeOrderRecord(raw: Partial<OrderRecord>): OrderRecord {
     else if (raw.pdf_ready) billStatus = 'generated';
   }
 
+  const defaultPaymentStatus: PaymentStatus =
+    raw.payment_status ||
+    (raw.status === 'completed' ? 'paid' : 'pending');
+
   return {
     id: raw.id || '',
     order_number: orderNumber,
@@ -211,6 +246,9 @@ export function normalizeOrderRecord(raw: Partial<OrderRecord>): OrderRecord {
     discount: typeof raw.discount === 'number' ? raw.discount : 0,
     total: Number(raw.total || 0),
     status: (raw.status || 'pending') as OrderStatus,
+    payment_status: defaultPaymentStatus,
+    paid_at: typeof raw.paid_at === 'string' ? raw.paid_at : '',
+    upi_uri: typeof raw.upi_uri === 'string' ? raw.upi_uri : '',
     pdf_ready: Boolean(raw.pdf_ready ?? (billStatus === 'generated' || billStatus === 'sent')),
     bill_status: billStatus,
     pdf_url: typeof raw.pdf_url === 'string' ? raw.pdf_url : '',
@@ -332,18 +370,246 @@ export async function syncCatalogToServer(
   }
 }
 
-export async function fetchOwnerConfigStatus(): Promise<{ whatsappConfigured: boolean }> {
+/**
+ * Public real-time subscription to restaurant UPI Payment Settings (UPI ID, Merchant Name, QR image URL).
+ * Zero login required; falls back cleanly to Express `/api/payment-settings`.
+ */
+export function subscribeToPaymentSettings(
+  onSettings: (settings: PaymentSettings) => void,
+): Unsubscribe {
+  const path = 'shop_settings/payment';
+
+  // Fetch initial server fallback immediately so customer bills have UPI QR even before Firestore hydrates
+  fetch('/api/payment-settings')
+    .then((res) => (res.ok ? safeReadJson<{ settings?: PaymentSettings }>(res, 'Payment settings') : null))
+    .then((parsed) => {
+      if (parsed?.data?.settings) {
+        onSettings({
+          ...DEFAULT_PAYMENT_SETTINGS,
+          ...parsed.data.settings,
+        });
+      }
+    })
+    .catch(() => {
+      // Ignore fallback network error
+    });
+
+  return onSnapshot(
+    doc(db, 'shop_settings', 'payment'),
+    (snapshot) => {
+      if (!snapshot.exists()) {
+        return;
+      }
+      const raw = snapshot.data() as Partial<PaymentSettings>;
+      onSettings({
+        id: 'payment',
+        upi_id: typeof raw.upi_id === 'string' ? raw.upi_id.trim() : '',
+        merchant_name:
+          typeof raw.merchant_name === 'string' && raw.merchant_name.trim()
+            ? raw.merchant_name.trim()
+            : DEFAULT_PAYMENT_SETTINGS.merchant_name,
+        qr_image_url: typeof raw.qr_image_url === 'string' ? raw.qr_image_url.trim() : '',
+        updated_at: raw.updated_at,
+      });
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.GET, path);
+      } catch {
+        // Fallback already attempted via /api/payment-settings
+      }
+    },
+  );
+}
+
+/**
+ * Syncs owner's Firestore PaymentSettings into the Express backend so server-generated PDFs
+ * immediately embed the exact-amount dynamic UPI QR.
+ */
+export async function syncPaymentSettingsToServer(settings: PaymentSettings): Promise<void> {
+  try {
+    const headers = await getOwnerAuthHeader();
+    await fetch('/api/owner/payment-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: JSON.stringify({
+        upi_id: settings.upi_id.trim(),
+        merchant_name: settings.merchant_name.trim() || 'RikZen Fast Food',
+        qr_image_url: settings.qr_image_url.trim(),
+      }),
+    });
+  } catch {
+    // Non-blocking background sync
+  }
+}
+
+/**
+ * Owner action: Uploads restaurant Payment QR screenshot (JPEG/PNG/WebP <= 2 MB) to confined server storage.
+ */
+export async function ownerUploadPaymentQrImage(file: File): Promise<string> {
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+    throw new Error('Please upload a JPEG, PNG, or WebP QR screenshot.');
+  }
+  if (file.size > 2 * 1024 * 1024) {
+    throw new Error('Payment QR image must be smaller than 2 MB.');
+  }
+
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('Failed to read selected QR image.'));
+    reader.readAsDataURL(file);
+  });
+
+  const headers = await getOwnerAuthHeader();
+  const res = await fetch('/api/owner/upload-payment-qr', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify({ dataUrl }),
+  });
+
+  const { data: json, errorMessage } = await safeReadJson<{ url?: string; error?: string }>(
+    res,
+    'Payment QR upload',
+  );
+  if (!res.ok || !json?.url) {
+    throw new Error(json?.error || errorMessage || 'Could not upload payment QR image.');
+  }
+  return json.url;
+}
+
+/**
+ * Owner action: Saves Restaurant UPI ID, Merchant Name, and Reference QR Image to both Firestore and Express backend.
+ */
+export async function ownerSavePaymentSettings(payload: {
+  upi_id: string;
+  merchant_name: string;
+  qr_image_url: string;
+}): Promise<PaymentSettings> {
+  const trimmedUpi = payload.upi_id.trim();
+  if (trimmedUpi !== '' && !isValidUpiId(trimmedUpi)) {
+    throw new Error('Please enter a valid UPI ID (example: rikzenfastfood@okaxis or 9876543210@ybl).');
+  }
+  const merchantName = payload.merchant_name.trim().slice(0, 80);
+  if (merchantName.length < 2) {
+    throw new Error('Restaurant name must be at least 2 characters.');
+  }
+  const qrImageUrl = payload.qr_image_url.trim().slice(0, 500);
+
+  // 1. Sync to Express server first (validates & persists for immediate PDF QR generation)
+  const headers = await getOwnerAuthHeader();
+  const res = await fetch('/api/owner/payment-settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify({
+      upi_id: trimmedUpi,
+      merchant_name: merchantName,
+      qr_image_url: qrImageUrl,
+    }),
+  });
+  const { data: json, errorMessage } = await safeReadJson<{
+    success?: boolean;
+    settings?: PaymentSettings;
+    error?: string;
+  }>(res, 'Save payment settings');
+  if (!res.ok || !json?.success) {
+    throw new Error(json?.error || errorMessage || 'Could not save payment settings on server.');
+  }
+
+  // 2. Persist in Firestore `/shop_settings/payment` for real-time sync across owner & customer screens
+  const path = 'shop_settings/payment';
+  try {
+    await setDoc(doc(db, 'shop_settings', 'payment'), {
+      id: 'payment',
+      upi_id: trimmedUpi,
+      merchant_name: merchantName,
+      qr_image_url: qrImageUrl,
+      updated_at: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+
+  return (
+    json.settings || {
+      id: 'payment',
+      upi_id: trimmedUpi,
+      merchant_name: merchantName,
+      qr_image_url: qrImageUrl,
+      updated_at: new Date().toISOString(),
+    }
+  );
+}
+
+export async function fetchOwnerConfigStatus(): Promise<{
+  whatsappConfigured: boolean;
+  hasToken?: boolean;
+  hasPhoneId?: boolean;
+  apiVersion?: string;
+}> {
   try {
     const headers = await getOwnerAuthHeader();
     const res = await fetch('/api/owner/config-status', { headers });
     if (!res.ok) return { whatsappConfigured: false };
-    const { data } = await safeReadJson<{ whatsappConfigured?: boolean }>(
-      res,
-      'Owner config status',
-    );
-    return { whatsappConfigured: Boolean(data?.whatsappConfigured) };
+    const { data } = await safeReadJson<{
+      whatsappConfigured?: boolean;
+      hasToken?: boolean;
+      hasPhoneId?: boolean;
+      apiVersion?: string;
+    }>(res, 'Owner config status');
+    return {
+      whatsappConfigured: Boolean(data?.whatsappConfigured),
+      hasToken: Boolean(data?.hasToken),
+      hasPhoneId: Boolean(data?.hasPhoneId),
+      apiVersion: data?.apiVersion || 'v21.0',
+    };
   } catch {
     return { whatsappConfigured: false };
+  }
+}
+
+export async function verifyWhatsAppConnectionOnServer(): Promise<{
+  connected: boolean;
+  displayPhoneNumber?: string;
+  verifiedName?: string;
+  qualityRating?: string;
+  code?: string;
+  error?: string;
+}> {
+  try {
+    const headers = await getOwnerAuthHeader();
+    const res = await fetch('/api/owner/whatsapp/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+    });
+    const { data, errorMessage } = await safeReadJson<{
+      connected?: boolean;
+      displayPhoneNumber?: string;
+      verifiedName?: string;
+      qualityRating?: string;
+      code?: string;
+      error?: string;
+    }>(res, 'WhatsApp connection check');
+
+    if (res.ok && data?.connected) {
+      return {
+        connected: true,
+        displayPhoneNumber: data.displayPhoneNumber,
+        verifiedName: data.verifiedName,
+        qualityRating: data.qualityRating,
+      };
+    }
+
+    return {
+      connected: false,
+      code: data?.code,
+      error: data?.error || errorMessage || `Connection check failed (HTTP ${res.status}).`,
+    };
+  } catch (err) {
+    return {
+      connected: false,
+      error: err instanceof Error ? err.message : 'Unable to test WhatsApp API connection.',
+    };
   }
 }
 
@@ -439,6 +705,9 @@ export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<s
       discount: quote.discount,
       total: quote.total,
       status: 'pending',
+      payment_status: 'pending',
+      paid_at: '',
+      upi_uri: quote.upi_uri || '',
       pdf_ready: Boolean(quote.pdf_ready),
       bill_status: quote.bill_status || 'generated',
       pdf_url: quote.pdf_url || '',
@@ -531,12 +800,15 @@ export async function ensureOrderPdfGenerated(
     pdf_path: json.pdf_path,
     generated_at: json.generated_at || new Date().toISOString(),
     size_bytes: Number(json.size_bytes || 0),
+    upi_uri: typeof json.upi_uri === 'string' ? json.upi_uri : order.upi_uri || '',
+    upi_id: typeof json.upi_id === 'string' ? json.upi_id : '',
   };
 
   if (
     isOwnerSession &&
     (order.pdf_url !== result.pdf_url ||
       order.pdf_path !== result.pdf_path ||
+      order.upi_uri !== result.upi_uri ||
       !order.pdf_ready ||
       order.bill_status === 'not_generated' ||
       order.bill_status === 'generating')
@@ -554,6 +826,7 @@ export async function ensureOrderPdfGenerated(
         pdf_url: result.pdf_url,
         pdf_path: result.pdf_path,
         generated_at: result.generated_at,
+        ...(result.upi_uri ? { upi_uri: result.upi_uri } : {}),
         updated_at: serverTimestamp(),
       });
     } catch (syncErr) {
@@ -889,13 +1162,18 @@ export function subscribeToMenuItems(onItems: (items: MenuItem[]) => void): Unsu
       });
       const orderIndex = new Map(CANONICAL_MENU_ITEMS.map((item, idx) => [item.id, idx]));
       docs.sort((a, b) => (orderIndex.get(a.id) ?? 999) - (orderIndex.get(b.id) ?? 999));
+      try {
+        localStorage.setItem(MENU_CACHE_KEY, JSON.stringify(docs));
+      } catch {
+        // Ignore storage quota errors
+      }
       onItems(docs);
     },
     (error) => {
       try {
         handleFirestoreError(error, OperationType.LIST, path);
       } catch {
-        onItems(CANONICAL_MENU_ITEMS);
+        onItems(getCachedMenuItems());
       }
     },
   );
@@ -914,13 +1192,18 @@ export function subscribeToOffers(onOffers: (offers: OfferRecord[]) => void): Un
         return;
       }
       const docs = snapshot.docs.map((d) => d.data() as OfferRecord);
+      try {
+        localStorage.setItem(OFFERS_CACHE_KEY, JSON.stringify(docs));
+      } catch {
+        // Ignore storage quota errors
+      }
       onOffers(docs);
     },
     (error) => {
       try {
         handleFirestoreError(error, OperationType.LIST, path);
       } catch {
-        onOffers(CANONICAL_OFFERS);
+        onOffers(getCachedOffers());
       }
     },
   );
@@ -1159,6 +1442,9 @@ export async function ownerUpdateOrderStatus(
       updatePayload.pdf_url = generatedBill.pdf_url;
       updatePayload.pdf_path = generatedBill.pdf_path;
       updatePayload.generated_at = generatedBill.generated_at;
+      if (generatedBill.upi_uri) {
+        updatePayload.upi_uri = generatedBill.upi_uri;
+      }
       if (order.send_status !== 'sent' && order.whatsapp_status !== 'sent') {
         updatePayload.bill_status = 'generated';
       }
@@ -1181,6 +1467,25 @@ export async function ownerUpdateOrderStatus(
 
     await batch.commit();
     return generatedBill;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, orderPath);
+  }
+}
+
+/**
+ * Owner action: Manually updates real payment status (never auto-marked paid just because QR was shown).
+ */
+export async function ownerUpdatePaymentStatus(
+  order: OrderRecord,
+  paymentStatus: PaymentStatus,
+): Promise<void> {
+  const orderPath = `orders/${order.id}`;
+  try {
+    await updateDoc(doc(db, 'orders', order.id), {
+      payment_status: paymentStatus,
+      paid_at: paymentStatus === 'paid' ? new Date().toISOString() : '',
+      updated_at: serverTimestamp(),
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, orderPath);
   }

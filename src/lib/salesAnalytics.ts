@@ -148,6 +148,33 @@ export interface ChartBucket {
   orders: number;
 }
 
+export interface BestSellingItemStat {
+  name: string;
+  qty: number;
+  revenue: number;
+}
+
+export function computeBestSellingItem(orders: OrderRecord[]): BestSellingItemStat | null {
+  const counts = new Map<string, BestSellingItemStat>();
+  for (const o of orders) {
+    if (!isRevenueOrder(o)) continue;
+    for (const line of o.items) {
+      const key = line.menu_item_id || line.name;
+      const prev = counts.get(key) || { name: line.name, qty: 0, revenue: 0 };
+      prev.qty += line.quantity;
+      prev.revenue += line.line_total;
+      counts.set(key, prev);
+    }
+  }
+  let best: BestSellingItemStat | null = null;
+  for (const item of counts.values()) {
+    if (!best || item.qty > best.qty || (item.qty === best.qty && item.revenue > best.revenue)) {
+      best = item;
+    }
+  }
+  return best;
+}
+
 /**
  * Hourly sales breakdown for a given day (real completed orders only).
  */
@@ -155,11 +182,16 @@ export function buildHourlySalesSeries(orders: OrderRecord[], targetDay: Date = 
   buckets: ChartBucket[];
   totalSales: number;
   totalOrders: number;
+  allDayOrdersCount: number;
+  cancelledOrdersCount: number;
   avgOrderValue: number;
+  bestSellingItem: BestSellingItemStat | null;
   completedOrders: OrderRecord[];
 } {
   const bounds = { start: startOfDay(targetDay), end: endOfDay(targetDay), label: '' };
-  const dayOrders = filterOrdersInRange(orders, bounds).filter(isRevenueOrder);
+  const allDayOrders = filterOrdersInRange(orders, bounds);
+  const cancelledOrdersCount = allDayOrders.filter((o) => o.status === 'rejected').length;
+  const dayOrders = allDayOrders.filter(isRevenueOrder);
 
   const hourTotals = new Map<number, { sales: number; orders: number }>();
   let minHour = 10;
@@ -191,7 +223,16 @@ export function buildHourlySalesSeries(orders: OrderRecord[], targetDay: Date = 
   const totalOrders = dayOrders.length;
   const avgOrderValue = totalOrders > 0 ? Math.round(totalSales / totalOrders) : 0;
 
-  return { buckets, totalSales, totalOrders, avgOrderValue, completedOrders: dayOrders };
+  return {
+    buckets,
+    totalSales,
+    totalOrders,
+    allDayOrdersCount: allDayOrders.length,
+    cancelledOrdersCount,
+    avgOrderValue,
+    bestSellingItem: computeBestSellingItem(dayOrders),
+    completedOrders: dayOrders,
+  };
 }
 
 /**
@@ -203,6 +244,7 @@ export function buildWeeklySalesSeries(orders: OrderRecord[], refDate: Date = ne
   totalOrders: number;
   avgOrderValue: number;
   bestDay: ChartBucket | null;
+  bestSellingItem: BestSellingItemStat | null;
   completedOrders: OrderRecord[];
   periodLabel: string;
 } {
@@ -238,6 +280,7 @@ export function buildWeeklySalesSeries(orders: OrderRecord[], refDate: Date = ne
     totalOrders,
     avgOrderValue,
     bestDay,
+    bestSellingItem: computeBestSellingItem(weekOrders),
     completedOrders: weekOrders,
     periodLabel: `${fmt(start)} – ${fmt(end)}`,
   };
@@ -255,6 +298,9 @@ export function buildMonthlySalesSeries(orders: OrderRecord[], year: number = ne
   currentMonthOrders: OrderRecord[];
   currentMonthSales: number;
   currentMonthAvg: number;
+  currentMonthDiscounts: number;
+  currentMonthBestItem: BestSellingItemStat | null;
+  currentMonthBestDay: { dateLabel: string; sales: number } | null;
 } {
   const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const buckets: ChartBucket[] = monthNames.map((label) => ({ label, sales: 0, orders: 0 }));
@@ -263,6 +309,7 @@ export function buildMonthlySalesSeries(orders: OrderRecord[], year: number = ne
   const currentMonthIdx = now.getMonth();
   const yearOrders: OrderRecord[] = [];
   const currentMonthOrders: OrderRecord[] = [];
+  const monthDayTotals = new Map<string, { dateLabel: string; sales: number }>();
 
   for (const ord of orders) {
     if (!isRevenueOrder(ord)) continue;
@@ -274,6 +321,13 @@ export function buildMonthlySalesSeries(orders: OrderRecord[], year: number = ne
     yearOrders.push(ord);
     if (m === currentMonthIdx) {
       currentMonthOrders.push(ord);
+      const dayKey = formatIsoDateLocal(d);
+      const prev = monthDayTotals.get(dayKey) || {
+        dateLabel: d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
+        sales: 0,
+      };
+      prev.sales += ord.total;
+      monthDayTotals.set(dayKey, prev);
     }
   }
 
@@ -282,8 +336,16 @@ export function buildMonthlySalesSeries(orders: OrderRecord[], year: number = ne
   const avgOrderValue = totalOrders > 0 ? Math.round(totalSales / totalOrders) : 0;
 
   const currentMonthSales = currentMonthOrders.reduce((sum, o) => sum + o.total, 0);
+  const currentMonthDiscounts = currentMonthOrders.reduce((sum, o) => sum + (o.discount || 0), 0);
   const currentMonthAvg =
     currentMonthOrders.length > 0 ? Math.round(currentMonthSales / currentMonthOrders.length) : 0;
+
+  let currentMonthBestDay: { dateLabel: string; sales: number } | null = null;
+  for (const entry of monthDayTotals.values()) {
+    if (entry.sales > 0 && (!currentMonthBestDay || entry.sales > currentMonthBestDay.sales)) {
+      currentMonthBestDay = entry;
+    }
+  }
 
   return {
     buckets,
@@ -294,6 +356,9 @@ export function buildMonthlySalesSeries(orders: OrderRecord[], year: number = ne
     currentMonthOrders,
     currentMonthSales,
     currentMonthAvg,
+    currentMonthDiscounts,
+    currentMonthBestItem: computeBestSellingItem(currentMonthOrders),
+    currentMonthBestDay,
   };
 }
 

@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import PDFDocument from 'pdfkit';
+import QRCode from 'qrcode';
 import type { OrderLineItem } from '../types/restaurant.ts';
 
 export interface BillPdfInput {
@@ -13,6 +14,9 @@ export interface BillPdfInput {
   total: number;
   notes?: string;
   created_at_iso: string;
+  upi_id?: string;
+  merchant_name?: string;
+  upi_uri?: string;
 }
 
 const DEJAVU_REGULAR = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
@@ -93,10 +97,28 @@ function drawPageFrame(doc: PDFKit.PDFDocument) {
 }
 
 /**
- * Generates a real, verified, branded RikZen Fast Food PDF invoice buffer.
- * Uses DejaVuSans for crisp ₹ Rupee glyph rendering with automatic Helvetica fallback.
+ * Generates a real, verified, branded RikZen Fast Food PDF invoice buffer
+ * with an embedded high-resolution, error-correction-H exact-amount dynamic UPI QR.
  */
 export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise<Buffer> {
+  // Pre-render crisp monochrome high-resolution UPI QR PNG buffer if dynamic UPI URI is configured
+  let qrPngBuffer: Buffer | null = null;
+  const trimmedUpiUri = typeof input.upi_uri === 'string' ? input.upi_uri.trim() : '';
+  const trimmedUpiId = typeof input.upi_id === 'string' ? input.upi_id.trim() : '';
+
+  if (trimmedUpiUri && trimmedUpiUri.startsWith('upi://pay?')) {
+    qrPngBuffer = await QRCode.toBuffer(trimmedUpiUri, {
+      type: 'png',
+      width: 512,
+      margin: 4,
+      errorCorrectionLevel: 'H',
+      color: {
+        dark: '#000000',
+        light: '#FFFFFF',
+      },
+    });
+  }
+
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({
       size: 'A5',
@@ -127,30 +149,30 @@ export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise
     const pageHeight = doc.page.height;
     const left = 28;
     const contentWidth = pageWidth - left * 2;
-    const footerY = pageHeight - 98;
+    const footerY = pageHeight - 76;
 
     drawPageFrame(doc);
 
     // Header Banner
     doc
-      .roundedRect(left, 26, contentWidth, 72, 12)
+      .roundedRect(left, 24, contentWidth, 64, 12)
       .fillColor('#151110')
       .fill();
 
-    drawVectorBurger(doc, left + 12, 45, 0.92);
-    drawVectorPizza(doc, left + contentWidth - 42, 45, 0.92);
+    drawVectorBurger(doc, left + 12, 39, 0.88);
+    drawVectorPizza(doc, left + contentWidth - 40, 39, 0.88);
 
     doc
       .font(fontBold)
-      .fontSize(17)
+      .fontSize(16.5)
       .fillColor('#FFFFFF')
-      .text('RIKZEN FAST FOOD', left, 41, { width: contentWidth, align: 'center' });
+      .text('RIKZEN FAST FOOD', left, 37, { width: contentWidth, align: 'center' });
 
     doc
       .font(fontBody)
-      .fontSize(8.8)
+      .fontSize(8.5)
       .fillColor('#FDBA74')
-      .text('Fast Food  •  Fresh  •  Delicious', left, 65, {
+      .text('Fresh  •  Fast  •  Delicious', left, 59, {
         width: contentWidth,
         align: 'center',
       });
@@ -171,64 +193,64 @@ export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise
     });
 
     // Customer & Order Metadata Card
-    const metaTop = 110;
+    const metaTop = 98;
     doc
-      .roundedRect(left, metaTop, contentWidth, 84, 10)
+      .roundedRect(left, metaTop, contentWidth, 78, 10)
       .fillColor('#F9FAFB')
       .fill();
     doc
-      .roundedRect(left, metaTop, contentWidth, 84, 10)
+      .roundedRect(left, metaTop, contentWidth, 78, 10)
       .lineWidth(0.8)
       .strokeColor('#E5E7EB')
       .stroke();
 
     doc
       .font(fontBold)
-      .fontSize(8)
+      .fontSize(7.8)
       .fillColor('#E5391B')
-      .text('CUSTOMER & ORDER DETAILS', left + 12, metaTop + 10);
+      .text('CUSTOMER & ORDER DETAILS', left + 12, metaTop + 9);
 
     const col1X = left + 12;
     const col2X = left + Math.floor(contentWidth * 0.54);
 
-    doc.font(fontBody).fontSize(8.2).fillColor('#6B7280').text('Customer:', col1X, metaTop + 28);
-    doc
-      .font(fontBold)
-      .fontSize(9)
-      .fillColor('#111827')
-      .text(input.customer_name || 'Guest', col1X + 48, metaTop + 27, {
-        width: col2X - col1X - 54,
-        ellipsis: true,
-      });
-
-    doc.font(fontBody).fontSize(8.2).fillColor('#6B7280').text('Mobile:', col1X, metaTop + 45);
+    doc.font(fontBody).fontSize(8).fillColor('#6B7280').text('Customer:', col1X, metaTop + 25);
     doc
       .font(fontBold)
       .fontSize(8.8)
       .fillColor('#111827')
-      .text(formatMobileDisplay(input.customer_mobile), col1X + 48, metaTop + 45, {
-        width: col2X - col1X - 54,
+      .text(input.customer_name || 'Guest', col1X + 46, metaTop + 24, {
+        width: col2X - col1X - 52,
+        ellipsis: true,
       });
 
-    doc.font(fontBody).fontSize(8.2).fillColor('#6B7280').text('Table:', col1X, metaTop + 62);
+    doc.font(fontBody).fontSize(8).fillColor('#6B7280').text('Mobile:', col1X, metaTop + 41);
     doc
       .font(fontBold)
-      .fontSize(9)
+      .fontSize(8.5)
       .fillColor('#111827')
-      .text(`Table ${input.table_number}`, col1X + 48, metaTop + 62);
+      .text(formatMobileDisplay(input.customer_mobile), col1X + 46, metaTop + 41, {
+        width: col2X - col1X - 52,
+      });
 
-    doc.font(fontBody).fontSize(8.2).fillColor('#6B7280').text('Order No:', col2X, metaTop + 28);
+    doc.font(fontBody).fontSize(8).fillColor('#6B7280').text('Table:', col1X, metaTop + 57);
     doc
       .font(fontBold)
-      .fontSize(9.5)
+      .fontSize(8.8)
+      .fillColor('#111827')
+      .text(`Table ${input.table_number}`, col1X + 46, metaTop + 57);
+
+    doc.font(fontBody).fontSize(8).fillColor('#6B7280').text('Order No:', col2X, metaTop + 25);
+    doc
+      .font(fontBold)
+      .fontSize(9.2)
       .fillColor('#E5391B')
-      .text(`#${input.order_code}`, col2X + 48, metaTop + 27);
+      .text(`#${input.order_code}`, col2X + 46, metaTop + 24);
 
-    doc.font(fontBody).fontSize(8.2).fillColor('#6B7280').text('Date:', col2X, metaTop + 45);
-    doc.font(fontBold).fontSize(8.8).fillColor('#111827').text(dateStr, col2X + 48, metaTop + 45);
+    doc.font(fontBody).fontSize(8).fillColor('#6B7280').text('Date:', col2X, metaTop + 41);
+    doc.font(fontBold).fontSize(8.5).fillColor('#111827').text(dateStr, col2X + 46, metaTop + 41);
 
-    doc.font(fontBody).fontSize(8.2).fillColor('#6B7280').text('Time:', col2X, metaTop + 62);
-    doc.font(fontBold).fontSize(8.8).fillColor('#111827').text(timeStr, col2X + 48, metaTop + 62);
+    doc.font(fontBody).fontSize(8).fillColor('#6B7280').text('Time:', col2X, metaTop + 57);
+    doc.font(fontBold).fontSize(8.5).fillColor('#111827').text(timeStr, col2X + 46, metaTop + 57);
 
     // Order Items Table
     const itemColX = left + 10;
@@ -238,88 +260,92 @@ export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise
 
     const drawItemsTableHeader = (topY: number) => {
       doc
-        .roundedRect(left, topY, contentWidth, 22, 5)
+        .roundedRect(left, topY, contentWidth, 20, 5)
         .fillColor('#FEF2F0')
         .fill();
-      doc.font(fontBold).fontSize(8.5).fillColor('#991B1B');
-      doc.text('Item Name', itemColX, topY + 6, { width: 168 });
-      doc.text('Qty', qtyColX, topY + 6, { width: 34, align: 'center' });
-      doc.text('Price', priceColX, topY + 6, { width: 44, align: 'right' });
-      doc.text('Total', totalColX, topY + 6, { width: 50, align: 'right' });
-      return topY + 28;
+      doc.font(fontBold).fontSize(8.2).fillColor('#991B1B');
+      doc.text('Item', itemColX, topY + 5.5, { width: 168 });
+      doc.text('Qty', qtyColX, topY + 5.5, { width: 34, align: 'center' });
+      doc.text('Price', priceColX, topY + 5.5, { width: 44, align: 'right' });
+      doc.text('Total', totalColX, topY + 5.5, { width: 50, align: 'right' });
+      return topY + 25;
     };
 
-    let y = 208;
+    let y = 186;
     doc
       .font(fontBold)
-      .fontSize(9)
+      .fontSize(8.5)
       .fillColor('#111827')
-      .text('ORDER', left, y);
-    y += 15;
+      .text('ORDER ITEMS', left, y);
+    y += 13;
     y = drawItemsTableHeader(y);
 
     for (const line of input.items) {
-      if (y > pageHeight - 135) {
+      if (y > pageHeight - 120) {
         doc.addPage();
         drawPageFrame(doc);
-        y = drawItemsTableHeader(32);
+        y = drawItemsTableHeader(30);
       }
 
-      doc.font(fontBold).fontSize(9).fillColor('#111827');
+      doc.font(fontBold).fontSize(8.8).fillColor('#111827');
       doc.text(line.name, itemColX, y, { width: 166, ellipsis: true });
 
-      doc.font(fontBody).fontSize(9).fillColor('#374151');
+      doc.font(fontBody).fontSize(8.8).fillColor('#374151');
       doc.text(String(line.quantity), qtyColX, y, { width: 34, align: 'center' });
       doc.text(fmt(line.unit_price), priceColX, y, { width: 44, align: 'right' });
 
-      doc.font(fontBold).fontSize(9).fillColor('#111827');
+      doc.font(fontBold).fontSize(8.8).fillColor('#111827');
       doc.text(fmt(line.line_total), totalColX, y, { width: 50, align: 'right' });
 
       if (line.regular_price > line.unit_price) {
-        y += 12;
+        y += 11;
         doc
           .font(fontBody)
-          .fontSize(7.5)
+          .fontSize(7.2)
           .fillColor('#15803D')
           .text(
-            `Offer Applied: Regular ${fmt(line.regular_price)} -> ${fmt(line.unit_price)}`,
+            `Offer Applied: ${fmt(line.regular_price)} -> ${fmt(line.unit_price)}`,
             itemColX,
             y,
           );
       }
 
-      y += 15;
+      y += 13;
       doc
         .moveTo(left + 6, y)
         .lineTo(left + contentWidth - 6, y)
         .lineWidth(0.5)
         .strokeColor('#E5E7EB')
         .stroke();
-      y += 7;
+      y += 6;
     }
 
-    // Ensure totals + optional note fit cleanly above the footer without overlapping
-    const neededForTotals = input.notes?.trim() ? 115 : 88;
-    if (y + neededForTotals > footerY) {
+    // Check space needed for Totals + optional note + optional Dynamic UPI QR block
+    const qrBlockHeight = qrPngBuffer ? 132 : 0;
+    const noteHeight = input.notes?.trim() ? 20 : 0;
+    const totalsHeight = 76;
+    const neededBelowItems = totalsHeight + noteHeight + (qrPngBuffer ? qrBlockHeight + 10 : 0);
+
+    if (y + neededBelowItems > footerY - 6) {
       doc.addPage();
       drawPageFrame(doc);
-      y = 38;
+      y = 32;
     }
 
     // Totals Summary Block
-    y += 4;
+    y += 2;
     const summaryLeft = left + contentWidth - 190;
-    doc.font(fontBody).fontSize(9.5).fillColor('#4B5563');
+    doc.font(fontBody).fontSize(9).fillColor('#4B5563');
     doc.text('Subtotal:', summaryLeft, y, { width: 98, align: 'right' });
     doc
       .font(fontBold)
       .fillColor('#111827')
       .text(fmt(input.subtotal), summaryLeft + 102, y, { width: 82, align: 'right' });
-    y += 16;
+    y += 14;
 
     doc
       .font(fontBody)
-      .fontSize(9.5)
+      .fontSize(9)
       .fillColor(input.discount > 0 ? '#15803D' : '#6B7280');
     doc.text('Discount:', summaryLeft, y, { width: 98, align: 'right' });
     doc
@@ -329,30 +355,111 @@ export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise
         width: 82,
         align: 'right',
       });
-    y += 18;
+    y += 16;
 
     doc
-      .roundedRect(summaryLeft - 6, y, 196, 30, 8)
+      .roundedRect(summaryLeft - 6, y, 196, 28, 8)
       .fillColor('#E5391B')
       .fill();
     doc
       .font(fontBold)
-      .fontSize(11)
+      .fontSize(10.5)
       .fillColor('#FFFFFF')
-      .text('FINAL TOTAL:', summaryLeft, y + 8.5, { width: 94, align: 'right' });
+      .text('TOTAL:', summaryLeft, y + 7.5, { width: 94, align: 'right' });
     doc
       .font(fontBold)
       .fontSize(12.5)
       .fillColor('#FFFFFF')
-      .text(fmt(input.total), summaryLeft + 98, y + 7.5, { width: 86, align: 'right' });
+      .text(fmt(input.total), summaryLeft + 98, y + 6.5, { width: 86, align: 'right' });
+
+    y += 34;
 
     if (input.notes && input.notes.trim()) {
-      y += 38;
       doc
         .font(fontBody)
-        .fontSize(8)
+        .fontSize(7.8)
         .fillColor('#6B7280')
         .text(`Special Request: ${input.notes.trim()}`, left, y, { width: contentWidth });
+      y += 16;
+    }
+
+    // Dynamic Exact-Amount UPI Payment QR Card (Crisp monochrome, quiet-zone framed, high contrast)
+    if (qrPngBuffer) {
+      y += 4;
+      if (y + qrBlockHeight > footerY - 6) {
+        doc.addPage();
+        drawPageFrame(doc);
+        y = 32;
+      }
+
+      const cardHeight = 126;
+      doc
+        .roundedRect(left, y, contentWidth, cardHeight, 10)
+        .fillColor('#FFFFFF')
+        .fill();
+      doc
+        .roundedRect(left, y, contentWidth, cardHeight, 10)
+        .lineWidth(1.1)
+        .strokeColor('#151110')
+        .stroke();
+
+      // Left white frame holding razor-sharp monochrome QR (108pt x 108pt)
+      const qrSize = 108;
+      const qrX = left + 10;
+      const qrY = y + 9;
+      doc.image(qrPngBuffer, qrX, qrY, { width: qrSize, height: qrSize });
+
+      // Right side clear payment details
+      const infoX = qrX + qrSize + 14;
+      const infoWidth = left + contentWidth - infoX - 10;
+
+      doc
+        .roundedRect(infoX, y + 12, 86, 17, 4)
+        .fillColor('#151110')
+        .fill();
+      doc
+        .font(fontBold)
+        .fontSize(8)
+        .fillColor('#FFFFFF')
+        .text('SCAN TO PAY', infoX, y + 16, { width: 86, align: 'center' });
+
+      doc
+        .font(fontBold)
+        .fontSize(16)
+        .fillColor('#E5391B')
+        .text(`Pay ${fmt(input.total)}`, infoX, y + 36, { width: infoWidth });
+
+      doc
+        .font(fontBold)
+        .fontSize(8.2)
+        .fillColor('#111827')
+        .text(input.merchant_name?.trim() || 'RikZen Fast Food', infoX, y + 58, {
+          width: infoWidth,
+          ellipsis: true,
+        });
+
+      if (trimmedUpiId) {
+        doc
+          .font(fontBody)
+          .fontSize(7.8)
+          .fillColor('#4B5563')
+          .text(`UPI ID: ${trimmedUpiId}`, infoX, y + 71, {
+            width: infoWidth,
+            ellipsis: true,
+          });
+      }
+
+      doc
+        .font(fontBold)
+        .fontSize(7.8)
+        .fillColor('#15803D')
+        .text('Scan to pay this exact bill amount', infoX, y + 86, { width: infoWidth });
+
+      doc
+        .font(fontBody)
+        .fontSize(7.3)
+        .fillColor('#6B7280')
+        .text('PhonePe • Google Pay • Paytm • BHIM', infoX, y + 102, { width: infoWidth });
     }
 
     // Branded Fast-Food Footer Strip
@@ -363,30 +470,30 @@ export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise
       .strokeColor('#E5E7EB')
       .stroke();
 
-    drawVectorFries(doc, left + 10, footerY + 18, 0.85);
-    drawVectorRoll(doc, left + 42, footerY + 20, 0.8);
-    drawVectorDrink(doc, left + contentWidth - 38, footerY + 18, 0.85);
+    drawVectorFries(doc, left + 10, footerY + 12, 0.78);
+    drawVectorRoll(doc, left + 40, footerY + 14, 0.72);
+    drawVectorDrink(doc, left + contentWidth - 36, footerY + 12, 0.78);
 
     doc
       .font(fontBold)
-      .fontSize(11.5)
+      .fontSize(10.5)
       .fillColor('#E5391B')
-      .text('THANK YOU!', left, footerY + 14, { width: contentWidth, align: 'center' });
+      .text('THANK YOU!', left, footerY + 10, { width: contentWidth, align: 'center' });
 
     doc
       .font(fontBold)
-      .fontSize(9)
+      .fontSize(8.5)
       .fillColor('#111827')
-      .text('Thank You for visiting RikZen Fast Food', left, footerY + 32, {
+      .text('Thank You for visiting RikZen Fast Food', left, footerY + 26, {
         width: contentWidth,
         align: 'center',
       });
 
     doc
       .font(fontBody)
-      .fontSize(8.5)
+      .fontSize(8)
       .fillColor('#6B7280')
-      .text('We hope to serve you again!', left, footerY + 46, {
+      .text('We hope to serve you again!', left, footerY + 39, {
         width: contentWidth,
         align: 'center',
       });

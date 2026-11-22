@@ -42,6 +42,11 @@ service cloud.firestore {
         (p == '' || p.matches('^/bills/ord_[a-zA-Z0-9_\\-]+/RikZen-Fast-Food-Bill-RK[0-9]{4,8}\\.pdf$'));
     }
 
+    function isSafeUpiUri(uri) {
+      return uri is string && uri.size() <= 500 &&
+        (uri == '' || uri.matches('^upi://pay\\?.*$'));
+    }
+
     function isSignedIn() {
       return request.auth != null && request.auth.token.email_verified == true;
     }
@@ -135,6 +140,19 @@ service cloud.firestore {
         data.updated_at is timestamp;
     }
 
+    function isValidPaymentSettings(data, settingId) {
+      return settingId == 'payment' &&
+        data.keys().hasAll(['id', 'upi_id', 'merchant_name', 'qr_image_url', 'updated_at']) &&
+        data.keys().hasOnly(['id', 'upi_id', 'merchant_name', 'qr_image_url', 'updated_at']) &&
+        data.id is string && data.id == 'payment' &&
+        data.upi_id is string && data.upi_id.size() <= 120 &&
+        (data.upi_id == '' || data.upi_id.matches('^[a-zA-Z0-9._\\-]{2,80}@[a-zA-Z0-9.\\-]{2,64}$')) &&
+        data.merchant_name is string && data.merchant_name.size() >= 2 && data.merchant_name.size() <= 80 &&
+        data.qr_image_url is string && data.qr_image_url.size() <= 500 &&
+        (data.qr_image_url == '' || isSafeImageUrl(data.qr_image_url)) &&
+        data.updated_at is timestamp;
+    }
+
     function isValidOrderLineItem(item) {
       return item is map &&
         item.keys().hasAll(['menu_item_id', 'name', 'regular_price', 'unit_price', 'quantity', 'line_total']) &&
@@ -158,7 +176,9 @@ service cloud.firestore {
         data.keys().hasOnly([
           'id', 'order_number', 'order_code', 'table_id', 'table_number',
           'customer_name', 'customer_mobile', 'items', 'item_count',
-          'subtotal', 'discount', 'total', 'status', 'pdf_ready',
+          'subtotal', 'discount', 'total', 'status',
+          'payment_status', 'paid_at', 'upi_uri',
+          'pdf_ready',
           'bill_status', 'pdf_url', 'pdf_path', 'generated_at', 'sent_at', 'send_status',
           'whatsapp_status', 'whatsapp_error', 'customer_session_id',
           'server_signature', 'notes', 'created_at', 'updated_at'
@@ -178,6 +198,9 @@ service cloud.firestore {
         data.discount is number && data.discount >= 0 && data.discount < data.subtotal &&
         data.total is number && data.total == data.subtotal - data.discount &&
         data.status in ['pending', 'accepted', 'preparing', 'ready', 'bill_requested', 'bill_ready', 'completed', 'rejected'] &&
+        (!('payment_status' in data) || data.payment_status in ['not_paid', 'pending', 'paid', 'failed']) &&
+        (!('paid_at' in data) || (data.paid_at is string && data.paid_at.size() <= 64)) &&
+        (!('upi_uri' in data) || isSafeUpiUri(data.upi_uri)) &&
         data.pdf_ready is bool &&
         (!('bill_status' in data) || data.bill_status in ['not_generated', 'generating', 'generated', 'sending', 'sent', 'failed', 'retrying']) &&
         (!('pdf_url' in data) || isSafeBillUrl(data.pdf_url)) &&
@@ -290,17 +313,31 @@ service cloud.firestore {
       allow delete: if isValidId(tableId) && isAdmin();
     }
 
-    // Real-time Dine-In Orders (Strict Customer Mobile PII Protection + PDF Bill Metadata)
+    // Public Restaurant Payment Settings (UPI ID, Merchant Name, Reference QR Image — zero secrets)
+    match /shop_settings/{settingId} {
+      allow get: if isValidId(settingId) && settingId == 'payment';
+      allow list: if isAdmin();
+      allow create: if isValidId(settingId) && isAdmin() && isValidPaymentSettings(incoming(), settingId) &&
+        incoming().updated_at == request.time;
+      allow update: if isValidId(settingId) && isAdmin() && isValidPaymentSettings(incoming(), settingId) &&
+        incoming().id == existing().id &&
+        incoming().updated_at == request.time;
+      allow delete: if false;
+    }
+
+    // Real-time Dine-In Orders (Strict Customer Mobile PII Protection + PDF Bill + UPI Payment Status)
     match /orders/{orderId} {
       // Only the verified shop owner can list orders. Customers cannot discover or read other orders.
       allow get: if isAdmin() || isValidOrderDocId(orderId);
       allow list: if isAdmin();
 
-      // Customers create server-verified pending orders with validated +91 mobile number and generated PDF metadata.
+      // Customers create server-verified pending orders (never pre-marked as paid).
       allow create: if isValidOrderDocId(orderId) &&
         isValidOrder(incoming(), orderId) &&
         incoming().keys().hasAll(['bill_status', 'pdf_url', 'pdf_path', 'generated_at', 'sent_at', 'send_status']) &&
         incoming().status == 'pending' &&
+        (!('payment_status' in incoming()) || incoming().payment_status in ['pending', 'not_paid']) &&
+        (!('paid_at' in incoming()) || incoming().paid_at == '') &&
         incoming().send_status == 'not_sent' &&
         incoming().whatsapp_status == 'not_sent' &&
         incoming().whatsapp_error == '' &&
@@ -313,9 +350,10 @@ service cloud.firestore {
         isValidOrder(incoming(), orderId) &&
         orderImmutableFieldsUnchanged() &&
         incoming().updated_at == request.time && (
-          // Tier 1: Verified Owner manages lifecycle, PDF bill generation/storage metadata, and WhatsApp delivery state
+          // Tier 1: Verified Owner manages lifecycle, payment verification, PDF bill metadata, and WhatsApp delivery state
           (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly([
-            'status', 'pdf_ready', 'bill_status', 'pdf_url', 'pdf_path',
+            'status', 'payment_status', 'paid_at', 'upi_uri',
+            'pdf_ready', 'bill_status', 'pdf_url', 'pdf_path',
             'generated_at', 'sent_at', 'send_status',
             'whatsapp_status', 'whatsapp_error', 'updated_at'
           ])) ||

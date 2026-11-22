@@ -5,6 +5,7 @@ import { FoodArtIcon, FoodArtKind } from './FoodArtIcons';
 
 interface RikZenIntroProps {
   onComplete: () => void;
+  mode?: 'full' | 'quick';
 }
 
 interface FloatingIntroItem {
@@ -109,26 +110,27 @@ const FLOATING_FOODS: FloatingIntroItem[] = [
 
 const LOADER_SEQUENCE: FoodArtKind[] = ['burger', 'fries', 'roll', 'pizza'];
 
-export const RikZenIntro: React.FC<RikZenIntroProps> = ({ onComplete }) => {
+export const RikZenIntro: React.FC<RikZenIntroProps> = ({ onComplete, mode = 'full' }) => {
   const [exiting, setExiting] = useState(false);
   const [loaderStep, setLoaderStep] = useState(0);
+  const isQuick = mode === 'quick';
 
   useEffect(() => {
     const prefersReduced =
       typeof window !== 'undefined' &&
       window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-    const totalMs = prefersReduced ? 900 : 3850;
-    const exitLeadMs = 420;
+    const totalMs = isQuick ? (prefersReduced ? 500 : 1050) : prefersReduced ? 900 : 3850;
+    const exitLeadMs = isQuick ? 240 : 420;
 
-    // Cycle the 3.0s–3.8s loading food sequence smoothly
+    // Cycle the loading food sequence smoothly
     const seqInterval = window.setInterval(() => {
       setLoaderStep((prev) => (prev + 1) % LOADER_SEQUENCE.length);
-    }, 240);
+    }, isQuick ? 180 : 240);
 
     const exitTimer = window.setTimeout(() => {
       setExiting(true);
-    }, Math.max(300, totalMs - exitLeadMs));
+    }, Math.max(200, totalMs - exitLeadMs));
 
     const doneTimer = window.setTimeout(() => {
       onComplete();
@@ -139,12 +141,12 @@ export const RikZenIntro: React.FC<RikZenIntroProps> = ({ onComplete }) => {
       window.clearTimeout(exitTimer);
       window.clearTimeout(doneTimer);
     };
-  }, [onComplete]);
+  }, [onComplete, isQuick]);
 
   const handleSkip = () => {
     if (exiting) return;
     setExiting(true);
-    window.setTimeout(() => onComplete(), 280);
+    window.setTimeout(() => onComplete(), 180);
   };
 
   return (
@@ -153,7 +155,7 @@ export const RikZenIntro: React.FC<RikZenIntroProps> = ({ onComplete }) => {
         key="rikzen-intro-overlay"
         initial={{ opacity: 0 }}
         animate={{ opacity: exiting ? 0 : 1, scale: exiting ? 1.02 : 1 }}
-        transition={{ duration: exiting ? 0.38 : 0.42, ease: [0.16, 1, 0.3, 1] }}
+        transition={{ duration: exiting ? (isQuick ? 0.22 : 0.38) : isQuick ? 0.2 : 0.42, ease: [0.16, 1, 0.3, 1] }}
         className="fixed inset-0 z-50 bg-[#151110] text-white flex items-center justify-center overflow-hidden select-none"
         role="presentation"
         aria-label="Welcome to RikZen Fast Food"
@@ -243,11 +245,11 @@ export const RikZenIntro: React.FC<RikZenIntroProps> = ({ onComplete }) => {
 
         {/* Center Safe Zone: Main Logo, Tagline, Welcome & Food Loader */}
         <div className="relative z-10 max-w-md w-full mx-auto px-6 text-center flex flex-col items-center">
-          {/* Soft Animated Glow Emblem (0.95s–1.8s) */}
+          {/* Soft Animated Glow Emblem */}
           <motion.div
             initial={{ opacity: 0, scale: 0.75 }}
             animate={{ opacity: 1, scale: 1 }}
-            transition={{ delay: 0.9, duration: 0.55, ease: [0.16, 1, 0.3, 1] }}
+            transition={{ delay: isQuick ? 0.04 : 0.9, duration: isQuick ? 0.28 : 0.55, ease: [0.16, 1, 0.3, 1] }}
             className="relative mb-5"
           >
             <div
@@ -259,11 +261,11 @@ export const RikZenIntro: React.FC<RikZenIntroProps> = ({ onComplete }) => {
             </div>
           </motion.div>
 
-          {/* Brand Wordmark: Fade In -> Slight Scale Up -> Glow -> Stay (1.0s–2.0s) */}
+          {/* Brand Wordmark */}
           <motion.h1
             initial={{ opacity: 0, scale: 0.92, y: 10 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
-            transition={{ delay: 1.05, duration: 0.65, ease: [0.16, 1, 0.3, 1] }}
+            transition={{ delay: isQuick ? 0.08 : 1.05, duration: isQuick ? 0.32 : 0.65, ease: [0.16, 1, 0.3, 1] }}
             className="font-display text-3xl sm:text-5xl font-extrabold tracking-tight text-white drop-shadow-[0_0_24px_rgba(229,57,27,0.45)]"
           >
             RIKZEN <span className="text-[#FF5A36]">FAST FOOD</span>
@@ -273,28 +275,30 @@ export const RikZenIntro: React.FC<RikZenIntroProps> = ({ onComplete }) => {
           <motion.p
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 1.5, duration: 0.45, ease: [0.16, 1, 0.3, 1] }}
+            transition={{ delay: isQuick ? 0.16 : 1.5, duration: isQuick ? 0.25 : 0.45, ease: [0.16, 1, 0.3, 1] }}
             className="mt-2.5 text-sm sm:text-base font-semibold tracking-widest text-amber-200/95"
           >
             Fresh · Fast · Delicious
           </motion.p>
 
-          {/* Welcome Message (2.0s–3.0s) */}
-          <motion.p
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 2.05, duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
-            className="mt-4 text-sm sm:text-base font-medium text-neutral-200 inline-flex items-center justify-center gap-1.5"
-          >
-            <span>Welcome to RikZen Fast Food</span>
-            <Heart className="w-4 h-4 text-[#FF5A36] fill-current inline-block" />
-          </motion.p>
+          {/* Welcome Message */}
+          {!isQuick && (
+            <motion.p
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 2.05, duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
+              className="mt-4 text-sm sm:text-base font-medium text-neutral-200 inline-flex items-center justify-center gap-1.5"
+            >
+              <span>Welcome to RikZen Fast Food</span>
+              <Heart className="w-4 h-4 text-[#FF5A36] fill-current inline-block" />
+            </motion.p>
+          )}
 
-          {/* Compact Animated Food Loader Sequence (2.75s–3.8s): Burger -> Fries -> Roll -> Pizza */}
+          {/* Compact Animated Food Loader Sequence */}
           <motion.div
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 2.65, duration: 0.35 }}
+            transition={{ delay: isQuick ? 0.14 : 2.65, duration: isQuick ? 0.2 : 0.35 }}
             className="mt-7 flex flex-col items-center gap-3"
           >
             <div className="flex items-center gap-3">
@@ -317,7 +321,7 @@ export const RikZenIntro: React.FC<RikZenIntroProps> = ({ onComplete }) => {
               <motion.div
                 initial={{ scaleX: 0 }}
                 animate={{ scaleX: 1 }}
-                transition={{ duration: 3.4, ease: 'easeInOut' }}
+                transition={{ duration: isQuick ? 0.85 : 3.4, ease: 'easeInOut' }}
                 className="h-full w-full origin-left bg-gradient-to-r from-[#E5391B] to-amber-400"
               />
             </div>

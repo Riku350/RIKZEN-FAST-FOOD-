@@ -74,6 +74,16 @@ export type BillStatus =
 
 export type WhatsAppDeliveryStatus = 'not_sent' | 'sending' | 'retrying' | 'sent' | 'failed';
 
+export type PaymentStatus = 'not_paid' | 'pending' | 'paid' | 'failed';
+
+export interface PaymentSettings {
+  id: 'payment';
+  upi_id: string;
+  merchant_name: string;
+  qr_image_url: string;
+  updated_at?: unknown;
+}
+
 export interface OrderLineItem {
   menu_item_id: string;
   name: string;
@@ -103,6 +113,9 @@ export interface OrderRecord {
   discount: number;
   total: number;
   status: OrderStatus;
+  payment_status: PaymentStatus;
+  paid_at: string;
+  upi_uri: string;
   pdf_ready: boolean;
   bill_status: BillStatus;
   pdf_url: string;
@@ -143,6 +156,9 @@ export interface VerifiedOrderQuote {
   discount: number;
   total: number;
   status: 'pending';
+  payment_status: PaymentStatus;
+  paid_at: string;
+  upi_uri: string;
   pdf_ready: boolean;
   bill_status: BillStatus;
   pdf_url: string;
@@ -165,6 +181,8 @@ export interface GeneratedBillResult {
   bill_status: BillStatus;
   pdf_url: string;
   pdf_path: string;
+  upi_uri?: string;
+  upi_id?: string;
   generated_at: string;
   size_bytes: number;
 }

@@ -48,7 +48,12 @@ export default function App() {
 
   return (
     <ErrorBoundary>
-      {showIntro && <RikZenIntro onComplete={handleIntroComplete} />}
+      {showIntro && !isOwnerRoute && (
+        <RikZenIntro
+          mode={isMenuRoute && route.tableNumber ? 'quick' : 'full'}
+          onComplete={handleIntroComplete}
+        />
+      )}
       {isOwnerRoute ? (
         <OwnerDashboard onNavigate={navigate} />
       ) : isMenuRoute && route.tableNumber ? (

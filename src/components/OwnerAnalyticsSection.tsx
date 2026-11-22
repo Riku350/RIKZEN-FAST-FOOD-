@@ -194,8 +194,10 @@ interface OwnerAnalyticsSectionProps {
   onViewOrder: (order: OrderRecord) => void;
   onDownloadBill: (order: OrderRecord) => void;
   onSendWhatsApp: (order: OrderRecord) => void;
+  onMarkPaid?: (order: OrderRecord) => void;
   downloadingBillId: string | null;
   sendingWaOrderId: string | null;
+  updatingPaymentId?: string | null;
   onToast: (msg: string) => void;
 }
 
@@ -214,8 +216,10 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
   onViewOrder,
   onDownloadBill,
   onSendWhatsApp,
+  onMarkPaid,
   downloadingBillId,
   sendingWaOrderId,
+  updatingPaymentId = null,
   onToast,
 }) => {
   const [datePreset, setDatePreset] = useState<DatePreset>('today');
@@ -268,15 +272,21 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
       .sort((a, b) => b.revenue - a.revenue)
       .slice(0, 5);
 
+    const nonRejectedInRange = ordersInRange.filter((o) => o.status !== 'rejected');
+    const paidCount = nonRejectedInRange.filter((o) => o.payment_status === 'paid').length;
+    const pendingPayCount = nonRejectedInRange.filter((o) => o.payment_status !== 'paid').length;
+
     return {
       totalSales,
       totalOrders,
       allPeriodOrders: ordersInRange.length,
+      paidCount,
+      pendingPayCount,
       avgOrder,
       discounts,
       topDishes,
     };
-  }, [completedInRange, ordersInRange.length]);
+  }, [completedInRange, ordersInRange]);
 
   // Real Daily, Weekly, Monthly series (strictly completed orders)
   const dailyRefDate = useMemo(() => {
@@ -493,9 +503,13 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
           </p>
         </div>
         <div className="bg-white rounded-2xl border border-neutral-200 p-4 sm:p-5">
-          <p className="text-xs font-semibold text-neutral-500">Offer Discounts</p>
-          <p className="font-mono text-2xl sm:text-3xl font-extrabold text-neutral-900 mt-1">
-            <AnimatedNumber value={rangeMetrics.discounts} prefix="₹" />
+          <p className="text-xs font-semibold text-neutral-500">Payment Summary</p>
+          <p className="font-mono text-xl sm:text-2xl font-extrabold text-emerald-700 mt-1 tabular-nums">
+            {rangeMetrics.paidCount} Paid ·{' '}
+            <span className="text-amber-700">{rangeMetrics.pendingPayCount} Pending</span>
+          </p>
+          <p className="text-[11px] text-neutral-500 mt-0.5 tabular-nums">
+            Discounts: {formatRupees(rangeMetrics.discounts)}
           </p>
         </div>
       </div>
@@ -593,7 +607,7 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
             <div className="flex flex-wrap items-baseline justify-between gap-2">
               <div>
                 <h3 className="text-base font-extrabold text-neutral-900">
-                  Hourly Sales ({dailyRefDate.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })})
+                  Daily Sales ({dailyRefDate.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })})
                 </h3>
                 <p className="text-xs text-neutral-500">
                   Real completed revenue grouped by order hour
@@ -606,6 +620,47 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                 <p className="text-xs text-neutral-500">
                   {dailySeries.totalOrders} completed · Avg {formatRupees(dailySeries.avgOrderValue)}
                 </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 text-xs tabular-nums">
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Today&apos;s Sales</span>
+                <span className="font-mono font-extrabold text-[#E5391B] text-sm">
+                  {formatRupees(dailySeries.totalSales)}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Today&apos;s Orders</span>
+                <span className="font-mono font-extrabold text-neutral-900 text-sm">
+                  {dailySeries.allDayOrdersCount}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Avg Order Value</span>
+                <span className="font-mono font-extrabold text-neutral-900 text-sm">
+                  {formatRupees(dailySeries.avgOrderValue)}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Completed</span>
+                <span className="font-mono font-extrabold text-emerald-700 text-sm">
+                  {dailySeries.totalOrders}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Cancelled</span>
+                <span className="font-mono font-extrabold text-red-700 text-sm">
+                  {dailySeries.cancelledOrdersCount}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Best-Selling Item</span>
+                <span className="font-bold text-neutral-900 text-sm truncate block" title={dailySeries.bestSellingItem?.name || ''}>
+                  {dailySeries.bestSellingItem
+                    ? `${dailySeries.bestSellingItem.name} (${dailySeries.bestSellingItem.qty})`
+                    : '—'}
+                </span>
               </div>
             </div>
 
@@ -626,33 +681,50 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                 </h3>
                 <p className="text-xs text-neutral-500">Monday to Sunday verified completed orders</p>
               </div>
-              <div className="flex flex-wrap items-center gap-4 text-xs tabular-nums">
-                <div>
-                  <span className="text-neutral-500 block">Weekly Total</span>
-                  <span className="font-mono font-extrabold text-neutral-900 text-sm">
-                    {formatRupees(weeklySeries.totalSales)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-neutral-500 block">Orders</span>
-                  <span className="font-mono font-extrabold text-neutral-900 text-sm">
-                    {weeklySeries.totalOrders}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-neutral-500 block">Avg Order</span>
-                  <span className="font-mono font-extrabold text-neutral-900 text-sm">
-                    {formatRupees(weeklySeries.avgOrderValue)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-neutral-500 block">Best Sales Day</span>
-                  <span className="font-mono font-extrabold text-[#E5391B] text-sm">
-                    {weeklySeries.bestDay
-                      ? `${weeklySeries.bestDay.label} (${formatRupees(weeklySeries.bestDay.sales)})`
-                      : '—'}
-                  </span>
-                </div>
+              <div className="text-right font-mono tabular-nums">
+                <p className="text-lg font-extrabold text-neutral-900">
+                  {formatRupees(weeklySeries.totalSales)}
+                </p>
+                <p className="text-xs text-neutral-500">
+                  {weeklySeries.totalOrders} completed · Avg {formatRupees(weeklySeries.avgOrderValue)}
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 text-xs tabular-nums">
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Total Sales</span>
+                <span className="font-mono font-extrabold text-[#E5391B] text-sm">
+                  {formatRupees(weeklySeries.totalSales)}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Total Orders</span>
+                <span className="font-mono font-extrabold text-neutral-900 text-sm">
+                  {weeklySeries.totalOrders}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Avg Order Value</span>
+                <span className="font-mono font-extrabold text-neutral-900 text-sm">
+                  {formatRupees(weeklySeries.avgOrderValue)}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Best Sales Day</span>
+                <span className="font-mono font-extrabold text-[#E5391B] text-sm">
+                  {weeklySeries.bestDay
+                    ? `${weeklySeries.bestDay.label} (${formatRupees(weeklySeries.bestDay.sales)})`
+                    : '—'}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3 col-span-2 sm:col-span-1">
+                <span className="text-neutral-500 block">Best-Selling Food</span>
+                <span className="font-bold text-neutral-900 text-sm truncate block" title={weeklySeries.bestSellingItem?.name || ''}>
+                  {weeklySeries.bestSellingItem
+                    ? `${weeklySeries.bestSellingItem.name} (${weeklySeries.bestSellingItem.qty})`
+                    : '—'}
+                </span>
               </div>
             </div>
 
@@ -670,29 +742,66 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
             <div className="flex flex-wrap items-baseline justify-between gap-2">
               <div>
                 <h3 className="text-base font-extrabold text-neutral-900">
-                  Monthly Sales ({now.getFullYear()})
+                  Monthly Sales ({now.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })} &amp; {now.getFullYear()})
                 </h3>
                 <p className="text-xs text-neutral-500">January – December completed order totals</p>
               </div>
-              <div className="flex flex-wrap items-center gap-4 text-xs tabular-nums">
-                <div>
-                  <span className="text-neutral-500 block">This Month</span>
-                  <span className="font-mono font-extrabold text-[#E5391B] text-sm">
-                    {formatRupees(monthlySeries.currentMonthSales)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-neutral-500 block">{now.getFullYear()} Total</span>
-                  <span className="font-mono font-extrabold text-neutral-900 text-sm">
-                    {formatRupees(monthlySeries.totalSales)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-neutral-500 block">Orders</span>
-                  <span className="font-mono font-extrabold text-neutral-900 text-sm">
-                    {monthlySeries.totalOrders}
-                  </span>
-                </div>
+              <div className="text-right font-mono tabular-nums">
+                <p className="text-lg font-extrabold text-neutral-900">
+                  {formatRupees(monthlySeries.totalSales)}
+                </p>
+                <p className="text-xs text-neutral-500">
+                  {now.getFullYear()} total · {monthlySeries.totalOrders} completed
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 text-xs tabular-nums">
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Monthly Sales</span>
+                <span className="font-mono font-extrabold text-[#E5391B] text-sm">
+                  {formatRupees(monthlySeries.currentMonthSales)}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Total Orders</span>
+                <span className="font-mono font-extrabold text-neutral-900 text-sm">
+                  {monthlySeries.currentMonthOrders.length}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Avg Order Value</span>
+                <span className="font-mono font-extrabold text-neutral-900 text-sm">
+                  {formatRupees(
+                    monthlySeries.currentMonthOrders.length > 0
+                      ? Math.round(
+                          monthlySeries.currentMonthSales / monthlySeries.currentMonthOrders.length,
+                        )
+                      : 0,
+                  )}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Total Discounts</span>
+                <span className="font-mono font-extrabold text-emerald-700 text-sm">
+                  {formatRupees(monthlySeries.currentMonthDiscounts)}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Best Sales Day</span>
+                <span className="font-mono font-extrabold text-[#E5391B] text-sm truncate block">
+                  {monthlySeries.currentMonthBestDay
+                    ? `${monthlySeries.currentMonthBestDay.dateLabel} (${formatRupees(monthlySeries.currentMonthBestDay.sales)})`
+                    : '—'}
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Best-Selling Item</span>
+                <span className="font-bold text-neutral-900 text-sm truncate block" title={monthlySeries.currentMonthBestItem?.name || ''}>
+                  {monthlySeries.currentMonthBestItem
+                    ? `${monthlySeries.currentMonthBestItem.name} (${monthlySeries.currentMonthBestItem.qty})`
+                    : '—'}
+                </span>
               </div>
             </div>
 
@@ -806,18 +915,37 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                         <td className="py-3 pr-3 text-right font-mono font-bold text-neutral-900 whitespace-nowrap">
                           {formatRupees(ord.total)}
                         </td>
-                        <td className="py-3 pr-3 text-xs font-bold capitalize whitespace-nowrap">
-                          <span
-                            className={
-                              ord.status === 'completed'
-                                ? 'text-emerald-700'
-                                : ord.status === 'rejected'
-                                  ? 'text-red-700'
-                                  : 'text-amber-700'
-                            }
-                          >
-                            {ord.status.replace('_', ' ')}
-                          </span>
+                        <td className="py-3 pr-3 text-xs font-bold whitespace-nowrap">
+                          <div className="space-y-0.5">
+                            <span
+                              className={`block capitalize ${
+                                ord.status === 'completed'
+                                  ? 'text-emerald-700'
+                                  : ord.status === 'rejected'
+                                    ? 'text-red-700'
+                                    : 'text-amber-700'
+                              }`}
+                            >
+                              {ord.status.replace('_', ' ')}
+                            </span>
+                            {ord.status !== 'rejected' && (
+                              <span
+                                className={`block text-[11px] ${
+                                  ord.payment_status === 'paid'
+                                    ? 'text-emerald-700'
+                                    : ord.payment_status === 'failed'
+                                      ? 'text-red-700'
+                                      : 'text-amber-700'
+                                }`}
+                              >
+                                {ord.payment_status === 'paid'
+                                  ? 'Payment: Paid'
+                                  : ord.payment_status === 'failed'
+                                    ? 'Payment: Failed'
+                                    : 'Payment: Pending'}
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td className="py-3 pr-3 text-xs text-neutral-500 whitespace-nowrap">
                           <div>{date}</div>
@@ -825,46 +953,69 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                         </td>
                         <td className="py-3 text-right whitespace-nowrap">
                           <div className="inline-flex items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => onViewOrder(ord)}
-                              className="min-h-[34px] px-2.5 py-1 rounded-lg border border-neutral-200 bg-white text-neutral-800 text-xs font-bold hover:bg-neutral-100 inline-flex items-center gap-1 cursor-pointer"
-                            >
-                              <Eye className="w-3.5 h-3.5" />
-                              View
-                            </button>
-                            <button
-                              type="button"
-                              disabled={isDownloading}
-                              onClick={() => onDownloadBill(ord)}
-                              className="min-h-[34px] px-2.5 py-1 rounded-lg bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
-                            >
-                              <Download className="w-3.5 h-3.5" />
-                              {isDownloading ? '...' : 'Bill'}
-                            </button>
-                            <button
-                              type="button"
-                              disabled={isBusySend}
-                              onClick={() => onSendWhatsApp(ord)}
-                              className={`min-h-[34px] px-2.5 py-1 rounded-lg text-white text-xs font-bold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60 ${
-                                ord.whatsapp_status === 'failed'
-                                  ? 'bg-red-700 hover:bg-red-800'
-                                  : 'bg-emerald-700 hover:bg-emerald-800'
-                              }`}
-                            >
-                              {isBusySend ? (
-                                <Clock className="w-3.5 h-3.5" />
-                              ) : ord.whatsapp_status === 'failed' ? (
-                                <RefreshCw className="w-3.5 h-3.5" />
-                              ) : (
-                                <Send className="w-3.5 h-3.5" />
-                              )}
-                              {ord.whatsapp_status === 'failed'
-                                ? 'Retry'
-                                : ord.whatsapp_status === 'sent'
-                                  ? 'Sent'
-                                  : 'Send'}
-                            </button>
+                            {!ord.pdf_ready && !ord.pdf_url && ord.bill_status === 'not_generated' ? (
+                              <button
+                                type="button"
+                                onClick={() => onViewOrder(ord)}
+                                className="min-h-[34px] px-2.5 py-1 rounded-lg bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] inline-flex items-center gap-1 cursor-pointer"
+                              >
+                                Generate Bill
+                              </button>
+                            ) : (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => onViewOrder(ord)}
+                                  className="min-h-[34px] px-2.5 py-1 rounded-lg border border-neutral-200 bg-white text-neutral-800 text-xs font-bold hover:bg-neutral-100 inline-flex items-center gap-1 cursor-pointer"
+                                >
+                                  <Eye className="w-3.5 h-3.5" />
+                                  View
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isDownloading}
+                                  onClick={() => onDownloadBill(ord)}
+                                  className="min-h-[34px] px-2.5 py-1 rounded-lg bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
+                                >
+                                  <Download className="w-3.5 h-3.5" />
+                                  {isDownloading ? '...' : 'Download'}
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isBusySend}
+                                  onClick={() => onSendWhatsApp(ord)}
+                                  className={`min-h-[34px] px-2.5 py-1 rounded-lg text-white text-xs font-bold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60 ${
+                                    ord.whatsapp_status === 'failed'
+                                      ? 'bg-red-700 hover:bg-red-800'
+                                      : 'bg-emerald-700 hover:bg-emerald-800'
+                                  }`}
+                                >
+                                  {isBusySend ? (
+                                    <Clock className="w-3.5 h-3.5" />
+                                  ) : ord.whatsapp_status === 'failed' ? (
+                                    <RefreshCw className="w-3.5 h-3.5" />
+                                  ) : (
+                                    <Send className="w-3.5 h-3.5" />
+                                  )}
+                                  {ord.whatsapp_status === 'failed'
+                                    ? 'Retry'
+                                    : ord.whatsapp_status === 'sent'
+                                      ? 'Sent'
+                                      : 'Share Bill'}
+                                </button>
+                              </>
+                            )}
+                            {onMarkPaid && ord.payment_status !== 'paid' && ord.status !== 'rejected' && (
+                              <button
+                                type="button"
+                                disabled={updatingPaymentId === ord.id}
+                                onClick={() => onMarkPaid(ord)}
+                                className="min-h-[34px] px-2.5 py-1 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-bold hover:bg-emerald-100 inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
+                              >
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                                {updatingPaymentId === ord.id ? '...' : 'Mark Paid'}
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>
@@ -914,6 +1065,23 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                         >
                           {ord.status.replace('_', ' ')}
                         </p>
+                        {ord.status !== 'rejected' && (
+                          <p
+                            className={`text-[11px] font-bold ${
+                              ord.payment_status === 'paid'
+                                ? 'text-emerald-700'
+                                : ord.payment_status === 'failed'
+                                  ? 'text-red-700'
+                                  : 'text-amber-700'
+                            }`}
+                          >
+                            {ord.payment_status === 'paid'
+                              ? 'Paid'
+                              : ord.payment_status === 'failed'
+                                ? 'Pay Failed'
+                                : 'Pay Pending'}
+                          </p>
+                        )}
                       </div>
                     </div>
 
@@ -921,39 +1089,62 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                       {ord.items.map((l) => `${l.name} ×${l.quantity}`).join(', ')} · {date}, {time}
                     </p>
 
-                    <div className="grid grid-cols-3 gap-2">
-                      <button
-                        type="button"
-                        onClick={() => onViewOrder(ord)}
-                        className="min-h-[38px] px-2 py-1.5 rounded-xl bg-white border border-neutral-200 text-neutral-900 text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer"
-                      >
-                        <Eye className="w-3.5 h-3.5" />
-                        View
-                      </button>
-                      <button
-                        type="button"
-                        disabled={isDownloading}
-                        onClick={() => onDownloadBill(ord)}
-                        className="min-h-[38px] px-2 py-1.5 rounded-xl bg-neutral-900 text-white text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        {isDownloading ? '...' : 'Download'}
-                      </button>
-                      <button
-                        type="button"
-                        disabled={isBusySend}
-                        onClick={() => onSendWhatsApp(ord)}
-                        className={`min-h-[38px] px-2 py-1.5 rounded-xl text-white text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 ${
-                          ord.whatsapp_status === 'failed' ? 'bg-red-700' : 'bg-emerald-700'
-                        }`}
-                      >
-                        <Send className="w-3.5 h-3.5" />
-                        {ord.whatsapp_status === 'failed'
-                          ? 'Retry'
-                          : ord.whatsapp_status === 'sent'
-                            ? 'Sent'
-                            : 'Send'}
-                      </button>
+                    <div className="flex flex-wrap gap-2">
+                      {!ord.pdf_ready && !ord.pdf_url && ord.bill_status === 'not_generated' ? (
+                        <button
+                          type="button"
+                          onClick={() => onViewOrder(ord)}
+                          className="flex-1 min-h-[38px] px-3 py-1.5 rounded-xl bg-[#E5391B] text-white text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer"
+                        >
+                          Generate Bill
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => onViewOrder(ord)}
+                            className="flex-1 min-h-[38px] px-2 py-1.5 rounded-xl bg-white border border-neutral-200 text-neutral-900 text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer"
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                            View
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isDownloading}
+                            onClick={() => onDownloadBill(ord)}
+                            className="flex-1 min-h-[38px] px-2 py-1.5 rounded-xl bg-neutral-900 text-white text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            {isDownloading ? '...' : 'Download'}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isBusySend}
+                            onClick={() => onSendWhatsApp(ord)}
+                            className={`flex-1 min-h-[38px] px-2 py-1.5 rounded-xl text-white text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 ${
+                              ord.whatsapp_status === 'failed' ? 'bg-red-700' : 'bg-emerald-700'
+                            }`}
+                          >
+                            <Send className="w-3.5 h-3.5" />
+                            {ord.whatsapp_status === 'failed'
+                              ? 'Retry'
+                              : ord.whatsapp_status === 'sent'
+                                ? 'Sent'
+                                : 'Share Bill'}
+                          </button>
+                        </>
+                      )}
+                      {onMarkPaid && ord.payment_status !== 'paid' && ord.status !== 'rejected' && (
+                        <button
+                          type="button"
+                          disabled={updatingPaymentId === ord.id}
+                          onClick={() => onMarkPaid(ord)}
+                          className="w-full min-h-[38px] px-3 py-1.5 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60"
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          {updatingPaymentId === ord.id ? 'Updating...' : 'Mark Paid'}
+                        </button>
+                      )}
                     </div>
                   </div>
                 );

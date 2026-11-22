@@ -11,27 +11,35 @@ import {
   ChefHat,
   Clock,
   Copy,
+  CreditCard,
   Download,
   Edit3,
   ExternalLink,
   Eye,
   FileText,
+  FolderArchive,
   Gift,
   Home,
   LayoutGrid,
+  Loader2,
   Lock,
   LogOut,
+  Mic,
   Phone,
   Plus,
   Printer,
+  QrCode,
   Receipt,
   RefreshCw,
+  Save,
   Send,
   Settings,
   ShieldAlert,
+  Square,
   Tag,
   Trash2,
   TrendingUp,
+  Upload,
   Utensils,
   Volume2,
   VolumeX,
@@ -56,24 +64,43 @@ import {
   getTableQrUrl,
   ownerDeleteMenuItem,
   ownerDeleteOffer,
+  ownerSavePaymentSettings,
   ownerSendWhatsAppBill,
   ownerToggleMenuItemAvailability,
   ownerToggleOfferActive,
   ownerUpdateOrderStatus,
+  ownerUpdatePaymentStatus,
+  ownerUploadPaymentQrImage,
   playKitchenAlertChime,
   seedOwnerShopDataIfNeeded,
   subscribeToAllOrders,
   subscribeToMenuItems,
   subscribeToOffers,
+  subscribeToPaymentSettings,
   subscribeToTables,
   syncCatalogToServer,
+  syncPaymentSettingsToServer,
   timestampToDate,
+  verifyWhatsAppConnectionOnServer,
 } from '../lib/orderService';
 import {
   buildHourlySalesSeries,
   getDailyReportFilename,
   isRevenueOrder,
 } from '../lib/salesAnalytics';
+import {
+  decodeUpiQrFromImageFile,
+  downloadAllTableQrsZip,
+  downloadSingleTableQrPng,
+} from '../lib/tableQrExport';
+import { buildDynamicUpiUri, DEFAULT_PAYMENT_SETTINGS, isValidUpiId } from '../lib/upiPayment';
+import {
+  playOrderNotificationBell,
+  VoiceAlertSettings,
+  voiceOrderAlertManager,
+  VoiceQueueState,
+  VoiceSpeed,
+} from '../lib/voiceOrderAlert';
 import {
   getDiscountPercent,
   getEffectivePrice,
@@ -82,6 +109,7 @@ import {
   OfferRecord,
   OrderRecord,
   OrderStatus,
+  PaymentSettings,
   TableRecord,
   TableStatus,
 } from '../types/restaurant';
@@ -146,15 +174,50 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   const [menuItems, setMenuItems] = useState<MenuItem[]>(CANONICAL_MENU_ITEMS);
   const [offers, setOffers] = useState<OfferRecord[]>(CANONICAL_OFFERS);
   const [whatsappConfigured, setWhatsappConfigured] = useState(false);
+  const [waConfigMeta, setWaConfigMeta] = useState<{
+    hasToken: boolean;
+    hasPhoneId: boolean;
+    apiVersion: string;
+  }>({ hasToken: false, hasPhoneId: false, apiVersion: 'v21.0' });
+  const [waLiveCheck, setWaLiveCheck] = useState<{
+    testing: boolean;
+    connected: boolean;
+    displayPhoneNumber?: string;
+    verifiedName?: string;
+    qualityRating?: string;
+    error?: string;
+  }>({ testing: false, connected: false });
   const [dataError, setDataError] = useState<string | null>(null);
 
   // Action busy states
   const [busyOrderId, setBusyOrderId] = useState<string | null>(null);
   const [sendingWaOrderId, setSendingWaOrderId] = useState<string | null>(null);
   const [downloadingBillId, setDownloadingBillId] = useState<string | null>(null);
+  const [updatingPaymentId, setUpdatingPaymentId] = useState<string | null>(null);
   const [billErrors, setBillErrors] = useState<Record<string, string>>({});
   const [confirmDeleteItemId, setConfirmDeleteItemId] = useState<string | null>(null);
   const [confirmDeleteOfferId, setConfirmDeleteOfferId] = useState<string | null>(null);
+
+  // Payment settings state (Restaurant UPI ID, Merchant Name, Uploaded Reference QR)
+  const [paymentSettings, setPaymentSettings] = useState<PaymentSettings>(DEFAULT_PAYMENT_SETTINGS);
+  const [paymentDraft, setPaymentDraft] = useState<{
+    upi_id: string;
+    merchant_name: string;
+    qr_image_url: string;
+  }>({
+    upi_id: DEFAULT_PAYMENT_SETTINGS.upi_id,
+    merchant_name: DEFAULT_PAYMENT_SETTINGS.merchant_name,
+    qr_image_url: DEFAULT_PAYMENT_SETTINGS.qr_image_url,
+  });
+  const [savingPayment, setSavingPayment] = useState(false);
+  const [uploadingQr, setUploadingQr] = useState(false);
+  const [qrScanNotice, setQrScanNotice] = useState<string | null>(null);
+  const [paymentFormError, setPaymentFormError] = useState<string | null>(null);
+  const paymentDraftDirtyRef = useRef(false);
+
+  // Table QR Download & Print state
+  const [downloadingTableQr, setDownloadingTableQr] = useState<number | 'all' | null>(null);
+  const [printTableNumbers, setPrintTableNumbers] = useState<number[]>([...TABLE_NUMBERS]);
 
   // Modals & inspector state
   const [itemModalOpen, setItemModalOpen] = useState(false);
@@ -164,10 +227,16 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   const [editingOffer, setEditingOffer] = useState<OfferRecord | null>(null);
   const [previewBillOrder, setPreviewBillOrder] = useState<OrderRecord | null>(null);
   const [selectedTableNum, setSelectedTableNum] = useState<number | null>(null);
-  const [soundEnabled, setSoundEnabled] = useState(true);
+  const [voiceSettings, setVoiceSettings] = useState<VoiceAlertSettings>(() =>
+    voiceOrderAlertManager.getSettings(),
+  );
+  const [voiceQueueState, setVoiceQueueState] = useState<VoiceQueueState>(() =>
+    voiceOrderAlertManager.getState(),
+  );
+  const [dismissedVoiceError, setDismissedVoiceError] = useState<string | null>(null);
   const [copiedTable, setCopiedTable] = useState<number | null>(null);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
-  const [newOrderBanner, setNewOrderBanner] = useState<OrderRecord | null>(null);
+  const [liveAlertOrders, setLiveAlertOrders] = useState<OrderRecord[]>([]);
   const [quickReportBusy, setQuickReportBusy] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const prefersReducedMotion = useReducedMotion();
@@ -175,7 +244,24 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   const knownOrderStatusesRef = useRef<Map<string, OrderStatus>>(new Map());
   const seenNewOrderIdsRef = useRef<Set<string>>(new Set());
   const initialOrdersLoadedRef = useRef(false);
+  const voiceSettingsRef = useRef<VoiceAlertSettings>(voiceSettings);
   const liveOrdersRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    voiceSettingsRef.current = voiceSettings;
+  }, [voiceSettings]);
+
+  useEffect(() => {
+    const unsubVoice = voiceOrderAlertManager.subscribe((next) => {
+      setVoiceQueueState(next);
+      if (next.lastError && next.lastError !== dismissedVoiceError) {
+        setDismissedVoiceError(null);
+      }
+    });
+    return () => {
+      unsubVoice();
+    };
+  }, [dismissedVoiceError]);
 
   const showToast = (msg: string) => {
     setToastMsg(msg);
@@ -200,6 +286,23 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
             await seedOwnerShopDataIfNeeded(nextUser);
             const cfg = await fetchOwnerConfigStatus();
             setWhatsappConfigured(cfg.whatsappConfigured);
+            setWaConfigMeta({
+              hasToken: Boolean(cfg.hasToken),
+              hasPhoneId: Boolean(cfg.hasPhoneId),
+              apiVersion: cfg.apiVersion || 'v21.0',
+            });
+            if (cfg.whatsappConfigured) {
+              setWaLiveCheck({ testing: true, connected: false });
+              const live = await verifyWhatsAppConnectionOnServer();
+              setWaLiveCheck({
+                testing: false,
+                connected: live.connected,
+                displayPhoneNumber: live.displayPhoneNumber,
+                verifiedName: live.verifiedName,
+                qualityRating: live.qualityRating,
+                error: live.error,
+              });
+            }
           } catch (err) {
             setDataError(err instanceof Error ? err.message : 'Unable to initialize shop data.');
           }
@@ -225,35 +328,66 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     const unsubOrders = subscribeToAllOrders(
       (incomingOrders) => {
         if (!initialOrdersLoadedRef.current) {
+          // Mark all pre-existing orders as seen so refreshing the page NEVER announces old orders
           for (const ord of incomingOrders) {
             seenNewOrderIdsRef.current.add(ord.id);
+            voiceOrderAlertManager.markOrderAlreadySeen(ord.id);
           }
         } else {
+          const freshlyArrivedPending: OrderRecord[] = [];
+          let billRequestedChime = false;
+
           for (const ord of incomingOrders) {
             const prevStatus = knownOrderStatusesRef.current.get(ord.id);
-            if (!prevStatus && ord.status === 'pending' && !seenNewOrderIdsRef.current.has(ord.id)) {
+            const isGenuinelyNewPending =
+              !prevStatus &&
+              ord.status === 'pending' &&
+              !seenNewOrderIdsRef.current.has(ord.id) &&
+              !voiceOrderAlertManager.hasBeenAnnounced(ord.id);
+
+            if (isGenuinelyNewPending) {
               seenNewOrderIdsRef.current.add(ord.id);
-              setNewOrderBanner(ord);
-              window.setTimeout(() => {
-                setNewOrderBanner((curr) => (curr?.id === ord.id ? null : curr));
-              }, 8500);
-              if (soundEnabled) {
-                playKitchenAlertChime('order');
-              }
-              break;
-            }
-            if (prevStatus && prevStatus !== 'bill_requested' && ord.status === 'bill_requested') {
-              if (soundEnabled) {
-                playKitchenAlertChime('bill');
-              }
-              break;
+              freshlyArrivedPending.push(ord);
+            } else if (
+              prevStatus &&
+              prevStatus !== 'bill_requested' &&
+              ord.status === 'bill_requested'
+            ) {
+              billRequestedChime = true;
             }
           }
+
+          if (freshlyArrivedPending.length > 0) {
+            // Announce oldest-first so simultaneous orders play in natural arrival order
+            const chronological = [...freshlyArrivedPending].reverse();
+            for (const newOrd of chronological) {
+              voiceOrderAlertManager.enqueueOrder(newOrd);
+            }
+            setLiveAlertOrders((prev) => {
+              const existingIds = new Set(prev.map((o) => o.id));
+              const additions = freshlyArrivedPending.filter((o) => !existingIds.has(o.id));
+              return [...additions, ...prev].slice(0, 6);
+            });
+          } else if (billRequestedChime && voiceSettingsRef.current.enabled) {
+            playKitchenAlertChime('bill');
+          }
         }
+
+        // Keep live alert popup cards synced with Firestore (auto-remove once confirmed/rejected)
+        const pendingById = new Map<string, OrderRecord>();
         const nextMap = new Map<string, OrderStatus>();
         for (const ord of incomingOrders) {
           nextMap.set(ord.id, ord.status);
+          if (ord.status === 'pending') {
+            pendingById.set(ord.id, ord);
+          }
         }
+        setLiveAlertOrders((prev) =>
+          prev
+            .filter((o) => pendingById.has(o.id))
+            .map((o) => pendingById.get(o.id) || o),
+        );
+
         knownOrderStatusesRef.current = nextMap;
         initialOrdersLoadedRef.current = true;
         setOrders(incomingOrders);
@@ -268,14 +402,35 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
 
     const unsubMenu = subscribeToMenuItems((items) => setMenuItems(items));
     const unsubOffers = subscribeToOffers((list) => setOffers(list));
+    const unsubPayment = subscribeToPaymentSettings((settings) => {
+      setPaymentSettings(settings);
+      if (!paymentDraftDirtyRef.current) {
+        setPaymentDraft({
+          upi_id: settings.upi_id,
+          merchant_name: settings.merchant_name,
+          qr_image_url: settings.qr_image_url,
+        });
+      }
+      void syncPaymentSettingsToServer(settings);
+    });
 
     return () => {
       unsubOrders();
       unsubTables();
       unsubMenu();
       unsubOffers();
+      unsubPayment();
     };
-  }, [authReady, user, isOwner, soundEnabled]);
+  }, [authReady, user, isOwner]);
+
+  // Restore all 6 table cards after printing a single table card
+  useEffect(() => {
+    const handleAfterPrint = () => {
+      setPrintTableNumbers([...TABLE_NUMBERS]);
+    };
+    window.addEventListener('afterprint', handleAfterPrint);
+    return () => window.removeEventListener('afterprint', handleAfterPrint);
+  }, []);
 
   // Keep server-side pricing engine synced whenever Owner updates menu items or offers
   useEffect(() => {
@@ -302,7 +457,80 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   };
 
   const handleSignOut = async () => {
+    voiceOrderAlertManager.stopAndClearQueue();
     await signOut(auth);
+  };
+
+  const handleEnableSoundAlerts = async () => {
+    const unlocked = await voiceOrderAlertManager.enableSound();
+    setVoiceSettings(voiceOrderAlertManager.getSettings());
+    setDismissedVoiceError(null);
+    if (unlocked) {
+      await playOrderNotificationBell(voiceSettings.volume);
+      showToast('Voice order alerts enabled (Indian Female voice ready).');
+    } else {
+      showToast('Unable to unlock browser audio. Please check browser sound permissions.');
+    }
+  };
+
+  const handleToggleVoiceEnabled = async () => {
+    const nextEnabled = !voiceSettings.enabled;
+    if (nextEnabled) {
+      await voiceOrderAlertManager.enableSound();
+    }
+    const updated = voiceOrderAlertManager.updateSettings({ enabled: nextEnabled });
+    setVoiceSettings(updated);
+    showToast(nextEnabled ? 'Voice order announcements ON.' : 'Voice order announcements OFF.');
+  };
+
+  const handleChangeVoiceVolume = (nextVolume: number) => {
+    const updated = voiceOrderAlertManager.updateSettings({ volume: nextVolume });
+    setVoiceSettings(updated);
+  };
+
+  const handleChangeVoiceSpeed = (nextSpeed: VoiceSpeed) => {
+    const updated = voiceOrderAlertManager.updateSettings({ speed: nextSpeed });
+    setVoiceSettings(updated);
+  };
+
+  const handleTestVoiceAnnouncement = async () => {
+    setDismissedVoiceError(null);
+    setVoiceSettings(voiceOrderAlertManager.updateSettings({ soundActivated: true }));
+    await voiceOrderAlertManager.playTestAnnouncement();
+  };
+
+  const handleReplayOrderVoice = async (order: OrderRecord) => {
+    setDismissedVoiceError(null);
+    await voiceOrderAlertManager.replayOrder(order);
+    setVoiceSettings(voiceOrderAlertManager.getSettings());
+  };
+
+  const handleTestWhatsAppConnection = async () => {
+    if (waLiveCheck.testing) return;
+    setWaLiveCheck((prev) => ({ ...prev, testing: true, error: undefined }));
+    const cfg = await fetchOwnerConfigStatus();
+    setWhatsappConfigured(cfg.whatsappConfigured);
+    setWaConfigMeta({
+      hasToken: Boolean(cfg.hasToken),
+      hasPhoneId: Boolean(cfg.hasPhoneId),
+      apiVersion: cfg.apiVersion || 'v21.0',
+    });
+    const res = await verifyWhatsAppConnectionOnServer();
+    setWaLiveCheck({
+      testing: false,
+      connected: res.connected,
+      displayPhoneNumber: res.displayPhoneNumber,
+      verifiedName: res.verifiedName,
+      qualityRating: res.qualityRating,
+      error: res.error,
+    });
+    if (res.connected) {
+      showToast(
+        `WhatsApp Connected${res.displayPhoneNumber ? ` (${res.displayPhoneNumber})` : ''}`,
+      );
+    } else if (res.error) {
+      showToast(res.error);
+    }
   };
 
   const handleSendWhatsApp = async (order: OrderRecord) => {
@@ -415,6 +643,129 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     }
   };
 
+  const handleMarkPaid = async (order: OrderRecord) => {
+    if (updatingPaymentId) return;
+    setUpdatingPaymentId(order.id);
+    setDataError(null);
+    try {
+      await ownerUpdatePaymentStatus(order, 'paid');
+      showToast(`Payment marked as Paid for #${order.order_code}.`);
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Could not update payment status.');
+    } finally {
+      setUpdatingPaymentId(null);
+    }
+  };
+
+  const handleUploadPaymentQrFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    setUploadingQr(true);
+    setPaymentFormError(null);
+    setQrScanNotice(null);
+    try {
+      // 1. Auto-decode UPI ID & Merchant Name directly from the uploaded QR screenshot
+      const decoded = await decodeUpiQrFromImageFile(file);
+      // 2. Upload reference QR image safely to server storage
+      const uploadedUrl = await ownerUploadPaymentQrImage(file);
+
+      paymentDraftDirtyRef.current = true;
+      setPaymentDraft((prev) => ({
+        upi_id: decoded.upiId || prev.upi_id,
+        merchant_name: decoded.merchantName || prev.merchant_name || 'RikZen Fast Food',
+        qr_image_url: uploadedUrl,
+      }));
+
+      if (decoded.upiId) {
+        setQrScanNotice(
+          `UPI ID detected automatically from your QR: ${decoded.upiId}. Review and click Save Payment Settings.`,
+        );
+      } else {
+        setQrScanNotice(
+          'QR screenshot uploaded! Enter your Restaurant UPI ID below and click Save so every bill generates a dynamic exact-amount QR.',
+        );
+      }
+    } catch (err) {
+      setPaymentFormError(
+        err instanceof Error ? err.message : 'Unable to upload or read payment QR image.',
+      );
+    } finally {
+      setUploadingQr(false);
+    }
+  };
+
+  const handleSavePaymentSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (savingPayment) return;
+    setPaymentFormError(null);
+    setQrScanNotice(null);
+
+    const trimmedUpi = paymentDraft.upi_id.trim();
+    if (trimmedUpi !== '' && !isValidUpiId(trimmedUpi)) {
+      setPaymentFormError(
+        'Please enter a valid UPI ID (example: rikzenfastfood@okaxis or 9876543210@ybl).',
+      );
+      return;
+    }
+
+    setSavingPayment(true);
+    try {
+      const saved = await ownerSavePaymentSettings({
+        upi_id: trimmedUpi,
+        merchant_name: paymentDraft.merchant_name.trim() || 'RikZen Fast Food',
+        qr_image_url: paymentDraft.qr_image_url.trim(),
+      });
+      paymentDraftDirtyRef.current = false;
+      setPaymentSettings(saved);
+      showToast(
+        trimmedUpi
+          ? `Payment Settings saved (${trimmedUpi}). Bills now embed dynamic exact-amount UPI QRs.`
+          : 'Payment Settings saved.',
+      );
+    } catch (err) {
+      setPaymentFormError(
+        err instanceof Error ? err.message : 'Could not save payment settings.',
+      );
+    } finally {
+      setSavingPayment(false);
+    }
+  };
+
+  const handleDownloadSingleTableQr = async (tableNum: number) => {
+    if (downloadingTableQr !== null) return;
+    setDownloadingTableQr(tableNum);
+    try {
+      const filename = await downloadSingleTableQrPng(tableNum);
+      showToast(`Downloaded ${filename}`);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to download Table QR PNG.');
+    } finally {
+      setDownloadingTableQr(null);
+    }
+  };
+
+  const handleDownloadAllTableQrs = async () => {
+    if (downloadingTableQr !== null) return;
+    setDownloadingTableQr('all');
+    try {
+      const filename = await downloadAllTableQrsZip();
+      showToast(`Downloaded ${filename} (Tables 1–6)`);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to generate Table QR ZIP.');
+    } finally {
+      setDownloadingTableQr(null);
+    }
+  };
+
+  const handlePrintTableQrs = (tableNums: number[]) => {
+    setPrintTableNumbers(tableNums);
+    window.setTimeout(() => {
+      window.print();
+    }, 120);
+  };
+
   // Live 6-Table derived status
   const liveTableSummaries = useMemo(() => {
     const activeByTable = new Map<number, OrderRecord>();
@@ -460,11 +811,17 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     const readyCount = orders.filter((o) => o.status === 'ready').length;
     const billReqCount = orders.filter((o) => o.status === 'bill_requested' || o.status === 'bill_ready').length;
     const completedCount = orders.filter((o) => o.status === 'completed').length;
+    const todaysPaidCount = todaysNonRejected.filter((o) => o.payment_status === 'paid').length;
+    const todaysPendingPaymentCount = todaysNonRejected.filter(
+      (o) => o.payment_status !== 'paid',
+    ).length;
     const activeTablesCount = liveTableSummaries.filter((t) => t.status !== 'available').length;
 
     return {
       todaysOrders: todaysNonRejected.length,
       todaysCompletedCount: todaysCompleted.length,
+      todaysPaidCount,
+      todaysPendingPaymentCount,
       todaysSales,
       todaysDiscounts,
       avgOrderValue: todaysCompleted.length > 0 ? Math.round(todaysSales / todaysCompleted.length) : 0,
@@ -626,7 +983,8 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   // REDESIGNED MOBILE-APP-LIKE OWNER POS DASHBOARD
   // =========================================================================
   return (
-    <div className="min-h-screen bg-[#F8F9FA] text-neutral-900 flex flex-col lg:flex-row">
+    <>
+    <div className="min-h-screen bg-[#F8F9FA] text-neutral-900 flex flex-col lg:flex-row print:hidden">
       {/* Desktop Sidebar */}
       <aside className="hidden lg:flex lg:w-64 lg:shrink-0 bg-white border-r border-neutral-200 flex-col justify-between p-5 sticky top-0 h-screen">
         <div className="space-y-6">
@@ -719,18 +1077,39 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            {voiceQueueState.isSpeaking && (
+              <button
+                type="button"
+                onClick={() => voiceOrderAlertManager.skipCurrent()}
+                title="Stop current announcement"
+                className="min-h-[40px] px-3 rounded-xl bg-red-50 border border-red-200 text-red-700 hover:bg-red-100 inline-flex items-center gap-1.5 text-xs font-bold cursor-pointer"
+              >
+                <span className="w-2 h-2 rounded-full bg-red-600 animate-ping" />
+                <span className="hidden md:inline max-w-[140px] truncate">
+                  {voiceQueueState.currentLabel || 'Announcing...'}
+                </span>
+                <Square className="w-3 h-3 fill-current" />
+              </button>
+            )}
+
             <button
               type="button"
-              onClick={() => setSoundEnabled((s) => !s)}
-              aria-label={soundEnabled ? 'Mute sound' : 'Unmute sound'}
-              className="min-h-[40px] min-w-[40px] px-3 rounded-xl border border-neutral-200 text-neutral-700 hover:bg-neutral-50 inline-flex items-center justify-center gap-1.5 text-xs font-semibold cursor-pointer"
+              onClick={handleToggleVoiceEnabled}
+              aria-label={voiceSettings.enabled ? 'Turn voice alerts off' : 'Turn voice alerts on'}
+              className={`min-h-[40px] min-w-[40px] px-3 rounded-xl border inline-flex items-center justify-center gap-1.5 text-xs font-semibold cursor-pointer ${
+                voiceSettings.enabled
+                  ? 'border-emerald-200 bg-emerald-50/60 text-emerald-800 hover:bg-emerald-50'
+                  : 'border-neutral-200 bg-white text-neutral-600 hover:bg-neutral-50'
+              }`}
             >
-              {soundEnabled ? (
+              {voiceSettings.enabled ? (
                 <Volume2 className="w-4 h-4 text-emerald-700" />
               ) : (
                 <VolumeX className="w-4 h-4 text-neutral-400" />
               )}
-              <span className="hidden sm:inline">{soundEnabled ? 'Bell On' : 'Muted'}</span>
+              <span className="hidden sm:inline">
+                {voiceSettings.enabled ? 'Voice ON' : 'Voice OFF'}
+              </span>
             </button>
 
             <button
@@ -767,57 +1146,175 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
           })}
         </div>
 
-        {/* Live New Order Slide-In Banner (Animates Once Per New Order) */}
-        <AnimatePresence>
-          {newOrderBanner && (
-            <motion.div
-              key={newOrderBanner.id}
-              initial={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, x: 48, scale: 0.96 }}
-              animate={{ opacity: 1, x: 0, scale: 1 }}
-              exit={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, x: 48 }}
-              transition={{ duration: 0.24 }}
-              className="fixed top-20 right-4 z-50 w-[calc(100vw-2rem)] max-w-sm rounded-2xl bg-[#151110] text-white border border-[#E5391B]/50 shadow-2xl p-4 space-y-2.5"
-            >
-              <div className="flex items-start justify-between gap-2">
-                <div>
-                  <p className="text-[11px] font-extrabold tracking-wider text-amber-300 uppercase">
-                    NEW ORDER · Table {newOrderBanner.table_number}
+        {/* Browser Autoplay Requirement Banner: Enable Order Alerts */}
+        {voiceSettings.enabled && (!voiceSettings.soundActivated || !voiceQueueState.audioUnlocked) && (
+          <div className="bg-amber-50 border-b border-amber-200 px-4 sm:px-6 py-3">
+            <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="w-10 h-10 rounded-xl bg-[#E5391B] text-white flex items-center justify-center shrink-0">
+                  <Volume2 className="w-5 h-5" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-sm font-extrabold text-neutral-900">
+                    Enable Order Alerts
                   </p>
-                  <p className="text-base font-extrabold text-white mt-0.5 truncate">
-                    {newOrderBanner.customer_name} ·{' '}
-                    <span className="font-mono text-amber-300">
-                      {formatRupees(newOrderBanner.total)}
-                    </span>
+                  <p className="text-xs text-neutral-700">
+                    Click once to activate natural Indian female voice announcements for incoming table orders.
                   </p>
                 </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
                 <button
                   type="button"
-                  onClick={() => setNewOrderBanner(null)}
-                  aria-label="Dismiss new order notification"
-                  className="w-7 h-7 rounded-lg bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer shrink-0"
+                  onClick={handleEnableSoundAlerts}
+                  className="min-h-[42px] px-5 py-2 rounded-xl bg-[#E5391B] hover:bg-[#C82E14] text-white text-xs font-extrabold tracking-wide inline-flex items-center gap-2 shadow-sm cursor-pointer"
                 >
-                  <X className="w-4 h-4" />
+                  <Volume2 className="w-4 h-4" />
+                  ENABLE SOUND
                 </button>
               </div>
-              <p className="text-xs text-neutral-300 line-clamp-2">
-                {newOrderBanner.items.map((l) => `${l.name} ×${l.quantity}`).join(', ')}
-              </p>
-              <div className="flex items-center gap-2 pt-0.5">
+            </div>
+          </div>
+        )}
+
+        {/* Clear Fallback Notice if Speech Synthesis or Browser Audio Fails */}
+        {voiceQueueState.lastError && voiceQueueState.lastError !== dismissedVoiceError && (
+          <div className="bg-red-50 border-b border-red-200 px-4 sm:px-6 py-2.5">
+            <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-2 text-xs">
+              <p className="font-semibold text-red-800">{voiceQueueState.lastError}</p>
+              <div className="flex items-center gap-2">
+                {!voiceQueueState.audioUnlocked && (
+                  <button
+                    type="button"
+                    onClick={handleEnableSoundAlerts}
+                    className="px-3 py-1 rounded-lg bg-[#E5391B] text-white font-bold cursor-pointer"
+                  >
+                    ENABLE SOUND
+                  </button>
+                )}
                 <button
                   type="button"
-                  onClick={() => {
-                    setSection('dashboard');
-                    setOrderFilter('pending');
-                    setNewOrderBanner(null);
-                    liveOrdersRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                  }}
-                  className="flex-1 min-h-[36px] px-3 py-1.5 rounded-xl bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] cursor-pointer"
+                  onClick={() => setDismissedVoiceError(voiceQueueState.lastError)}
+                  className="px-2.5 py-1 rounded-lg border border-red-200 text-red-800 font-semibold hover:bg-red-100 cursor-pointer"
                 >
-                  Open New Order
+                  Dismiss
                 </button>
               </div>
-            </motion.div>
-          )}
+            </div>
+          </div>
+        )}
+
+        {/* Large Animated Visual New Order Alert Card (Confirm / Reject Directly) */}
+        <AnimatePresence>
+          {liveAlertOrders.length > 0 && (() => {
+            const activeAlert = liveAlertOrders[0];
+            const isSpeakingThis = voiceQueueState.currentOrderId === activeAlert.id;
+            const isAlertBusy = busyOrderId === activeAlert.id;
+            const remainingAlerts = liveAlertOrders.length - 1;
+            return (
+              <motion.div
+                key={activeAlert.id}
+                initial={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, y: -24, scale: 0.96 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, y: -18, scale: 0.96 }}
+                transition={{ duration: 0.24 }}
+                className="fixed top-20 right-4 z-50 w-[calc(100vw-2rem)] max-w-md rounded-3xl bg-[#151110] text-white border-2 border-[#E5391B] shadow-2xl shadow-red-600/30 p-5 space-y-4"
+              >
+                {/* Subtle pulsing top glow ring */}
+                <div className="flex items-start justify-between gap-3">
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="inline-flex items-center gap-1.5 text-xs font-extrabold uppercase tracking-widest text-amber-300">
+                        <Bell className="w-4 h-4 text-[#E5391B] animate-bounce" />
+                        NEW ORDER
+                      </span>
+                      {isSpeakingThis && (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-400/30">
+                          <Mic className="w-3 h-3 animate-pulse" />
+                          Announcing...
+                        </span>
+                      )}
+                      {remainingAlerts > 0 && (
+                        <span className="text-[11px] font-bold px-2 py-0.5 rounded-lg bg-white/10 text-amber-200">
+                          +{remainingAlerts} more
+                        </span>
+                      )}
+                    </div>
+                    <h3 className="font-display text-2xl font-extrabold tracking-tight text-white">
+                      TABLE {activeAlert.table_number}
+                    </h3>
+                    <p className="text-sm font-bold text-neutral-200">
+                      {activeAlert.customer_name || 'Guest'}
+                      <span className="font-mono text-xs text-neutral-400 ml-2">
+                        #{activeAlert.order_code}
+                      </span>
+                    </p>
+                  </div>
+
+                  <div className="flex flex-col items-end gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setLiveAlertOrders((prev) => prev.filter((o) => o.id !== activeAlert.id))
+                      }
+                      aria-label="Dismiss new order alert"
+                      className="w-8 h-8 rounded-xl bg-white/10 hover:bg-white/20 flex items-center justify-center cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                    <p className="font-mono text-2xl font-extrabold text-amber-300 tabular-nums">
+                      {formatRupees(activeAlert.total)}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Every ordered item clearly visible */}
+                <div className="rounded-2xl bg-white/5 border border-white/10 p-3.5 space-y-1.5 max-h-40 overflow-y-auto">
+                  {activeAlert.items.map((line) => (
+                    <div
+                      key={line.menu_item_id}
+                      className="flex items-center justify-between gap-2 text-sm"
+                    >
+                      <span className="font-semibold text-white">
+                        {line.name} × {line.quantity}
+                      </span>
+                      <span className="font-mono text-xs text-neutral-300 tabular-nums">
+                        {formatRupees(line.line_total)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Direct Confirm & Reject Actions */}
+                <div className="grid grid-cols-2 gap-2.5">
+                  <button
+                    type="button"
+                    disabled={isAlertBusy}
+                    onClick={async () => {
+                      await handleStatusChange(activeAlert, 'accepted');
+                      setLiveAlertOrders((prev) => prev.filter((o) => o.id !== activeAlert.id));
+                    }}
+                    className="min-h-[46px] px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-extrabold inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                  >
+                    <Check className="w-4 h-4" />
+                    {isAlertBusy ? 'Confirming...' : 'CONFIRM ORDER'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isAlertBusy}
+                    onClick={async () => {
+                      await handleStatusChange(activeAlert, 'rejected');
+                      setLiveAlertOrders((prev) => prev.filter((o) => o.id !== activeAlert.id));
+                    }}
+                    className="min-h-[46px] px-4 py-2.5 rounded-xl bg-red-600/20 hover:bg-red-600/35 border border-red-500/40 text-red-200 text-sm font-extrabold inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                  >
+                    <XCircle className="w-4 h-4" />
+                    REJECT
+                  </button>
+                </div>
+              </motion.div>
+            );
+          })()}
         </AnimatePresence>
 
         {/* Inline Toast Banner */}
@@ -913,7 +1410,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                 </div>
               </div>
 
-              {/* 4 Animated Top KPI Cards (Real Completed Revenue ONLY) */}
+              {/* 4 Animated Top KPI Cards (Today's Sales, Orders, Paid, Pending) */}
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
                 <motion.div
                   whileHover={prefersReducedMotion ? undefined : { y: -2 }}
@@ -925,21 +1422,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                     <AnimatedNumber value={stats.todaysSales} prefix="₹" />
                   </p>
                   <p className="text-[11px] text-emerald-700 font-semibold mt-1">
-                    From completed orders only
-                  </p>
-                </motion.div>
-
-                <motion.div
-                  whileHover={prefersReducedMotion ? undefined : { y: -2 }}
-                  transition={{ duration: 0.16 }}
-                  className="bg-white rounded-2xl border border-neutral-200 p-4 sm:p-5"
-                >
-                  <p className="text-xs font-bold text-neutral-500">Today&apos;s Orders</p>
-                  <p className="font-mono text-2xl sm:text-3xl font-extrabold text-neutral-900 mt-1">
-                    <AnimatedNumber value={stats.todaysOrders} />
-                  </p>
-                  <p className="text-[11px] text-neutral-500 font-medium mt-1 tabular-nums">
-                    Avg completed: {formatRupees(stats.avgOrderValue)}
+                    {stats.todaysCompletedCount} completed · Avg {formatRupees(stats.avgOrderValue)}
                   </p>
                 </motion.div>
 
@@ -949,26 +1432,42 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                   onClick={() => setSection('tables')}
                   className="bg-white rounded-2xl border border-neutral-200 p-4 sm:p-5 cursor-pointer hover:border-neutral-300"
                 >
-                  <p className="text-xs font-bold text-neutral-500">Active Tables</p>
+                  <p className="text-xs font-bold text-neutral-500">Today&apos;s Orders</p>
                   <p className="font-mono text-2xl sm:text-3xl font-extrabold text-neutral-900 mt-1">
-                    <AnimatedNumber value={stats.activeTablesCount} suffix=" / 6" />
+                    <AnimatedNumber value={stats.todaysOrders} />
                   </p>
-                  <p className="text-[11px] text-neutral-500 font-medium mt-1">
-                    {6 - stats.activeTablesCount} tables available
+                  <p className="text-[11px] text-neutral-500 font-medium mt-1 tabular-nums">
+                    Active Tables: {stats.activeTablesCount} / 6
                   </p>
                 </motion.div>
 
                 <motion.div
                   whileHover={prefersReducedMotion ? undefined : { y: -2 }}
                   transition={{ duration: 0.16 }}
-                  className="bg-white rounded-2xl border border-neutral-200 p-4 sm:p-5"
+                  onClick={() => setSection('bills')}
+                  className="bg-white rounded-2xl border border-neutral-200 p-4 sm:p-5 cursor-pointer hover:border-neutral-300"
                 >
-                  <p className="text-xs font-bold text-neutral-500">Completed Orders</p>
+                  <p className="text-xs font-bold text-neutral-500">Paid Today</p>
                   <p className="font-mono text-2xl sm:text-3xl font-extrabold text-emerald-700 mt-1">
-                    <AnimatedNumber value={stats.todaysCompletedCount} />
+                    <AnimatedNumber value={stats.todaysPaidCount} />
+                  </p>
+                  <p className="text-[11px] text-emerald-700 font-semibold mt-1">
+                    Verified payments received
+                  </p>
+                </motion.div>
+
+                <motion.div
+                  whileHover={prefersReducedMotion ? undefined : { y: -2 }}
+                  transition={{ duration: 0.16 }}
+                  onClick={() => setSection('bills')}
+                  className="bg-white rounded-2xl border border-neutral-200 p-4 sm:p-5 cursor-pointer hover:border-neutral-300"
+                >
+                  <p className="text-xs font-bold text-neutral-500">Pending Payment</p>
+                  <p className="font-mono text-2xl sm:text-3xl font-extrabold text-amber-700 mt-1">
+                    <AnimatedNumber value={stats.todaysPendingPaymentCount} />
                   </p>
                   <p className="text-[11px] text-neutral-500 font-medium mt-1 tabular-nums">
-                    {stats.completedCount} total all-time
+                    Awaiting customer UPI / cash
                   </p>
                 </motion.div>
               </div>
@@ -999,6 +1498,91 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                   compact={true}
                   emptyMessage="Mark an order Completed to see real hourly revenue appear here."
                 />
+              </div>
+
+              {/* Live Voice Order Alert Control Bar */}
+              <div className="bg-white rounded-3xl border border-neutral-200 p-4 sm:p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                <div className="flex items-start sm:items-center gap-3 min-w-0">
+                  <div
+                    className={`w-11 h-11 rounded-2xl flex items-center justify-center shrink-0 ${
+                      voiceSettings.enabled
+                        ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                        : 'bg-neutral-100 text-neutral-500 border border-neutral-200'
+                    }`}
+                  >
+                    {voiceSettings.enabled ? (
+                      <Mic className={`w-5 h-5 ${voiceQueueState.isSpeaking ? 'animate-pulse' : ''}`} />
+                    ) : (
+                      <VolumeX className="w-5 h-5" />
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="text-sm font-extrabold text-neutral-900">
+                        Live Voice Order Alerts · Indian Female
+                      </h3>
+                      {voiceQueueState.isSpeaking && (
+                        <span className="text-[11px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-lg inline-flex items-center gap-1">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 animate-ping" />
+                          Speaking {voiceQueueState.currentLabel || ''}
+                          {voiceQueueState.queueLength > 0
+                            ? ` (+${voiceQueueState.queueLength} queued)`
+                            : ''}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-neutral-500 mt-0.5">
+                      Announces table number, customer name, every ordered item, and verified total in sequence.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3">
+                  {/* Voice ON / OFF */}
+                  <button
+                    type="button"
+                    onClick={handleToggleVoiceEnabled}
+                    className={`min-h-[40px] px-3.5 py-2 rounded-xl text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer border ${
+                      voiceSettings.enabled
+                        ? 'bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700'
+                        : 'bg-neutral-100 border-neutral-200 text-neutral-700 hover:bg-neutral-200'
+                    }`}
+                  >
+                    {voiceSettings.enabled ? (
+                      <Volume2 className="w-4 h-4" />
+                    ) : (
+                      <VolumeX className="w-4 h-4" />
+                    )}
+                    {voiceSettings.enabled ? 'Voice ON' : 'Voice OFF'}
+                  </button>
+
+                  {/* Volume Slider */}
+                  <label className="inline-flex items-center gap-2 bg-neutral-50 border border-neutral-200 rounded-xl px-3 py-2 min-h-[40px]">
+                    <span className="text-[11px] font-bold text-neutral-600 whitespace-nowrap">
+                      Vol {voiceSettings.volume}%
+                    </span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={voiceSettings.volume}
+                      onChange={(e) => handleChangeVoiceVolume(Number(e.target.value))}
+                      aria-label="Voice alert volume"
+                      className="w-20 accent-[#E5391B] cursor-pointer"
+                    />
+                  </label>
+
+                  {/* Test Order Announcement Button */}
+                  <button
+                    type="button"
+                    onClick={handleTestVoiceAnnouncement}
+                    className="min-h-[40px] px-4 py-2 rounded-xl bg-neutral-900 hover:bg-neutral-800 text-white text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                  >
+                    <Volume2 className="w-4 h-4 text-amber-300" />
+                    TEST ORDER ANNOUNCEMENT
+                  </button>
+                </div>
               </div>
 
               {/* 5 Large Simple POS Queue Filter Cards */}
@@ -1116,6 +1700,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                       const isBusy = busyOrderId === order.id;
                       const isSendingWa = sendingWaOrderId === order.id;
                       const isConfirmedStage = !['pending', 'rejected'].includes(order.status);
+                      const isBeingAnnounced = voiceQueueState.currentOrderId === order.id;
 
                       return (
                         <motion.article
@@ -1125,9 +1710,11 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                           animate={{ opacity: 1, y: 0 }}
                           exit={{ opacity: 0, scale: 0.97 }}
                           transition={{ duration: 0.22 }}
-                          className={`bg-white rounded-3xl border p-5 sm:p-6 flex flex-col justify-between gap-4 ${
+                          className={`bg-white rounded-3xl border p-5 sm:p-6 flex flex-col justify-between gap-4 transition-shadow ${
                             order.status === 'pending'
-                              ? 'border-red-300 shadow-sm shadow-red-500/10'
+                              ? isBeingAnnounced
+                                ? 'border-[#E5391B] ring-4 ring-[#E5391B]/20 shadow-lg shadow-red-500/15'
+                                : 'border-red-300 ring-2 ring-red-500/15 shadow-md shadow-red-500/10'
                               : order.status === 'bill_requested'
                                 ? 'border-amber-300 shadow-sm shadow-amber-500/10'
                                 : 'border-neutral-200'
@@ -1137,25 +1724,41 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                             {/* Header Row: Status + Customer Name + Mobile + Table + Order # */}
                             <div className="flex items-start justify-between gap-3">
                               <div className="min-w-0">
-                                <p
-                                  className={`text-xs font-extrabold tracking-wide ${
-                                    order.status === 'pending'
-                                      ? 'text-red-700'
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <p
+                                    className={`text-xs font-extrabold tracking-wide inline-flex items-center gap-1.5 ${
+                                      order.status === 'pending'
+                                        ? 'text-red-700'
+                                        : order.status === 'bill_requested'
+                                          ? 'text-amber-800'
+                                          : order.status === 'preparing'
+                                            ? 'text-amber-700'
+                                            : order.status === 'rejected'
+                                              ? 'text-red-700'
+                                              : 'text-emerald-700'
+                                    }`}
+                                  >
+                                    {order.status === 'pending' && (
+                                      <span className="w-2 h-2 rounded-full bg-red-600 animate-pulse" />
+                                    )}
+                                    {order.status === 'pending'
+                                      ? 'NEW ORDER'
                                       : order.status === 'bill_requested'
-                                        ? 'text-amber-800'
-                                        : order.status === 'preparing'
-                                          ? 'text-amber-700'
-                                          : order.status === 'rejected'
-                                            ? 'text-red-700'
-                                            : 'text-emerald-700'
-                                  }`}
-                                >
-                                  {order.status === 'pending'
-                                    ? 'NEW ORDER'
-                                    : order.status === 'bill_requested'
-                                      ? 'BILL REQUESTED'
-                                      : order.status.replace('_', ' ').toUpperCase()}
-                                </p>
+                                        ? 'BILL REQUESTED'
+                                        : order.status.replace('_', ' ').toUpperCase()}
+                                  </p>
+                                  {order.status === 'pending' && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleReplayOrderVoice(order)}
+                                      className="text-[11px] font-bold text-neutral-600 hover:text-neutral-900 bg-neutral-100 hover:bg-neutral-200 px-2 py-0.5 rounded-lg inline-flex items-center gap-1 cursor-pointer"
+                                      title="Replay voice announcement"
+                                    >
+                                      <Volume2 className="w-3 h-3 text-[#E5391B]" />
+                                      {isBeingAnnounced ? 'Speaking...' : 'Announce'}
+                                    </button>
+                                  )}
+                                </div>
                                 <h3 className="text-xl font-extrabold text-neutral-900 truncate mt-0.5">
                                   {order.customer_name}
                                 </h3>
@@ -1218,10 +1821,21 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
 
                               return (
                                 <div className="rounded-2xl border border-neutral-200 bg-neutral-50/80 p-3.5 space-y-2.5">
-                                  <div className="flex items-center justify-between gap-2 text-xs">
+                                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                                     <span className="font-bold text-neutral-800 inline-flex items-center gap-1.5">
                                       <FileText className="w-3.5 h-3.5 text-[#E5391B]" />
-                                      BILL READY
+                                      BILL READY ·{' '}
+                                      <span
+                                        className={
+                                          order.payment_status === 'paid'
+                                            ? 'text-emerald-700'
+                                            : 'text-amber-700'
+                                        }
+                                      >
+                                        {order.payment_status === 'paid'
+                                          ? 'Payment: Paid'
+                                          : 'Payment: Pending'}
+                                      </span>
                                     </span>
                                     <span
                                       className={`font-extrabold inline-flex items-center gap-1.5 ${billMeta.color}`}
@@ -1314,11 +1928,25 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                                       ) : (
                                         <>
                                           <Send className="w-3.5 h-3.5" />
-                                          Send Bill
+                                          Share Bill
                                         </>
                                       )}
                                     </button>
                                   </div>
+
+                                  {order.payment_status !== 'paid' && (
+                                    <button
+                                      type="button"
+                                      disabled={updatingPaymentId === order.id}
+                                      onClick={() => handleMarkPaid(order)}
+                                      className="w-full min-h-[38px] px-3 py-1.5 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-bold hover:bg-emerald-100 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                                    >
+                                      <CheckCircle2 className="w-4 h-4" />
+                                      {updatingPaymentId === order.id
+                                        ? 'Updating Payment...'
+                                        : 'Mark Paid'}
+                                    </button>
+                                  )}
                                 </div>
                               );
                             })()}
@@ -1760,6 +2388,40 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
           {/* ========================================================== */}
           {section === 'tables' && (
             <div className="space-y-6">
+              <div className="bg-white rounded-3xl border border-neutral-200 p-5 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-extrabold text-neutral-900">
+                    Tables 1–6 Live Status &amp; QR Codes
+                  </h2>
+                  <p className="text-xs text-neutral-500 mt-0.5">
+                    Tap any table to inspect orders, or download / print high-resolution Table QR cards.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={downloadingTableQr !== null}
+                    onClick={handleDownloadAllTableQrs}
+                    className="min-h-[42px] px-4 py-2 rounded-xl bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60 whitespace-nowrap"
+                  >
+                    {downloadingTableQr === 'all' ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <FolderArchive className="w-4 h-4" />
+                    )}
+                    {downloadingTableQr === 'all' ? 'Creating ZIP...' : 'Download All Table QR'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handlePrintTableQrs([...TABLE_NUMBERS])}
+                    className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                  >
+                    <Printer className="w-4 h-4" />
+                    Print All 6 QRs
+                  </button>
+                </div>
+              </div>
+
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
                 {liveTableSummaries.map(({ tableNumber, status, activeOrder }) => {
                   const statusMeta = TABLE_STATUS_META[status];
@@ -1928,17 +2590,28 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                     numbers.
                   </p>
                 </div>
-                <span
-                  className={`text-xs font-bold px-3 py-1.5 rounded-xl border ${
-                    whatsappConfigured
-                      ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                      : 'bg-amber-50 border-amber-200 text-amber-800'
+                <button
+                  type="button"
+                  onClick={() => setSection('settings')}
+                  className={`text-xs font-bold px-3.5 py-2 rounded-xl border inline-flex items-center gap-2 cursor-pointer transition-colors ${
+                    waLiveCheck.connected
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-800 hover:bg-emerald-100'
+                      : whatsappConfigured
+                        ? 'bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100'
+                        : 'bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100'
                   }`}
                 >
-                  {whatsappConfigured
-                    ? 'WhatsApp Business API Ready'
-                    : 'WhatsApp API Pending Setup (see Settings)'}
-                </span>
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      waLiveCheck.connected ? 'bg-emerald-600' : 'bg-amber-500'
+                    }`}
+                  />
+                  {waLiveCheck.connected
+                    ? `WhatsApp Connected${waLiveCheck.displayPhoneNumber ? ` · ${waLiveCheck.displayPhoneNumber}` : ''}`
+                    : whatsappConfigured
+                      ? 'WhatsApp Keys Saved — Tap to Verify'
+                      : 'WhatsApp API Pending Setup (Open Settings)'}
+                </button>
               </div>
 
               {billOrders.length === 0 ? (
@@ -1980,9 +2653,25 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                               {formatRupees(order.total)}
                             </p>
                             <p
-                              className={`text-xs font-extrabold mt-1 inline-flex items-center gap-1.5 justify-end ${billMeta.color}`}
+                              className={`text-xs font-extrabold mt-0.5 inline-flex items-center gap-1 justify-end ${
+                                order.payment_status === 'paid'
+                                  ? 'text-emerald-700'
+                                  : 'text-amber-700'
+                              }`}
                             >
-                              <span className={`w-2 h-2 rounded-full ${billMeta.dot}`} />
+                              <span
+                                className={`w-1.5 h-1.5 rounded-full ${
+                                  order.payment_status === 'paid'
+                                    ? 'bg-emerald-600'
+                                    : 'bg-amber-500 animate-pulse'
+                                }`}
+                              />
+                              {order.payment_status === 'paid' ? 'Paid' : 'Payment Pending'}
+                            </p>
+                            <p
+                              className={`text-[11px] font-bold mt-0.5 inline-flex items-center gap-1 justify-end ${billMeta.color}`}
+                            >
+                              <span className={`w-1.5 h-1.5 rounded-full ${billMeta.dot}`} />
                               {billMeta.label}
                             </p>
                           </div>
@@ -2069,11 +2758,23 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                             ) : (
                               <>
                                 <Send className="w-3.5 h-3.5" />
-                                Send Bill
+                                Share Bill
                               </>
                             )}
                           </button>
                         </div>
+
+                        {order.payment_status !== 'paid' && (
+                          <button
+                            type="button"
+                            disabled={updatingPaymentId === order.id}
+                            onClick={() => handleMarkPaid(order)}
+                            className="w-full min-h-[40px] px-3 py-2 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-bold hover:bg-emerald-100 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                          >
+                            <CheckCircle2 className="w-4 h-4" />
+                            {updatingPaymentId === order.id ? 'Marking Paid...' : 'Mark Paid'}
+                          </button>
+                        )}
                       </div>
                     );
                   })}
@@ -2091,98 +2792,555 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
               onViewOrder={(ord) => setPreviewBillOrder(ord)}
               onDownloadBill={handleDownloadPdf}
               onSendWhatsApp={handleSendWhatsApp}
+              onMarkPaid={handleMarkPaid}
               downloadingBillId={downloadingBillId}
               sendingWaOrderId={sendingWaOrderId}
+              updatingPaymentId={updatingPaymentId}
               onToast={showToast}
             />
           )}
 
           {/* ========================================================== */}
-          {/* SECTION 7: SETTINGS & TABLE QR PRINT CENTER                */}
+          {/* SECTION 7: VOICE ALERTS, PAYMENT, WHATSAPP & 6-TABLE QR    */}
           {/* ========================================================== */}
           {section === 'settings' && (
             <div className="space-y-6">
-              {/* WhatsApp API Integration Status Card */}
-              <div className="bg-white rounded-3xl border border-neutral-200 p-6 space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-3">
+              {/* 0. Voice Order Alert Settings (Natural Indian Female Voice) */}
+              <div className="bg-white rounded-3xl border border-neutral-200 p-6 space-y-5">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <h2 className="text-lg font-extrabold text-neutral-900 inline-flex items-center gap-2">
+                      <Mic className="w-5 h-5 text-[#E5391B]" />
+                      Voice Order Alert Settings
+                    </h2>
+                    <p className="text-sm text-neutral-600 mt-0.5">
+                      Real-time natural Indian female voice announcements for every incoming table order
+                      (automatically queued when multiple orders arrive together).
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleToggleVoiceEnabled}
+                    className={`min-h-[40px] px-4 py-2 rounded-xl text-xs font-extrabold inline-flex items-center gap-2 cursor-pointer border ${
+                      voiceSettings.enabled
+                        ? 'bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700'
+                        : 'bg-neutral-100 border-neutral-300 text-neutral-700 hover:bg-neutral-200'
+                    }`}
+                  >
+                    {voiceSettings.enabled ? (
+                      <Volume2 className="w-4 h-4" />
+                    ) : (
+                      <VolumeX className="w-4 h-4" />
+                    )}
+                    {voiceSettings.enabled ? 'Voice Alerts ON' : 'Voice Alerts OFF'}
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  {/* Voice Selection */}
+                  <div className="rounded-2xl border border-neutral-200 bg-neutral-50 p-4 space-y-1.5">
+                    <p className="text-xs font-bold text-neutral-500">Voice</p>
+                    <p className="text-sm font-extrabold text-neutral-900">Indian Female</p>
+                    <p className="text-[11px] text-neutral-600 leading-relaxed">
+                      Natural polite Indian English restaurant staff voice (with automatic browser
+                      en-IN female fallback). Customer mobile numbers are never spoken aloud.
+                    </p>
+                  </div>
+
+                  {/* Speed Selection */}
+                  <div className="rounded-2xl border border-neutral-200 bg-neutral-50 p-4 space-y-2.5">
+                    <p className="text-xs font-bold text-neutral-500">Speech Speed</p>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {(['slow', 'normal', 'fast'] as const).map((spd) => {
+                        const active = voiceSettings.speed === spd;
+                        return (
+                          <button
+                            key={spd}
+                            type="button"
+                            onClick={() => handleChangeVoiceSpeed(spd)}
+                            className={`min-h-[38px] rounded-xl text-xs font-extrabold capitalize cursor-pointer border transition-colors ${
+                              active
+                                ? 'bg-[#E5391B] border-[#E5391B] text-white'
+                                : 'bg-white border-neutral-200 text-neutral-700 hover:bg-neutral-100'
+                            }`}
+                          >
+                            {spd}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[11px] text-neutral-500">Default: Normal (0.95× natural pace)</p>
+                  </div>
+
+                  {/* Volume Control */}
+                  <div className="rounded-2xl border border-neutral-200 bg-neutral-50 p-4 space-y-2.5">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-bold text-neutral-500">Volume</span>
+                      <span className="font-mono font-extrabold text-neutral-900">
+                        {voiceSettings.volume}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={5}
+                      value={voiceSettings.volume}
+                      onChange={(e) => handleChangeVoiceVolume(Number(e.target.value))}
+                      aria-label="Announcement volume"
+                      className="w-full accent-[#E5391B] cursor-pointer"
+                    />
+                    <p className="text-[11px] text-neutral-500">Default: 100% (Bell + Voice)</p>
+                  </div>
+                </div>
+
+                {!voiceQueueState.browserSpeechSupported && (
+                  <div className="rounded-2xl bg-amber-50 border border-amber-200 p-3.5 text-xs font-semibold text-amber-900">
+                    Browser Speech Synthesis is not available on this device. Natural server voice
+                    audio will be used automatically when online; visual order alerts and bell chimes
+                    remain active.
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleTestVoiceAnnouncement}
+                      className="min-h-[44px] px-5 py-2.5 rounded-xl bg-neutral-900 hover:bg-neutral-800 text-white text-xs font-extrabold inline-flex items-center gap-2 cursor-pointer"
+                    >
+                      <Volume2 className="w-4 h-4 text-amber-300" />
+                      TEST ORDER ANNOUNCEMENT
+                    </button>
+                    {voiceQueueState.isSpeaking && (
+                      <button
+                        type="button"
+                        onClick={() => voiceOrderAlertManager.stopAndClearQueue()}
+                        className="min-h-[44px] px-4 py-2.5 rounded-xl border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Square className="w-3.5 h-3.5 fill-current" />
+                        Stop Speaking
+                      </button>
+                    )}
+                    {!voiceQueueState.audioUnlocked && (
+                      <button
+                        type="button"
+                        onClick={handleEnableSoundAlerts}
+                        className="min-h-[44px] px-4 py-2.5 rounded-xl bg-[#E5391B] hover:bg-[#C82E14] text-white text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Volume2 className="w-4 h-4" />
+                        ENABLE SOUND
+                      </button>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-neutral-500 font-medium">
+                    Sample: &ldquo;Test announcement. New order received from Table number 3…&rdquo;
+                  </p>
+                </div>
+              </div>
+
+              {/* 1. Restaurant Payment Settings (UPI ID + Merchant Name + Upload UPI QR Screenshot) */}
+              <form
+                onSubmit={handleSavePaymentSettings}
+                className="bg-white rounded-3xl border border-neutral-200 p-6 space-y-5"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <h2 className="text-lg font-extrabold text-neutral-900 inline-flex items-center gap-2">
+                      <CreditCard className="w-5 h-5 text-[#E5391B]" />
+                      Payment Settings (Dynamic UPI Bill QR)
+                    </h2>
+                    <p className="text-sm text-neutral-600 mt-0.5">
+                      Upload your restaurant UPI QR screenshot or enter your UPI ID. Every customer
+                      bill automatically generates an exact-amount UPI QR pre-filled with the bill
+                      total.
+                    </p>
+                  </div>
+                  <span
+                    className={`text-xs font-bold px-3 py-1.5 rounded-xl border inline-flex items-center gap-1.5 ${
+                      paymentSettings.upi_id
+                        ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                        : 'bg-amber-50 border-amber-200 text-amber-800'
+                    }`}
+                  >
+                    <span
+                      className={`w-2 h-2 rounded-full ${
+                        paymentSettings.upi_id ? 'bg-emerald-600' : 'bg-amber-500'
+                      }`}
+                    />
+                    {paymentSettings.upi_id ? `UPI Active · ${paymentSettings.upi_id}` : 'UPI Setup Needed'}
+                  </span>
+                </div>
+
+                {qrScanNotice && (
+                  <div className="rounded-2xl bg-emerald-50 border border-emerald-200 p-3.5 text-xs font-semibold text-emerald-900">
+                    {qrScanNotice}
+                  </div>
+                )}
+
+                {paymentFormError && (
+                  <div className="rounded-2xl bg-red-50 border border-red-200 p-3.5 text-xs font-semibold text-red-800">
+                    {paymentFormError}
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+                  <div className="lg:col-span-7 space-y-4">
+                    <div>
+                      <label
+                        htmlFor="owner-upi-id"
+                        className="block text-xs font-bold text-neutral-700 mb-1.5"
+                      >
+                        Restaurant UPI ID
+                      </label>
+                      <input
+                        id="owner-upi-id"
+                        type="text"
+                        maxLength={120}
+                        value={paymentDraft.upi_id}
+                        onChange={(e) => {
+                          paymentDraftDirtyRef.current = true;
+                          setPaymentDraft((prev) => ({ ...prev, upi_id: e.target.value }));
+                        }}
+                        placeholder="e.g., rikzenfastfood@okaxis or 9876543210@ybl"
+                        className="w-full min-h-[46px] px-4 py-2.5 rounded-xl bg-neutral-50 border border-neutral-200 text-sm font-mono text-neutral-900 focus:outline-none focus:bg-white focus:border-[#E5391B]"
+                      />
+                    </div>
+
+                    <div>
+                      <label
+                        htmlFor="owner-merchant-name"
+                        className="block text-xs font-bold text-neutral-700 mb-1.5"
+                      >
+                        Restaurant Name (shown inside UPI app)
+                      </label>
+                      <input
+                        id="owner-merchant-name"
+                        type="text"
+                        required
+                        minLength={2}
+                        maxLength={80}
+                        value={paymentDraft.merchant_name}
+                        onChange={(e) => {
+                          paymentDraftDirtyRef.current = true;
+                          setPaymentDraft((prev) => ({ ...prev, merchant_name: e.target.value }));
+                        }}
+                        placeholder="RikZen Fast Food"
+                        className="w-full min-h-[46px] px-4 py-2.5 rounded-xl bg-neutral-50 border border-neutral-200 text-sm text-neutral-900 focus:outline-none focus:bg-white focus:border-[#E5391B]"
+                      />
+                    </div>
+
+                    <div className="space-y-2">
+                      <span className="block text-xs font-bold text-neutral-700">
+                        Payment QR Screenshot (Auto-reads your UPI ID)
+                      </span>
+                      <div className="flex flex-wrap items-center gap-3">
+                        <label className="min-h-[44px] px-4 py-2.5 rounded-xl border border-neutral-300 bg-neutral-50 hover:bg-neutral-100 text-neutral-900 text-xs font-bold inline-flex items-center gap-2 cursor-pointer">
+                          {uploadingQr ? (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <Upload className="w-4 h-4 text-[#E5391B]" />
+                          )}
+                          {uploadingQr
+                            ? 'Scanning & Uploading QR...'
+                            : 'Upload Restaurant Payment QR'}
+                          <input
+                            type="file"
+                            accept="image/png,image/jpeg,image/webp"
+                            onChange={handleUploadPaymentQrFile}
+                            disabled={uploadingQr}
+                            className="sr-only"
+                          />
+                        </label>
+                        {paymentDraft.qr_image_url && (
+                          <span className="text-xs text-emerald-700 font-semibold">
+                            Reference QR uploaded
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-neutral-500">
+                        Upload your PhonePe / Google Pay / Paytm / BHIM QR screenshot once — we
+                        automatically extract your UPI ID so every bill embeds a dynamic
+                        exact-amount QR.
+                      </p>
+                    </div>
+
+                    <div className="pt-1 flex flex-wrap gap-3">
+                      <button
+                        type="submit"
+                        disabled={savingPayment || uploadingQr}
+                        className="min-h-[46px] px-6 py-2.5 rounded-xl bg-[#E5391B] text-white text-sm font-bold hover:bg-[#C82E14] active:scale-[0.98] transition-all inline-flex items-center gap-2 cursor-pointer disabled:opacity-60"
+                      >
+                        {savingPayment ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <Save className="w-4 h-4" />
+                        )}
+                        {savingPayment ? 'Saving Settings...' : 'Save Payment Settings'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Right Preview: Live Exact-Amount Bill QR Test Preview + Uploaded Reference */}
+                  <div className="lg:col-span-5 rounded-2xl border border-neutral-200 bg-neutral-50 p-4 space-y-3 text-center">
+                    <p className="text-xs font-extrabold text-neutral-700 inline-flex items-center gap-1.5">
+                      <QrCode className="w-4 h-4 text-[#E5391B]" />
+                      Live Dynamic Bill QR Preview (Sample ₹493)
+                    </p>
+                    {isValidUpiId(paymentDraft.upi_id) ? (
+                      <div className="flex flex-col items-center gap-2">
+                        <div className="p-2.5 bg-white rounded-xl border border-neutral-900 inline-block">
+                          <QRCodeSVG
+                            value={buildDynamicUpiUri({
+                              upiId: paymentDraft.upi_id,
+                              merchantName: paymentDraft.merchant_name || 'RikZen Fast Food',
+                              amount: 493,
+                              orderCode: 'RK1042',
+                              tableNumber: 3,
+                            })}
+                            size={156}
+                            level="H"
+                            includeMargin={true}
+                            fgColor="#000000"
+                            bgColor="#FFFFFF"
+                          />
+                        </div>
+                        <p className="text-xs font-extrabold text-emerald-700">
+                          Exact ₹493 pre-filled when scanned
+                        </p>
+                        <p className="text-[11px] font-mono text-neutral-600 break-all">
+                          {paymentDraft.upi_id.trim()}
+                        </p>
+                      </div>
+                    ) : paymentDraft.qr_image_url ? (
+                      <div className="flex flex-col items-center gap-2">
+                        <img
+                          src={paymentDraft.qr_image_url}
+                          alt="Uploaded restaurant payment QR"
+                          className="w-40 h-40 object-contain rounded-xl border border-neutral-200 bg-white p-1.5"
+                        />
+                        <p className="text-[11px] text-amber-800 font-semibold">
+                          Enter your UPI ID on the left to enable exact-amount dynamic QRs on bills.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="py-8 px-4 text-xs text-neutral-500">
+                        Upload your UPI QR screenshot or type your UPI ID to preview your live
+                        exact-amount dynamic bill QR here.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </form>
+
+              {/* 2. WhatsApp API Integration Status Card */}
+              <div className="bg-white rounded-3xl border border-neutral-200 p-6 space-y-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <h2 className="text-lg font-extrabold text-neutral-900">
                       WhatsApp Business Cloud API
                     </h2>
                     <p className="text-sm text-neutral-600 mt-0.5">
-                      Automatically uploads and delivers branded PDF bills to customer WhatsApp
-                      numbers.
+                      Uploads and delivers server-generated PDF bills automatically to customer
+                      WhatsApp numbers via Meta Graph API ({waConfigMeta.apiVersion}).
                     </p>
                   </div>
-                  <span
-                    className={`text-xs font-bold px-3 py-1.5 rounded-xl border ${
-                      whatsappConfigured
-                        ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                        : 'bg-amber-50 border-amber-200 text-amber-800'
-                    }`}
-                  >
-                    {whatsappConfigured ? 'Connected' : 'Not Configured'}
-                  </span>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span
+                      className={`text-xs font-bold px-3 py-1.5 rounded-xl border inline-flex items-center gap-1.5 ${
+                        waLiveCheck.connected
+                          ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                          : 'bg-amber-50 border-amber-200 text-amber-800'
+                      }`}
+                    >
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          waLiveCheck.connected ? 'bg-emerald-600' : 'bg-amber-500'
+                        }`}
+                      />
+                      {waLiveCheck.testing
+                        ? 'Checking Meta API...'
+                        : waLiveCheck.connected
+                          ? 'Connected'
+                          : whatsappConfigured
+                            ? 'Verification Required'
+                            : 'Not Configured'}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={waLiveCheck.testing}
+                      onClick={handleTestWhatsAppConnection}
+                      className="min-h-[36px] px-3.5 py-1.5 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                    >
+                      {waLiveCheck.testing ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="w-3.5 h-3.5" />
+                      )}
+                      Test WhatsApp Connection
+                    </button>
+                  </div>
                 </div>
 
-                {!whatsappConfigured && (
+                {/* Live Verification Result */}
+                {waLiveCheck.connected && (
+                  <div className="rounded-2xl bg-emerald-50 border border-emerald-200 p-4 text-xs text-emerald-900 flex flex-wrap items-center justify-between gap-3">
+                    <div className="space-y-0.5">
+                      <p className="font-extrabold text-emerald-900 inline-flex items-center gap-1.5">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-700" />
+                        Live WhatsApp Cloud API Verified
+                      </p>
+                      <p className="text-emerald-800">
+                        {waLiveCheck.verifiedName ? `${waLiveCheck.verifiedName} · ` : ''}
+                        <span className="font-mono font-bold">
+                          {waLiveCheck.displayPhoneNumber || 'Verified Business Number'}
+                        </span>
+                        {waLiveCheck.qualityRating ? ` · Quality: ${waLiveCheck.qualityRating}` : ''}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {waLiveCheck.error && !waLiveCheck.connected && (
+                  <div className="rounded-2xl bg-red-50 border border-red-200 p-4 text-xs text-red-800 font-semibold">
+                    {waLiveCheck.error}
+                  </div>
+                )}
+
+                {/* Secret Readiness Checklist */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="rounded-2xl bg-neutral-50 border border-neutral-200 p-3.5 flex items-center justify-between gap-2 text-xs">
+                    <span className="font-mono font-bold text-neutral-800">
+                      WHATSAPP_ACCESS_TOKEN
+                    </span>
+                    <span
+                      className={`font-bold ${
+                        waConfigMeta.hasToken ? 'text-emerald-700' : 'text-amber-700'
+                      }`}
+                    >
+                      {waConfigMeta.hasToken ? 'Configured' : 'Missing'}
+                    </span>
+                  </div>
+                  <div className="rounded-2xl bg-neutral-50 border border-neutral-200 p-3.5 flex items-center justify-between gap-2 text-xs">
+                    <span className="font-mono font-bold text-neutral-800">
+                      WHATSAPP_PHONE_NUMBER_ID
+                    </span>
+                    <span
+                      className={`font-bold ${
+                        waConfigMeta.hasPhoneId ? 'text-emerald-700' : 'text-amber-700'
+                      }`}
+                    >
+                      {waConfigMeta.hasPhoneId ? 'Configured' : 'Missing'}
+                    </span>
+                  </div>
+                </div>
+
+                {!waLiveCheck.connected && (
                   <div className="rounded-2xl bg-neutral-50 border border-neutral-200 p-4 text-xs text-neutral-700 space-y-1.5 leading-relaxed">
                     <p className="font-bold text-neutral-900">
                       How to activate automated WhatsApp PDF delivery:
                     </p>
                     <p>
                       Add <span className="font-mono font-semibold">WHATSAPP_ACCESS_TOKEN</span> and{' '}
-                      <span className="font-mono font-semibold">WHATSAPP_PHONE_NUMBER_ID</span> in
-                      AI Studio Settings → Secrets, then restart the server. Until configured, bills
-                      still generate as downloadable PDFs and WhatsApp attempts honestly display
-                      their failure reason with a Retry button.
+                      <span className="font-mono font-semibold">WHATSAPP_PHONE_NUMBER_ID</span> from
+                      Meta Developers → WhatsApp Cloud API in AI Studio Settings → Secrets, restart
+                      the server, then click <span className="font-bold">Test WhatsApp Connection</span>.
+                      Until configured, customers still receive instant downloadable PDF bills with
+                      dynamic UPI QR on their screen with zero login.
                     </p>
                   </div>
                 )}
               </div>
 
-              {/* Printable 6-Table QR Codes */}
+              {/* 3. 6-Table QR Generator, PNG Download, All-6 ZIP & Print Center */}
               <div className="bg-white rounded-3xl border border-neutral-200 p-6 space-y-5">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h2 className="text-lg font-extrabold text-neutral-900">
-                      Table QR Codes (Tables 1–6)
+                      Table QR Generator (Tables 1–6)
                     </h2>
                     <p className="text-xs text-neutral-500">
-                      Print and place each unique QR card on its matching table.
+                      Download print-ready PNGs individually, grab all 6 in one ZIP, or print
+                      table tent cards directly.
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => window.print()}
-                    className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-2 cursor-pointer"
-                  >
-                    <Printer className="w-4 h-4" />
-                    Print QR Cards
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={downloadingTableQr !== null}
+                      onClick={handleDownloadAllTableQrs}
+                      className="min-h-[42px] px-4 py-2 rounded-xl bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] inline-flex items-center gap-2 cursor-pointer disabled:opacity-60 whitespace-nowrap"
+                    >
+                      {downloadingTableQr === 'all' ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <FolderArchive className="w-4 h-4" />
+                      )}
+                      {downloadingTableQr === 'all' ? 'Building ZIP...' : 'Download All Table QR'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handlePrintTableQrs([...TABLE_NUMBERS])}
+                      className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-2 cursor-pointer whitespace-nowrap"
+                    >
+                      <Printer className="w-4 h-4" />
+                      Print All 6 QR Cards
+                    </button>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                   {TABLE_NUMBERS.map((num) => {
                     const qrUrl = getTableQrUrl(num);
+                    const isDownloadingThis = downloadingTableQr === num;
                     return (
                       <div
                         key={num}
-                        className="rounded-2xl border border-neutral-200 p-5 flex flex-col items-center text-center"
+                        className="rounded-2xl border border-neutral-200 p-5 flex flex-col items-center text-center bg-neutral-50/40"
                       >
-                        <p className="text-xs font-bold text-[#E5391B]">RikZen Fast Food</p>
+                        <p className="text-xs font-extrabold text-[#E5391B] tracking-wide">
+                          RIKZEN FAST FOOD
+                        </p>
                         <h3 className="text-lg font-extrabold text-neutral-900 mb-3">
                           Table {num}
                         </h3>
-                        <div className="p-2.5 bg-white rounded-xl border border-neutral-200 mb-3">
-                          <QRCodeSVG value={qrUrl} size={128} level="M" fgColor="#111827" />
+                        <div className="p-2 bg-white rounded-xl border border-neutral-900 mb-3">
+                          <QRCodeSVG
+                            value={qrUrl}
+                            size={140}
+                            level="H"
+                            includeMargin={true}
+                            fgColor="#000000"
+                            bgColor="#FFFFFF"
+                          />
                         </div>
                         <p className="text-xs font-mono text-neutral-500 mb-3">/menu?table={num}</p>
-                        <div className="w-full flex gap-2">
+                        <div className="w-full grid grid-cols-2 gap-2">
+                          <button
+                            type="button"
+                            disabled={downloadingTableQr !== null}
+                            onClick={() => handleDownloadSingleTableQr(num)}
+                            className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 whitespace-nowrap"
+                          >
+                            {isDownloadingThis ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <Download className="w-3.5 h-3.5" />
+                            )}
+                            Download QR
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handlePrintTableQrs([num])}
+                            className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-white border border-neutral-300 text-neutral-900 text-xs font-bold hover:bg-neutral-100 inline-flex items-center justify-center gap-1 cursor-pointer whitespace-nowrap"
+                          >
+                            <Printer className="w-3.5 h-3.5" />
+                            Print QR
+                          </button>
                           <button
                             type="button"
                             onClick={() => handleCopyQrUrl(num)}
-                            className="flex-1 min-h-[38px] px-3 py-1.5 rounded-xl border border-neutral-200 text-xs font-bold text-neutral-800 inline-flex items-center justify-center gap-1 cursor-pointer"
+                            className="min-h-[36px] px-2.5 py-1.5 rounded-xl border border-neutral-200 bg-white text-xs font-semibold text-neutral-700 hover:bg-neutral-50 inline-flex items-center justify-center gap-1 cursor-pointer"
                           >
                             {copiedTable === num ? (
                               <>
@@ -2192,17 +3350,17 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                             ) : (
                               <>
                                 <Copy className="w-3.5 h-3.5" />
-                                Copy
+                                Copy Link
                               </>
                             )}
                           </button>
                           <button
                             type="button"
                             onClick={() => onNavigate(`/menu?table=${num}`)}
-                            className="flex-1 min-h-[38px] px-3 py-1.5 rounded-xl bg-neutral-900 text-white text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer"
+                            className="min-h-[36px] px-2.5 py-1.5 rounded-xl border border-neutral-200 bg-white text-xs font-semibold text-neutral-700 hover:bg-neutral-50 inline-flex items-center justify-center gap-1 cursor-pointer"
                           >
                             <ExternalLink className="w-3.5 h-3.5" />
-                            Open
+                            Open Menu
                           </button>
                         </div>
                       </div>
@@ -2288,11 +3446,62 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
           onClose={() => setPreviewBillOrder(null)}
           isOwnerView={true}
           whatsappConfigured={whatsappConfigured}
+          paymentSettings={paymentSettings}
           onSendWhatsApp={handleSendWhatsApp}
+          onMarkPaid={handleMarkPaid}
           onOpenSettings={() => setSection('settings')}
           isSendingWhatsApp={sendingWaOrderId === livePreviewOrder.id}
+          isUpdatingPayment={updatingPaymentId === livePreviewOrder.id}
         />
       )}
     </div>
+
+    {/* Dedicated Print-Only Branded Table QR Cards Sheet (Tables 1–6 or Single Selected Table) */}
+    <div className="hidden print:block bg-white text-neutral-900 p-4">
+      <div
+        className={`grid gap-6 ${
+          printTableNumbers.length === 1 ? 'grid-cols-1 max-w-md mx-auto' : 'grid-cols-2'
+        }`}
+      >
+        {printTableNumbers.map((num) => (
+          <div
+            key={num}
+            className="rikzen-print-break-avoid border-2 border-neutral-900 rounded-3xl p-6 text-center flex flex-col items-center justify-between bg-white"
+          >
+            <div className="w-full rounded-2xl bg-[#151110] text-white py-3 px-4 mb-4">
+              <p className="font-display text-xl font-extrabold tracking-tight">
+                RIKZEN FAST FOOD
+              </p>
+              <p className="text-[11px] text-amber-200 font-semibold">
+                Fresh · Fast · Delicious
+              </p>
+            </div>
+
+            <div className="px-6 py-1.5 rounded-xl bg-[#E5391B] text-white font-display text-2xl font-extrabold mb-3">
+              TABLE {num}
+            </div>
+
+            <p className="text-base font-extrabold text-neutral-900 mb-3">Scan to Order</p>
+
+            <div className="p-3 bg-white border-2 border-neutral-900 rounded-2xl mb-4">
+              <QRCodeSVG
+                value={getTableQrUrl(num)}
+                size={printTableNumbers.length === 1 ? 260 : 200}
+                level="H"
+                includeMargin={true}
+                fgColor="#000000"
+                bgColor="#FFFFFF"
+              />
+            </div>
+
+            <p className="text-xs font-bold text-emerald-700">
+              No Login Required · Instant Menu &amp; UPI Bill
+            </p>
+            <p className="text-[11px] font-mono text-neutral-500 mt-1">/menu?table={num}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+    </>
   );
 };

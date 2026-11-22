@@ -281,6 +281,18 @@
             "rejected"
           ]
         },
+        "payment_status": {
+          "type": "string",
+          "enum": ["not_paid", "pending", "paid", "failed"]
+        },
+        "paid_at": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "upi_uri": {
+          "type": "string",
+          "maxLength": 500
+        },
         "pdf_ready": {
           "type": "boolean"
         },
@@ -378,6 +390,35 @@
         "created_at",
         "updated_at"
       ]
+    },
+    "PaymentSettings": {
+      "title": "PaymentSettings",
+      "description": "Public restaurant UPI payment destination configured by the shop owner (no secret credentials).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "enum": ["payment"]
+        },
+        "upi_id": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "merchant_name": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "qr_image_url": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "upi_id", "merchant_name", "qr_image_url", "updated_at"]
     }
   },
   "firestore": {
@@ -404,6 +445,10 @@
     "/orders/{orderId}": {
       "schema": { "$ref": "#/entities/Order" },
       "description": "Live dine-in customer orders including private customer name and +91 mobile. Only the owner may list orders."
+    },
+    "/shop_settings/{settingId}": {
+      "schema": { "$ref": "#/entities/PaymentSettings" },
+      "description": "Public restaurant UPI payment settings (id='payment') readable by customers for bill QR display and writable strictly by the verified owner."
     }
   }
 }
