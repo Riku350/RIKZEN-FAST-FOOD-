@@ -1,0 +1,6 @@
+{
+  "name": "RikZen Fast Food",
+  "description": "Mobile-first QR table ordering web app and real-time live owner order dashboard for RikZen Fast Food.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

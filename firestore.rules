@@ -1,0 +1,337 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Hardened Global Helpers
+    // =========================================================================
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidOrderDocId(id) {
+      return id is string && id.size() >= 24 && id.size() <= 128 && id.matches('^ord_[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isSafeImageUrl(url) {
+      return url is string && url.size() >= 1 && url.size() <= 500 &&
+        (url.matches('^/src/assets/.*') || url.matches('^/uploads/.*') || url.matches('^https://.*'));
+    }
+
+    function isSafeBillUrl(url) {
+      return url is string && url.size() <= 400 &&
+        (url == '' || url.matches('^/api/bills/file/ord_[a-zA-Z0-9_\\-]+/RikZen-Fast-Food-Bill-RK[0-9]{4,8}\\.pdf\\?sig=[a-fA-F0-9]{64}$'));
+    }
+
+    function isSafeBillPath(p) {
+      return p is string && p.size() <= 240 &&
+        (p == '' || p.matches('^/bills/ord_[a-zA-Z0-9_\\-]+/RikZen-Fast-Food-Bill-RK[0-9]{4,8}\\.pdf$'));
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'rikudatabackup@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // =========================================================================
+    // Entity Validation Blueprints (Anti-Update-Gap)
+    // =========================================================================
+
+    function isValidUser(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'display_name', 'role', 'created_at', 'updated_at']) &&
+        data.keys().hasOnly(['uid', 'email', 'display_name', 'role', 'created_at', 'updated_at']) &&
+        data.uid is string && data.uid == userId && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
+        data.display_name is string && data.display_name.size() >= 1 && data.display_name.size() <= 80 &&
+        data.role in ['owner', 'staff'] &&
+        data.created_at is timestamp &&
+        data.updated_at is timestamp;
+    }
+
+    function isValidAdminDoc(data, adminId) {
+      return data.keys().hasAll(['uid', 'email', 'created_at']) &&
+        data.keys().hasOnly(['uid', 'email', 'created_at']) &&
+        data.uid is string && data.uid == adminId && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
+        data.created_at is timestamp;
+    }
+
+    function isValidMenuItem(data, itemId) {
+      return data.keys().hasAll([
+          'id', 'name', 'category', 'description', 'price', 'offer_price',
+          'image', 'available', 'is_veg', 'featured', 'created_at', 'updated_at'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'name', 'category', 'description', 'price', 'offer_price',
+          'image', 'available', 'is_veg', 'featured', 'created_at', 'updated_at'
+        ]) &&
+        data.id is string && data.id == itemId && data.id.size() <= 64 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.name is string && data.name.size() >= 2 && data.name.size() <= 80 &&
+        data.category in ['rolls', 'burgers', 'snacks', 'chicken', 'fast_food', 'drinks', 'lassi', 'desserts', 'special'] &&
+        data.description is string && data.description.size() >= 4 && data.description.size() <= 220 &&
+        data.price is number && data.price >= 1 && data.price <= 20000 &&
+        data.offer_price is number && (data.offer_price == 0 || (data.offer_price >= 1 && data.offer_price < data.price)) &&
+        isSafeImageUrl(data.image) &&
+        data.available is bool &&
+        data.is_veg is bool &&
+        data.featured is bool &&
+        data.created_at is timestamp &&
+        data.updated_at is timestamp;
+    }
+
+    function isValidOffer(data, offerId) {
+      return data.keys().hasAll([
+          'id', 'title', 'description', 'image', 'regular_price', 'offer_price',
+          'active', 'created_at', 'updated_at'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'title', 'description', 'image', 'regular_price', 'offer_price',
+          'active', 'created_at', 'updated_at'
+        ]) &&
+        data.id is string && data.id == offerId && data.id.size() <= 64 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.title is string && data.title.size() >= 2 && data.title.size() <= 80 &&
+        data.description is string && data.description.size() >= 4 && data.description.size() <= 200 &&
+        isSafeImageUrl(data.image) &&
+        data.regular_price is number && data.regular_price >= 2 && data.regular_price <= 20000 &&
+        data.offer_price is number && data.offer_price >= 1 && data.offer_price < data.regular_price &&
+        data.active is bool &&
+        data.created_at is timestamp &&
+        data.updated_at is timestamp;
+    }
+
+    function isValidTable(data, tableId) {
+      return data.keys().hasAll(['id', 'table_number', 'qr_code', 'status', 'active_order_id', 'updated_at']) &&
+        data.keys().hasOnly(['id', 'table_number', 'qr_code', 'status', 'active_order_id', 'updated_at']) &&
+        data.id is string && data.id == tableId &&
+        data.id in ['table_1', 'table_2', 'table_3', 'table_4', 'table_5', 'table_6'] &&
+        data.table_number is int && data.table_number >= 1 && data.table_number <= 6 &&
+        data.qr_code is string && data.qr_code.size() >= 1 && data.qr_code.size() <= 300 &&
+        data.status in ['available', 'ordering', 'preparing', 'ready', 'bill_requested'] &&
+        data.active_order_id is string && data.active_order_id.size() <= 128 &&
+        data.updated_at is timestamp;
+    }
+
+    function isValidOrderLineItem(item) {
+      return item is map &&
+        item.keys().hasAll(['menu_item_id', 'name', 'regular_price', 'unit_price', 'quantity', 'line_total']) &&
+        item.keys().hasOnly(['menu_item_id', 'name', 'regular_price', 'unit_price', 'quantity', 'line_total']) &&
+        item.menu_item_id is string && item.menu_item_id.size() >= 1 && item.menu_item_id.size() <= 64 &&
+        item.name is string && item.name.size() >= 2 && item.name.size() <= 80 &&
+        item.regular_price is number && item.regular_price >= 1 && item.regular_price <= 20000 &&
+        item.unit_price is number && item.unit_price >= 1 && item.unit_price <= item.regular_price &&
+        item.quantity is int && item.quantity >= 1 && item.quantity <= 20 &&
+        item.line_total is number && item.line_total == item.unit_price * item.quantity;
+    }
+
+    function isValidOrder(data, orderId) {
+      return data.keys().hasAll([
+          'id', 'order_number', 'order_code', 'table_id', 'table_number',
+          'customer_name', 'customer_mobile', 'items', 'item_count',
+          'subtotal', 'discount', 'total', 'status', 'pdf_ready',
+          'whatsapp_status', 'whatsapp_error', 'customer_session_id',
+          'server_signature', 'notes', 'created_at', 'updated_at'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'order_number', 'order_code', 'table_id', 'table_number',
+          'customer_name', 'customer_mobile', 'items', 'item_count',
+          'subtotal', 'discount', 'total', 'status', 'pdf_ready',
+          'bill_status', 'pdf_url', 'pdf_path', 'generated_at', 'sent_at', 'send_status',
+          'whatsapp_status', 'whatsapp_error', 'customer_session_id',
+          'server_signature', 'notes', 'created_at', 'updated_at'
+        ]) &&
+        data.id is string && data.id == orderId &&
+        data.order_number is int && data.order_number >= 1000 && data.order_number <= 99999999 &&
+        data.order_code is string && data.order_code.size() <= 16 && data.order_code.matches('^RK[0-9]{4,8}$') &&
+        data.table_id in ['table_1', 'table_2', 'table_3', 'table_4', 'table_5', 'table_6'] &&
+        data.table_number is int && data.table_number >= 1 && data.table_number <= 6 &&
+        data.table_id == 'table_' + string(data.table_number) &&
+        data.customer_name is string && data.customer_name.size() >= 2 && data.customer_name.size() <= 80 &&
+        data.customer_mobile is string && data.customer_mobile.size() <= 16 && data.customer_mobile.matches('^\\+91[6-9][0-9]{9}$') &&
+        data.items is list && data.items.size() >= 1 && data.items.size() <= 20 &&
+        isValidOrderLineItem(data.items[0]) &&
+        data.item_count is int && data.item_count >= 1 && data.item_count <= 100 &&
+        data.subtotal is number && data.subtotal >= 1 && data.subtotal <= 50000 &&
+        data.discount is number && data.discount >= 0 && data.discount < data.subtotal &&
+        data.total is number && data.total == data.subtotal - data.discount &&
+        data.status in ['pending', 'accepted', 'preparing', 'ready', 'bill_requested', 'bill_ready', 'completed', 'rejected'] &&
+        data.pdf_ready is bool &&
+        (!('bill_status' in data) || data.bill_status in ['not_generated', 'generating', 'generated', 'sending', 'sent', 'failed', 'retrying']) &&
+        (!('pdf_url' in data) || isSafeBillUrl(data.pdf_url)) &&
+        (!('pdf_path' in data) || isSafeBillPath(data.pdf_path)) &&
+        (!('generated_at' in data) || (data.generated_at is string && data.generated_at.size() <= 64)) &&
+        (!('sent_at' in data) || (data.sent_at is string && data.sent_at.size() <= 64)) &&
+        (!('send_status' in data) || data.send_status in ['not_sent', 'sending', 'retrying', 'sent', 'failed']) &&
+        data.whatsapp_status in ['not_sent', 'sending', 'retrying', 'sent', 'failed'] &&
+        data.whatsapp_error is string && data.whatsapp_error.size() <= 240 &&
+        data.customer_session_id is string && data.customer_session_id.size() >= 16 && data.customer_session_id.size() <= 128 &&
+        data.customer_session_id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.server_signature is string && data.server_signature.size() >= 32 && data.server_signature.size() <= 128 &&
+        data.server_signature.matches('^[a-fA-F0-9]+$') &&
+        data.notes is string && data.notes.size() <= 200 &&
+        data.created_at is timestamp &&
+        data.updated_at is timestamp;
+    }
+
+    function orderImmutableFieldsUnchanged() {
+      return incoming().id == existing().id &&
+        incoming().order_number == existing().order_number &&
+        incoming().order_code == existing().order_code &&
+        incoming().table_id == existing().table_id &&
+        incoming().table_number == existing().table_number &&
+        incoming().customer_name == existing().customer_name &&
+        incoming().customer_mobile == existing().customer_mobile &&
+        incoming().items == existing().items &&
+        incoming().item_count == existing().item_count &&
+        incoming().subtotal == existing().subtotal &&
+        incoming().discount == existing().discount &&
+        incoming().total == existing().total &&
+        incoming().customer_session_id == existing().customer_session_id &&
+        incoming().server_signature == existing().server_signature &&
+        incoming().notes == existing().notes &&
+        incoming().created_at == existing().created_at;
+    }
+
+    // =========================================================================
+    // Collection Rules
+    // =========================================================================
+
+    // Users (Owner/Staff PII strictly isolated)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId) && isAdmin() && isValidUser(incoming(), userId) &&
+        incoming().created_at == request.time &&
+        incoming().updated_at == request.time;
+      allow update: if isValidId(userId) && isValidUser(incoming(), userId) && (
+        (isAdmin() && incoming().uid == existing().uid && incoming().created_at == existing().created_at && incoming().updated_at == request.time) ||
+        (isOwner(userId) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['display_name', 'updated_at']) &&
+          incoming().uid == existing().uid &&
+          incoming().email == existing().email &&
+          incoming().role == existing().role &&
+          incoming().created_at == existing().created_at &&
+          incoming().updated_at == request.time)
+      );
+      allow delete: if isValidId(userId) && isAdmin();
+    }
+
+    // Trusted Admin Registry
+    match /admins/{adminId} {
+      allow get: if isValidId(adminId) && isAdmin();
+      allow list: if isAdmin();
+      allow create: if isValidId(adminId) && isAdmin() && isValidAdminDoc(incoming(), adminId) &&
+        incoming().created_at == request.time;
+      allow update: if false;
+      allow delete: if isValidId(adminId) && isAdmin();
+    }
+
+    // Public Menu Catalog (Owner CRUD only)
+    match /menu_items/{itemId} {
+      allow get: if isValidId(itemId);
+      allow list: if true;
+      allow create: if isValidId(itemId) && isAdmin() && isValidMenuItem(incoming(), itemId) &&
+        incoming().created_at == request.time &&
+        incoming().updated_at == request.time;
+      allow update: if isValidId(itemId) && isAdmin() && isValidMenuItem(incoming(), itemId) &&
+        incoming().id == existing().id &&
+        incoming().created_at == existing().created_at &&
+        incoming().updated_at == request.time;
+      allow delete: if isValidId(itemId) && isAdmin();
+    }
+
+    // Promotional Combo Offers (Owner CRUD only)
+    match /offers/{offerId} {
+      allow get: if isValidId(offerId);
+      allow list: if true;
+      allow create: if isValidId(offerId) && isAdmin() && isValidOffer(incoming(), offerId) &&
+        incoming().created_at == request.time &&
+        incoming().updated_at == request.time;
+      allow update: if isValidId(offerId) && isAdmin() && isValidOffer(incoming(), offerId) &&
+        incoming().id == existing().id &&
+        incoming().created_at == existing().created_at &&
+        incoming().updated_at == request.time;
+      allow delete: if isValidId(offerId) && isAdmin();
+    }
+
+    // Physical Restaurant Tables (6 tables)
+    match /tables/{tableId} {
+      allow get: if isValidId(tableId) && tableId in ['table_1', 'table_2', 'table_3', 'table_4', 'table_5', 'table_6'];
+      allow list: if isAdmin();
+      allow create: if isValidId(tableId) && isAdmin() && isValidTable(incoming(), tableId) &&
+        incoming().updated_at == request.time;
+      allow update: if isValidId(tableId) && isAdmin() && isValidTable(incoming(), tableId) &&
+        incoming().id == existing().id &&
+        incoming().table_number == existing().table_number &&
+        incoming().updated_at == request.time;
+      allow delete: if isValidId(tableId) && isAdmin();
+    }
+
+    // Real-time Dine-In Orders (Strict Customer Mobile PII Protection + PDF Bill Metadata)
+    match /orders/{orderId} {
+      // Only the verified shop owner can list orders. Customers cannot discover or read other orders.
+      allow get: if isAdmin() || isValidOrderDocId(orderId);
+      allow list: if isAdmin();
+
+      // Customers create server-verified pending orders with validated +91 mobile number and generated PDF metadata.
+      allow create: if isValidOrderDocId(orderId) &&
+        isValidOrder(incoming(), orderId) &&
+        incoming().keys().hasAll(['bill_status', 'pdf_url', 'pdf_path', 'generated_at', 'sent_at', 'send_status']) &&
+        incoming().status == 'pending' &&
+        incoming().send_status == 'not_sent' &&
+        incoming().whatsapp_status == 'not_sent' &&
+        incoming().whatsapp_error == '' &&
+        incoming().sent_at == '' &&
+        incoming().created_at == request.time &&
+        incoming().updated_at == request.time;
+
+      // Action-based update with Terminal State Locking and Owner Tier 1 vs Customer Tier 2
+      allow update: if isValidOrderDocId(orderId) &&
+        isValidOrder(incoming(), orderId) &&
+        orderImmutableFieldsUnchanged() &&
+        incoming().updated_at == request.time && (
+          // Tier 1: Verified Owner manages lifecycle, PDF bill generation/storage metadata, and WhatsApp delivery state
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly([
+            'status', 'pdf_ready', 'bill_status', 'pdf_url', 'pdf_path',
+            'generated_at', 'sent_at', 'send_status',
+            'whatsapp_status', 'whatsapp_error', 'updated_at'
+          ])) ||
+          // Tier 2: Dine-in customer can ONLY request bill on an active accepted/preparing/ready order
+          (!(existing().status in ['completed', 'rejected']) &&
+            existing().status in ['accepted', 'preparing', 'ready'] &&
+            incoming().status == 'bill_requested' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updated_at']))
+        );
+
+      allow delete: if isValidOrderDocId(orderId) && isAdmin();
+    }
+
+    // Connection test probe
+    match /test/{docId} {
+      allow read, write: if false;
+    }
+  }
+}

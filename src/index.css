@@ -1,0 +1,155 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Outfit", system-ui, -apple-system, sans-serif;
+  --font-sans: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --color-brand: #E5391B;
+  --color-brand-hover: #C82E14;
+  --color-brand-soft: #FEF2F0;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    scroll-behavior: smooth;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+    text-wrap: balance;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Hide scrollbars cleanly for horizontal category strip */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* GPU-composited continuous food & particle animations (transform & opacity only) */
+@keyframes rikzen-float-a {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) rotate(-4deg);
+  }
+  50% {
+    transform: translate3d(0, -14px, 0) rotate(5deg);
+  }
+}
+
+@keyframes rikzen-float-b {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) rotate(5deg);
+  }
+  50% {
+    transform: translate3d(6px, -11px, 0) rotate(-6deg);
+  }
+}
+
+@keyframes rikzen-gentle-bob {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(0, -9px, 0) scale(1.04);
+  }
+}
+
+@keyframes rikzen-slow-spin-sway {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) rotate(-8deg);
+  }
+  50% {
+    transform: translate3d(-5px, -10px, 0) rotate(10deg);
+  }
+}
+
+@keyframes rikzen-sparkle-twinkle {
+  0%, 100% {
+    opacity: 0.25;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.2);
+  }
+}
+
+@keyframes rikzen-bubble-rise {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 14px, 0) scale(0.85);
+  }
+  25% {
+    opacity: 0.55;
+  }
+  80% {
+    opacity: 0.35;
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(0, -28px, 0) scale(1.1);
+  }
+}
+
+@keyframes rikzen-glow-pulse {
+  0%, 100% {
+    opacity: 0.45;
+    transform: scale(0.95);
+  }
+  50% {
+    opacity: 0.85;
+    transform: scale(1.08);
+  }
+}
+
+.animate-rikzen-float-a {
+  animation: rikzen-float-a 5.6s ease-in-out infinite;
+  will-change: transform;
+}
+
+.animate-rikzen-float-b {
+  animation: rikzen-float-b 6.4s ease-in-out infinite;
+  will-change: transform;
+}
+
+.animate-rikzen-bob {
+  animation: rikzen-gentle-bob 4.4s ease-in-out infinite;
+  will-change: transform;
+}
+
+.animate-rikzen-sway {
+  animation: rikzen-slow-spin-sway 7.2s ease-in-out infinite;
+  will-change: transform;
+}
+
+.animate-rikzen-sparkle {
+  animation: rikzen-sparkle-twinkle 3.2s ease-in-out infinite;
+  will-change: transform, opacity;
+}
+
+.animate-rikzen-bubble {
+  animation: rikzen-bubble-rise 5.4s ease-in-out infinite;
+  will-change: transform, opacity;
+}
+
+.animate-rikzen-glow {
+  animation: rikzen-glow-pulse 2.8s ease-in-out infinite;
+  will-change: transform, opacity;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
