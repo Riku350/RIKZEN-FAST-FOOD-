@@ -146,7 +146,7 @@ export async function renderBrandedTableQrPngBlob(
   // Footer instructions
   ctx.fillStyle = '#15803D';
   ctx.font = '700 32px system-ui, -apple-system, sans-serif';
-  ctx.fillText('No Login Required  •  Instant Menu & UPI Bill', width / 2, 1418);
+  ctx.fillText('NO LOGIN REQUIRED  •  SCAN • ORDER • ENJOY', width / 2, 1418);
 
   ctx.fillStyle = '#6B7280';
   ctx.font = '500 24px ui-monospace, SFMono-Regular, monospace';
@@ -157,6 +157,111 @@ export async function renderBrandedTableQrPngBlob(
       (blob) => {
         if (!blob) {
           reject(new Error('Failed to encode Table QR PNG.'));
+          return;
+        }
+        resolve(blob);
+      },
+      'image/png',
+      1,
+    );
+  });
+}
+
+export function getMainMenuQrUrl(): string {
+  if (typeof window === 'undefined') return '/menu';
+  return `${window.location.origin}/menu`;
+}
+
+/**
+ * Renders a high-resolution, print-ready branded Main Website QR card PNG (`/menu`)
+ * for counters, doors, and takeaway desks.
+ */
+export async function renderBrandedMainMenuQrPngBlob(
+  menuUrl: string = getMainMenuQrUrl(),
+): Promise<Blob> {
+  const width = 1200;
+  const height = 1560;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    throw new Error('Unable to initialize canvas for Main Website QR export.');
+  }
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.strokeStyle = '#E5E7EB';
+  ctx.lineWidth = 8;
+  roundRectPath(ctx, 36, 36, width - 72, height - 72, 48);
+  ctx.stroke();
+
+  ctx.fillStyle = '#151110';
+  roundRectPath(ctx, 68, 68, width - 136, 210, 36);
+  ctx.fill();
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '800 58px system-ui, -apple-system, sans-serif';
+  ctx.fillText('RIKZEN FAST FOOD', width / 2, 168);
+
+  ctx.fillStyle = '#FDBA74';
+  ctx.font = '600 28px system-ui, -apple-system, sans-serif';
+  ctx.fillText('Fresh  •  Fast  •  Delicious', width / 2, 226);
+
+  ctx.fillStyle = '#E5391B';
+  roundRectPath(ctx, width / 2 - 280, 316, 560, 102, 28);
+  ctx.fill();
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '800 48px system-ui, -apple-system, sans-serif';
+  ctx.fillText('SCAN FOR MENU', width / 2, 384);
+
+  ctx.fillStyle = '#111827';
+  ctx.font = '800 40px system-ui, -apple-system, sans-serif';
+  ctx.fillText('Select Your Table & Order Instantly', width / 2, 484);
+
+  const qrCanvas = document.createElement('canvas');
+  await QRCode.toCanvas(qrCanvas, menuUrl, {
+    width: 780,
+    margin: 4,
+    errorCorrectionLevel: 'H',
+    color: {
+      dark: '#000000',
+      light: '#FFFFFF',
+    },
+  });
+
+  const qrBoxSize = 820;
+  const qrBoxX = (width - qrBoxSize) / 2;
+  const qrBoxY = 524;
+
+  ctx.fillStyle = '#FFFFFF';
+  roundRectPath(ctx, qrBoxX, qrBoxY, qrBoxSize, qrBoxSize, 32);
+  ctx.fill();
+  ctx.strokeStyle = '#151110';
+  ctx.lineWidth = 6;
+  roundRectPath(ctx, qrBoxX, qrBoxY, qrBoxSize, qrBoxSize, 32);
+  ctx.stroke();
+
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(qrCanvas, qrBoxX + 20, qrBoxY + 20, 780, 780);
+  ctx.imageSmoothingEnabled = true;
+
+  ctx.fillStyle = '#15803D';
+  ctx.font = '700 32px system-ui, -apple-system, sans-serif';
+  ctx.fillText('NO LOGIN REQUIRED  •  SCAN • ORDER • ENJOY', width / 2, 1418);
+
+  ctx.fillStyle = '#6B7280';
+  ctx.font = '500 24px ui-monospace, SFMono-Regular, monospace';
+  ctx.fillText('/menu', width / 2, 1472);
+
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          reject(new Error('Failed to encode Main Website QR PNG.'));
           return;
         }
         resolve(blob);
@@ -199,26 +304,40 @@ function triggerBlobDownload(blob: Blob, filename: string) {
 
 /**
  * Downloads a single high-resolution Table QR PNG:
- * `RikZen-Fast-Food-Table-{N}-QR.png`
+ * `RikZen-Table-{N}-QR.png`
  */
 export async function downloadSingleTableQrPng(tableNumber: number): Promise<string> {
-  const filename = `RikZen-Fast-Food-Table-${tableNumber}-QR.png`;
+  const filename = `RikZen-Table-${tableNumber}-QR.png`;
   const blob = await renderBrandedTableQrPngBlob(tableNumber, getTableQrUrl(tableNumber));
   triggerBlobDownload(blob, filename);
   return filename;
 }
 
 /**
- * Generates and downloads a real ZIP archive containing all 6 print-ready Table QR PNGs:
- * `RikZen-Fast-Food-Table-QRs.zip` -> `Table-1-QR.png` ... `Table-6-QR.png`
+ * Downloads the high-resolution Main Website QR PNG:
+ * `RikZen-Main-Website-QR.png`
+ */
+export async function downloadMainMenuQrPng(): Promise<string> {
+  const filename = 'RikZen-Main-Website-QR.png';
+  const blob = await renderBrandedMainMenuQrPngBlob(getMainMenuQrUrl());
+  triggerBlobDownload(blob, filename);
+  return filename;
+}
+
+/**
+ * Generates and downloads a real ZIP archive containing all 6 print-ready Table QR PNGs
+ * plus the Main Website QR:
+ * `RikZen-Fast-Food-Table-QRs.zip` -> `RikZen-Table-1-QR.png` ... `RikZen-Table-6-QR.png`
  */
 export async function downloadAllTableQrsZip(): Promise<string> {
   const zip = new JSZip();
   for (const tableNumber of TABLE_NUMBERS) {
     const blob = await renderBrandedTableQrPngBlob(tableNumber, getTableQrUrl(tableNumber));
     const buffer = await blob.arrayBuffer();
-    zip.file(`Table-${tableNumber}-QR.png`, buffer);
+    zip.file(`RikZen-Table-${tableNumber}-QR.png`, buffer);
   }
+  const mainBlob = await renderBrandedMainMenuQrPngBlob(getMainMenuQrUrl());
+  zip.file('RikZen-Main-Website-QR.png', await mainBlob.arrayBuffer());
   const zipBlob = await zip.generateAsync({ type: 'blob' });
   const filename = 'RikZen-Fast-Food-Table-QRs.zip';
   triggerBlobDownload(zipBlob, filename);

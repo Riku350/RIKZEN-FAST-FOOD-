@@ -11,11 +11,18 @@ import { generateBrandedBillPdfBuffer } from './src/lib/pdfBillGenerator.ts';
 import { generateSalesReportPdfBuffer, type SalesReportOrderRow } from './src/lib/pdfReportGenerator.ts';
 import {
   buildDynamicUpiUri,
+  createPaymentQrSnapshot,
   DEFAULT_PAYMENT_SETTINGS,
   isValidUpiId,
   type PaymentSettings,
 } from './src/lib/upiPayment.ts';
-import type { MenuItem, OfferRecord, OrderLineItem } from './src/types/restaurant.ts';
+import type {
+  MenuItem,
+  OfferRecord,
+  OrderLineItem,
+  PaymentMode,
+  PaymentQrSnapshot,
+} from './src/types/restaurant.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -75,18 +82,34 @@ const liveOfferMap = new Map<string, OfferRecord>(
 const UPLOADS_DIR = path.resolve(__dirname, 'src', 'assets', 'uploads');
 const BILLS_DIR = path.resolve(__dirname, 'bills');
 const DATA_DIR = path.resolve(__dirname, 'data');
+const PUBLIC_BILLS_DIR = path.resolve(DATA_DIR, 'public-bills');
 const PAYMENT_SETTINGS_FILE = path.resolve(DATA_DIR, 'payment-settings.json');
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(BILLS_DIR, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(PUBLIC_BILLS_DIR, { recursive: true });
+
+// 15-minute idempotency cache preventing duplicate orders on rapid double-clicks / retries
+const ORDER_IDEMPOTENCY_TTL_MS = 15 * 60 * 1000;
+const orderIdempotencyCache = new Map<string, { expiresAt: number; payload: Record<string, unknown> }>();
+
+function pruneOrderIdempotencyCache(): void {
+  const now = Date.now();
+  for (const [key, entry] of orderIdempotencyCache.entries()) {
+    if (entry.expiresAt <= now) {
+      orderIdempotencyCache.delete(key);
+    }
+  }
+}
 
 function loadPersistedPaymentSettings(): { settings: PaymentSettings; updatedAtMs: number } {
   try {
     if (fs.existsSync(PAYMENT_SETTINGS_FILE)) {
       const parsed = JSON.parse(fs.readFileSync(PAYMENT_SETTINGS_FILE, 'utf8')) as Partial<PaymentSettings>;
-      const upiId = typeof parsed.upi_id === 'string' && (parsed.upi_id === '' || isValidUpiId(parsed.upi_id))
-        ? parsed.upi_id.trim()
-        : '';
+      const upiId =
+        typeof parsed.upi_id === 'string' && (parsed.upi_id === '' || isValidUpiId(parsed.upi_id))
+          ? parsed.upi_id.trim()
+          : '';
       const merchantName =
         typeof parsed.merchant_name === 'string' && parsed.merchant_name.trim().length >= 2
           ? parsed.merchant_name.trim().slice(0, 80)
@@ -96,13 +119,21 @@ function loadPersistedPaymentSettings(): { settings: PaymentSettings; updatedAtM
         (parsed.qr_image_url === '' ||
           parsed.qr_image_url.startsWith('/uploads/') ||
           parsed.qr_image_url.startsWith('/src/assets/') ||
+          parsed.qr_image_url.startsWith('/assets/') ||
           parsed.qr_image_url.startsWith('https://'))
           ? parsed.qr_image_url.slice(0, 500)
           : '';
+      const paymentMode: PaymentMode =
+        parsed.payment_mode === 'uploaded_qr' || parsed.payment_mode === 'dynamic_upi'
+          ? parsed.payment_mode
+          : qrImageUrl
+            ? 'uploaded_qr'
+            : 'dynamic_upi';
       const stat = fs.statSync(PAYMENT_SETTINGS_FILE);
       return {
         settings: {
           id: 'payment',
+          payment_mode: paymentMode,
           upi_id: upiId,
           merchant_name: merchantName,
           qr_image_url: qrImageUrl,
@@ -122,7 +153,6 @@ function loadPersistedPaymentSettings(): { settings: PaymentSettings; updatedAtM
 
 const initialPaymentState = loadPersistedPaymentSettings();
 let livePaymentSettings: PaymentSettings = initialPaymentState.settings;
-let paymentSettingsUpdatedAtMs = initialPaymentState.updatedAtMs;
 
 function savePersistedPaymentSettings(next: PaymentSettings): void {
   const safePath = path.resolve(DATA_DIR, 'payment-settings.json');
@@ -133,7 +163,98 @@ function savePersistedPaymentSettings(next: PaymentSettings): void {
   fs.writeFileSync(tempPath, JSON.stringify(next, null, 2), 'utf8');
   fs.renameSync(tempPath, safePath);
   livePaymentSettings = next;
-  paymentSettingsUpdatedAtMs = Date.now();
+}
+
+function resolveLocalUploadImageBuffer(qrImageUrl?: string): Buffer | null {
+  if (!qrImageUrl || typeof qrImageUrl !== 'string') return null;
+  if (!qrImageUrl.startsWith('/uploads/')) return null;
+  const filename = path.basename(qrImageUrl);
+  if (!/^[a-zA-Z0-9._-]{3,120}$/.test(filename)) return null;
+  const fullPath = path.resolve(UPLOADS_DIR, filename);
+  if (!fullPath.startsWith(UPLOADS_DIR + path.sep)) return null;
+  try {
+    if (!fs.existsSync(fullPath)) return null;
+    const stat = fs.statSync(fullPath);
+    if (!stat.isFile() || stat.size < 100 || stat.size > 5 * 1024 * 1024) return null;
+    return fs.readFileSync(fullPath);
+  } catch {
+    return null;
+  }
+}
+
+interface StoredPublicBillRecord {
+  public_bill_id: string;
+  order_id: string;
+  order_code: string;
+  table_number: number;
+  customer_name: string;
+  customer_mobile: string;
+  items: OrderLineItem[];
+  subtotal: number;
+  discount: number;
+  total: number;
+  notes: string;
+  status: string;
+  payment_status: string;
+  created_at_iso: string;
+  confirmed_at: string;
+  generated_at: string;
+  pdf_url: string;
+  filename: string;
+  payment_qr_snapshot: PaymentQrSnapshot;
+}
+
+function getOrderSnapshotPath(orderDir: string): string {
+  const snapshotPath = path.resolve(orderDir, 'bill-snapshot.json');
+  if (!snapshotPath.startsWith(orderDir + path.sep)) {
+    throw new Error('Invalid bill snapshot path.');
+  }
+  return snapshotPath;
+}
+
+function getPublicBillIndexPath(publicBillId: string): string {
+  const safeId = publicBillId.trim();
+  if (!/^RK[0-9]{4,8}-[a-fA-F0-9]{8,24}$/.test(safeId)) {
+    throw new Error('Invalid public bill identifier.');
+  }
+  const filePath = path.resolve(PUBLIC_BILLS_DIR, `${safeId}.json`);
+  if (!filePath.startsWith(PUBLIC_BILLS_DIR + path.sep)) {
+    throw new Error('Invalid public bill index path.');
+  }
+  return filePath;
+}
+
+function readExistingOrderSnapshot(orderDir: string): StoredPublicBillRecord | null {
+  try {
+    const p = getOrderSnapshotPath(orderDir);
+    if (!fs.existsSync(p)) return null;
+    return JSON.parse(fs.readFileSync(p, 'utf8')) as StoredPublicBillRecord;
+  } catch {
+    return null;
+  }
+}
+
+function writePublicBillRecord(orderDir: string, record: StoredPublicBillRecord): void {
+  fs.mkdirSync(orderDir, { recursive: true });
+  const orderSnapPath = getOrderSnapshotPath(orderDir);
+  const tmpOrderSnap = path.resolve(orderDir, `.tmp_snap_${crypto.randomBytes(6).toString('hex')}.json`);
+  fs.writeFileSync(tmpOrderSnap, JSON.stringify(record, null, 2), 'utf8');
+  fs.renameSync(tmpOrderSnap, orderSnapPath);
+
+  const pubPath = getPublicBillIndexPath(record.public_bill_id);
+  const tmpPub = path.resolve(PUBLIC_BILLS_DIR, `.tmp_pub_${crypto.randomBytes(6).toString('hex')}.json`);
+  fs.writeFileSync(tmpPub, JSON.stringify(record, null, 2), 'utf8');
+  fs.renameSync(tmpPub, pubPath);
+}
+
+function readPublicBillRecord(publicBillId: string): StoredPublicBillRecord | null {
+  try {
+    const pubPath = getPublicBillIndexPath(publicBillId);
+    if (!fs.existsSync(pubPath)) return null;
+    return JSON.parse(fs.readFileSync(pubPath, 'utf8')) as StoredPublicBillRecord;
+  } catch {
+    return null;
+  }
 }
 
 function resolvePublicOrigin(req: Request): string {
@@ -219,15 +340,7 @@ async function verifyOwnerIdToken(authHeader?: string): Promise<{ uid: string; e
   }
 }
 
-async function safeParseProviderJson<T>(resp: globalThis.Response): Promise<{ ok: boolean; data: T | null; rawText: string }> {
-  const rawText = await resp.text();
-  try {
-    const parsed = JSON.parse(rawText) as T;
-    return { ok: true, data: parsed, rawText };
-  } catch {
-    return { ok: false, data: null, rawText };
-  }
-}
+
 
 interface SignableOrderPayload {
   id: string;
@@ -248,6 +361,11 @@ interface BillOrderRequest extends SignableOrderPayload {
   server_signature?: string;
   notes?: string;
   created_at_iso?: string;
+  confirmed_at?: string;
+  status?: string;
+  payment_status?: string;
+  public_bill_id?: string;
+  payment_qr_snapshot?: PaymentQrSnapshot | null;
 }
 
 function normalizeIndianMobile(raw: unknown): string | null {
@@ -444,32 +562,71 @@ async function ensureStoredBillPdf(
     total: number;
     notes?: string;
     createdAtIso: string;
+    confirmedAt?: string;
+    status?: string;
+    paymentStatus?: string;
+    publicBillId?: string;
+    existingQrSnapshot?: PaymentQrSnapshot | null;
   },
   options: { forceRegenerate?: boolean } = {},
 ) {
   const storage = buildBillStorageInfo(params.orderId, params.orderCode);
-  const existing = inspectStoredPdf(storage.absolutePath);
-  const upiUri = buildDynamicUpiUri({
-    upiId: livePaymentSettings.upi_id,
-    merchantName: livePaymentSettings.merchant_name,
-    amount: params.total,
-    orderCode: storage.orderCode,
-    tableNumber: params.tableNumber,
-  });
+  const existingPdf = inspectStoredPdf(storage.absolutePath);
+  const existingDiskSnapshot = readExistingOrderSnapshot(storage.orderDir);
 
-  if (!options.forceRegenerate && existing.valid) {
-    const stat = fs.statSync(storage.absolutePath);
-    if (stat.mtimeMs >= paymentSettingsUpdatedAtMs) {
-      return {
-        ...storage,
-        generatedAt: stat.mtime.toISOString(),
-        sizeBytes: existing.size,
-        reused: true,
-        upiUri,
-        upiId: livePaymentSettings.upi_id,
-      };
+  // Preserve immutable public_bill_id & payment_qr_snapshot for old bills so changing
+  // restaurant QR tomorrow NEVER alters previously generated customer bills.
+  const publicBillId =
+    (params.publicBillId && /^RK[0-9]{4,8}-[a-fA-F0-9]{8,24}$/.test(params.publicBillId)
+      ? params.publicBillId
+      : null) ||
+    existingDiskSnapshot?.public_bill_id ||
+    `${storage.orderCode}-${crypto.randomBytes(6).toString('hex')}`;
+
+  const qrSnapshot: PaymentQrSnapshot =
+    (!options.forceRegenerate && (params.existingQrSnapshot || existingDiskSnapshot?.payment_qr_snapshot)) ||
+    createPaymentQrSnapshot(livePaymentSettings, {
+      amount: params.total,
+      orderCode: storage.orderCode,
+      tableNumber: params.tableNumber,
+    });
+
+  const confirmedAt =
+    params.confirmedAt ||
+    existingDiskSnapshot?.confirmed_at ||
+    new Date().toISOString();
+
+  if (!options.forceRegenerate && existingPdf.valid && existingDiskSnapshot) {
+    // Keep public bill status/payment_status fresh without mutating immutable payment_qr_snapshot
+    if (
+      (params.paymentStatus && params.paymentStatus !== existingDiskSnapshot.payment_status) ||
+      (params.status && params.status !== existingDiskSnapshot.status)
+    ) {
+      writePublicBillRecord(storage.orderDir, {
+        ...existingDiskSnapshot,
+        status: params.status || existingDiskSnapshot.status,
+        payment_status: params.paymentStatus || existingDiskSnapshot.payment_status,
+        confirmed_at: confirmedAt,
+      });
     }
+    const stat = fs.statSync(storage.absolutePath);
+    return {
+      ...storage,
+      publicBillId,
+      billPageUrl: `/bill/${publicBillId}`,
+      paymentQrSnapshot: qrSnapshot,
+      generatedAt: existingDiskSnapshot.generated_at || stat.mtime.toISOString(),
+      sizeBytes: existingPdf.size,
+      reused: true,
+      upiUri: qrSnapshot.upi_uri,
+      upiId: qrSnapshot.upi_id,
+    };
   }
+
+  const uploadedQrBuffer =
+    qrSnapshot.mode === 'uploaded_qr'
+      ? resolveLocalUploadImageBuffer(qrSnapshot.qr_image_url)
+      : null;
 
   const pdfBuffer = await generateBrandedBillPdfBuffer({
     order_code: storage.orderCode,
@@ -482,9 +639,11 @@ async function ensureStoredBillPdf(
     total: params.total,
     notes: params.notes,
     created_at_iso: params.createdAtIso,
-    upi_id: livePaymentSettings.upi_id,
-    merchant_name: livePaymentSettings.merchant_name,
-    upi_uri: upiUri,
+    payment_mode: qrSnapshot.mode,
+    upi_id: qrSnapshot.upi_id,
+    merchant_name: qrSnapshot.merchant_name,
+    upi_uri: qrSnapshot.upi_uri,
+    uploaded_qr_buffer: uploadedQrBuffer,
   });
 
   if (pdfBuffer.length < 512 || pdfBuffer.subarray(0, 5).toString('utf8') !== '%PDF-') {
@@ -508,13 +667,39 @@ async function ensureStoredBillPdf(
     throw new Error('Stored PDF file could not be verified on server storage.');
   }
 
+  const generatedAt = new Date().toISOString();
+  writePublicBillRecord(storage.orderDir, {
+    public_bill_id: publicBillId,
+    order_id: storage.orderId,
+    order_code: storage.orderCode,
+    table_number: params.tableNumber,
+    customer_name: params.customerName,
+    customer_mobile: params.customerMobile,
+    items: params.items,
+    subtotal: params.subtotal,
+    discount: params.discount,
+    total: params.total,
+    notes: params.notes || '',
+    status: params.status || 'accepted',
+    payment_status: params.paymentStatus || 'pending',
+    created_at_iso: params.createdAtIso,
+    confirmed_at: confirmedAt,
+    generated_at: generatedAt,
+    pdf_url: storage.pdfUrl,
+    filename: storage.filename,
+    payment_qr_snapshot: qrSnapshot,
+  });
+
   return {
     ...storage,
-    generatedAt: new Date().toISOString(),
+    publicBillId,
+    billPageUrl: `/bill/${publicBillId}`,
+    paymentQrSnapshot: qrSnapshot,
+    generatedAt,
     sizeBytes: verified.size,
     reused: false,
-    upiUri,
-    upiId: livePaymentSettings.upi_id,
+    upiUri: qrSnapshot.upi_uri,
+    upiId: qrSnapshot.upi_id,
   };
 }
 
@@ -525,9 +710,9 @@ interface RequestedLine {
 }
 
 const app = express();
-app.use(express.json({ limit: '4mb' }));
+app.use(express.json({ limit: '10mb' }));
 
-// Serve owner-uploaded dish photos safely
+// Serve owner-uploaded dish photos & payment QR images safely
 app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '7d' }));
 
 app.get('/api/health', (_req, res) => {
@@ -543,7 +728,7 @@ app.get('/api/menu', (_req, res) => {
 });
 
 /**
- * Public non-secret restaurant UPI payment destination (UPI ID, Merchant Name, Reference QR image URL).
+ * Public non-secret restaurant Payment QR configuration (Mode 1 Uploaded QR or Mode 2 Dynamic UPI QR).
  */
 app.get('/api/payment-settings', (_req, res) => {
   res.json({
@@ -553,7 +738,7 @@ app.get('/api/payment-settings', (_req, res) => {
 });
 
 /**
- * Owner-authenticated Payment Settings update (syncs UPI destination for dynamic exact-amount PDF & UI QRs).
+ * Owner-authenticated Payment Settings update (honest 2-mode: uploaded_qr or dynamic_upi).
  */
 app.post('/api/owner/payment-settings', async (req, res) => {
   const owner = await verifyOwnerIdToken(req.headers.authorization);
@@ -563,16 +748,30 @@ app.post('/api/owner/payment-settings', async (req, res) => {
   }
 
   const body = req.body as {
+    payment_mode?: unknown;
     upi_id?: unknown;
     merchant_name?: unknown;
     qr_image_url?: unknown;
   };
+
+  const paymentMode: PaymentMode =
+    body.payment_mode === 'uploaded_qr' || body.payment_mode === 'dynamic_upi'
+      ? body.payment_mode
+      : livePaymentSettings.payment_mode || 'dynamic_upi';
 
   const rawUpiId = typeof body.upi_id === 'string' ? body.upi_id.trim() : '';
   if (rawUpiId !== '' && !isValidUpiId(rawUpiId)) {
     res.status(400).json({
       success: false,
       error: 'Please enter a valid UPI ID (example: rikzenfastfood@okaxis or 9876543210@ybl).',
+    });
+    return;
+  }
+
+  if (paymentMode === 'dynamic_upi' && rawUpiId === '') {
+    res.status(400).json({
+      success: false,
+      error: 'Enter a valid Restaurant UPI ID to use Dynamic Amount UPI QR mode.',
     });
     return;
   }
@@ -587,6 +786,7 @@ app.post('/api/owner/payment-settings', async (req, res) => {
     qrImageUrl !== '' &&
     !qrImageUrl.startsWith('/uploads/') &&
     !qrImageUrl.startsWith('/src/assets/') &&
+    !qrImageUrl.startsWith('/assets/') &&
     !qrImageUrl.startsWith('https://')
   ) {
     res.status(400).json({
@@ -596,8 +796,17 @@ app.post('/api/owner/payment-settings', async (req, res) => {
     return;
   }
 
+  if (paymentMode === 'uploaded_qr' && qrImageUrl === '') {
+    res.status(400).json({
+      success: false,
+      error: 'Please upload your restaurant payment QR image first.',
+    });
+    return;
+  }
+
   const updated: PaymentSettings = {
     id: 'payment',
+    payment_mode: paymentMode,
     upi_id: rawUpiId,
     merchant_name: merchantName,
     qr_image_url: qrImageUrl,
@@ -607,12 +816,13 @@ app.post('/api/owner/payment-settings', async (req, res) => {
   savePersistedPaymentSettings(updated);
   res.json({
     success: true,
+    message: 'Payment QR saved successfully.',
     settings: livePaymentSettings,
   });
 });
 
 /**
- * Owner-authenticated Payment QR Screenshot upload (JPEG/PNG/WebP <= 2 MB -> /uploads/qr_<hex>.<ext>).
+ * Owner-authenticated Payment QR Image upload (PNG/JPG/JPEG/WEBP <= 5 MB -> /uploads/qr_<hex>.<ext>).
  */
 app.post('/api/owner/upload-payment-qr', async (req, res) => {
   const owner = await verifyOwnerIdToken(req.headers.authorization);
@@ -629,14 +839,17 @@ app.post('/api/owner/upload-payment-qr', async (req, res) => {
 
   const match = body.dataUrl.match(/^data:(image\/(jpeg|jpg|png|webp));base64,([A-Za-z0-9+/=]+)$/);
   if (!match) {
-    res.status(400).json({ success: false, error: 'Only JPEG, PNG, and WebP QR images are supported.' });
+    res.status(400).json({
+      success: false,
+      error: 'Only PNG, JPG, JPEG, and WEBP QR images are supported.',
+    });
     return;
   }
 
   const ext = match[2] === 'jpeg' ? 'jpg' : match[2];
   const buffer = Buffer.from(match[3], 'base64');
-  if (buffer.length < 100 || buffer.length > 2 * 1024 * 1024) {
-    res.status(400).json({ success: false, error: 'QR image size must be under 2 MB.' });
+  if (buffer.length < 100 || buffer.length > 5 * 1024 * 1024) {
+    res.status(400).json({ success: false, error: 'QR image size must be under 5 MB.' });
     return;
   }
 
@@ -649,6 +862,58 @@ app.post('/api/owner/upload-payment-qr', async (req, res) => {
 
   fs.writeFileSync(targetPath, buffer);
   res.json({ success: true, url: `/uploads/${filename}` });
+});
+
+/**
+ * Owner-authenticated delete of current uploaded QR reference (does NOT delete older bill snapshots).
+ */
+app.delete('/api/owner/payment-qr', async (req, res) => {
+  const owner = await verifyOwnerIdToken(req.headers.authorization);
+  if (!owner) {
+    res.status(401).json({ success: false, error: 'Owner authentication required.' });
+    return;
+  }
+
+  const nextSettings: PaymentSettings = {
+    ...livePaymentSettings,
+    qr_image_url: '',
+    payment_mode: livePaymentSettings.upi_id ? 'dynamic_upi' : 'uploaded_qr',
+    updated_at: new Date().toISOString(),
+  };
+  savePersistedPaymentSettings(nextSettings);
+  res.json({
+    success: true,
+    message: 'Uploaded payment QR removed.',
+    settings: livePaymentSettings,
+  });
+});
+
+/**
+ * Server-side High-Resolution Main Website QR PNG Download (`/menu`).
+ */
+app.get('/api/tables/main/qr.png', async (req, res) => {
+  try {
+    const origin = resolvePublicOrigin(req);
+    const menuUrl = `${origin}/menu`;
+    const pngBuffer = await QRCode.toBuffer(menuUrl, {
+      type: 'png',
+      width: 900,
+      margin: 5,
+      errorCorrectionLevel: 'H',
+      color: { dark: '#000000', light: '#FFFFFF' },
+    });
+
+    const filename = 'RikZen-Main-Website-QR.png';
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', String(pngBuffer.length));
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(pngBuffer);
+  } catch (err) {
+    console.error('[RikZen Main Website QR PNG Error]', err);
+    res.status(500).json({ success: false, error: 'Failed to generate Main Website QR PNG.' });
+  }
 });
 
 /**
@@ -672,7 +937,7 @@ app.get('/api/tables/:tableNumber/qr.png', async (req, res) => {
       color: { dark: '#000000', light: '#FFFFFF' },
     });
 
-    const filename = `RikZen-Fast-Food-Table-${tableNumber}-QR.png`;
+    const filename = `RikZen-Table-${tableNumber}-QR.png`;
     res.setHeader('Content-Type', 'image/png');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('Content-Length', String(pngBuffer.length));
@@ -687,6 +952,7 @@ app.get('/api/tables/:tableNumber/qr.png', async (req, res) => {
 
 /**
  * Server-side All-6-Tables QR ZIP Archive Download (`RikZen-Fast-Food-Table-QRs.zip`).
+ * Contains `RikZen-Table-1-QR.png` ... `RikZen-Table-6-QR.png` + `RikZen-Main-Website-QR.png`.
  */
 app.get('/api/tables/qr-zip', async (req, res) => {
   try {
@@ -702,8 +968,17 @@ app.get('/api/tables/qr-zip', async (req, res) => {
         errorCorrectionLevel: 'H',
         color: { dark: '#000000', light: '#FFFFFF' },
       });
-      zip.file(`Table-${tableNumber}-QR.png`, pngBuffer);
+      zip.file(`RikZen-Table-${tableNumber}-QR.png`, pngBuffer);
     }
+
+    const mainPngBuffer = await QRCode.toBuffer(`${origin}/menu`, {
+      type: 'png',
+      width: 900,
+      margin: 5,
+      errorCorrectionLevel: 'H',
+      color: { dark: '#000000', light: '#FFFFFF' },
+    });
+    zip.file('RikZen-Main-Website-QR.png', mainPngBuffer);
 
     const zipBuffer = await zip.generateAsync({ type: 'nodebuffer' });
     res.setHeader('Content-Type', 'application/zip');
@@ -727,18 +1002,17 @@ app.get('/api/owner/config-status', async (req, res) => {
     res.status(401).json({ success: false, error: 'Owner authentication required.' });
     return;
   }
-  const hasToken = Boolean(process.env.WHATSAPP_ACCESS_TOKEN?.trim());
-  const hasPhoneId = Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID?.trim());
   const voiceTtsConfigured = Boolean(
     process.env.GEMINI_API_KEY?.trim() && process.env.GEMINI_API_KEY.trim() !== 'MY_GEMINI_API_KEY',
   );
   res.json({
     success: true,
-    whatsappConfigured: hasToken && hasPhoneId,
-    hasToken,
-    hasPhoneId,
     voiceTtsConfigured,
-    apiVersion: process.env.WHATSAPP_API_VERSION?.trim() || 'v21.0',
+    paymentMode: livePaymentSettings.payment_mode,
+    paymentConfigured:
+      livePaymentSettings.payment_mode === 'uploaded_qr'
+        ? Boolean(livePaymentSettings.qr_image_url)
+        : isValidUpiId(livePaymentSettings.upi_id),
   });
 });
 
@@ -834,88 +1108,7 @@ app.post('/api/owner/voice-alert-tts', async (req, res) => {
   }
 });
 
-/**
- * Owner-authenticated live WhatsApp Business Cloud API credential verification.
- * Performs a real read-only phone-number lookup on Meta Graph API (never fakes connected).
- */
-app.post('/api/owner/whatsapp/verify', async (req, res) => {
-  const owner = await verifyOwnerIdToken(req.headers.authorization);
-  if (!owner) {
-    res.status(401).json({ success: false, error: 'Owner authentication required.' });
-    return;
-  }
 
-  const accessToken = process.env.WHATSAPP_ACCESS_TOKEN?.trim();
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim();
-  const apiVersion = process.env.WHATSAPP_API_VERSION?.trim() || 'v21.0';
-
-  if (!accessToken || !phoneNumberId) {
-    res.status(503).json({
-      success: false,
-      connected: false,
-      code: 'WHATSAPP_NOT_CONFIGURED',
-      hasToken: Boolean(accessToken),
-      hasPhoneId: Boolean(phoneNumberId),
-      error: 'WhatsApp API is not configured. Add WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID in Settings → Secrets.',
-    });
-    return;
-  }
-
-  if (!/^[0-9]{6,32}$/.test(phoneNumberId) || !/^v[0-9]{1,3}\.[0-9]{1,2}$/.test(apiVersion)) {
-    res.status(400).json({
-      success: false,
-      connected: false,
-      code: 'INVALID_WHATSAPP_CONFIG',
-      error: 'WHATSAPP_PHONE_NUMBER_ID must be numeric and WHATSAPP_API_VERSION must look like v21.0.',
-    });
-    return;
-  }
-
-  try {
-    const resp = await fetch(
-      `https://graph.facebook.com/${encodeURIComponent(apiVersion)}/${encodeURIComponent(phoneNumberId)}?fields=display_phone_number,verified_name,quality_rating`,
-      {
-        method: 'GET',
-        headers: { Authorization: `Bearer ${accessToken}` },
-      },
-    );
-
-    const parsed = await safeParseProviderJson<{
-      display_phone_number?: string;
-      verified_name?: string;
-      quality_rating?: string;
-      error?: { message?: string };
-    }>(resp);
-
-    if (!resp.ok || !parsed.data?.display_phone_number) {
-      res.status(502).json({
-        success: false,
-        connected: false,
-        code: 'WHATSAPP_VERIFY_FAILED',
-        error:
-          parsed.data?.error?.message ||
-          `Meta WhatsApp API rejected the configured credentials (HTTP ${resp.status}).`,
-      });
-      return;
-    }
-
-    res.json({
-      success: true,
-      connected: true,
-      displayPhoneNumber: parsed.data.display_phone_number,
-      verifiedName: parsed.data.verified_name || 'RikZen Fast Food',
-      qualityRating: parsed.data.quality_rating || 'GREEN',
-    });
-  } catch (err) {
-    console.error('[RikZen WhatsApp Verify Error]', err);
-    res.status(502).json({
-      success: false,
-      connected: false,
-      code: 'WHATSAPP_NETWORK_ERROR',
-      error: 'Unable to reach Meta WhatsApp Business API right now. Please try again.',
-    });
-  }
-});
 
 /**
  * Owner-authenticated sync of Firestore Menu Items & Offers into the server pricing engine.
@@ -1025,15 +1218,18 @@ app.post('/api/owner/upload-image', async (req, res) => {
 
 /**
  * Authoritative Server-Side Order Verification, Customer Mobile Validation,
- * Offer Discount Calculation, Cryptographic Signing, AND Immediate PDF Bill Storage.
+ * Idempotency Protection (prevents duplicate orders), Offer Discount Calculation,
+ * and Cryptographic Signing. Bill PDF + QR Snapshot is generated upon Owner Confirmation.
  */
 app.post('/api/orders/verify', async (req, res) => {
   try {
+    pruneOrderIdempotencyCache();
     const body = req.body as {
       tableNumber?: unknown;
       customerName?: unknown;
       customerMobile?: unknown;
       customerSessionId?: unknown;
+      clientRequestId?: unknown;
       items?: unknown;
       notes?: unknown;
     };
@@ -1058,7 +1254,7 @@ app.post('/api/orders/verify', async (req, res) => {
 
     const normalizedMobile = normalizeIndianMobile(body.customerMobile);
     if (!normalizedMobile) {
-      res.status(400).json({ success: false, error: 'Please enter a valid mobile number.' });
+      res.status(400).json({ success: false, error: 'Please enter a valid 10-digit mobile number.' });
       return;
     }
 
@@ -1066,6 +1262,20 @@ app.post('/api/orders/verify', async (req, res) => {
     if (!/^[a-zA-Z0-9_-]{16,128}$/.test(customerSessionId)) {
       res.status(400).json({ success: false, error: 'Invalid customer session identifier.' });
       return;
+    }
+
+    const clientRequestId =
+      typeof body.clientRequestId === 'string' && /^[a-zA-Z0-9_-]{8,128}$/.test(body.clientRequestId.trim())
+        ? body.clientRequestId.trim()
+        : '';
+
+    if (clientRequestId) {
+      const idempKey = `${customerSessionId}:${clientRequestId}`;
+      const cached = orderIdempotencyCache.get(idempKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        res.json({ ...cached.payload, idempotent_replay: true });
+        return;
+      }
     }
 
     if (!Array.isArray(body.items) || body.items.length < 1 || body.items.length > 20) {
@@ -1163,7 +1373,7 @@ app.post('/api/orders/verify', async (req, res) => {
     currentOrderSequence += 1;
     const orderNumber = currentOrderSequence;
     const orderCode = `RK${orderNumber}`;
-    const nowIso = new Date().toISOString();
+    const publicBillId = `${orderCode}-${crypto.randomBytes(6).toString('hex')}`;
 
     const signable: SignableOrderPayload = {
       id: orderId,
@@ -1181,46 +1391,51 @@ app.post('/api/orders/verify', async (req, res) => {
     };
 
     const serverSignature = computeOrderSignature(signable);
+    const upiUri =
+      livePaymentSettings.payment_mode === 'dynamic_upi'
+        ? buildDynamicUpiUri({
+            upiId: livePaymentSettings.upi_id,
+            merchantName: livePaymentSettings.merchant_name,
+            amount: total,
+            orderCode,
+            tableNumber,
+          })
+        : '';
 
-    const storedPdf = await ensureStoredBillPdf({
-      orderId,
-      orderCode,
-      tableNumber,
-      customerName,
-      customerMobile: normalizedMobile,
-      items: verifiedItems,
-      subtotal,
-      discount,
-      total,
-      notes,
-      createdAtIso: nowIso,
-    });
-
-    res.json({
+    const responsePayload: Record<string, unknown> = {
       success: true,
       ...signable,
       item_count: itemCount,
       status: 'pending',
       payment_status: 'pending',
       paid_at: '',
-      upi_uri: storedPdf.upiUri,
-      pdf_ready: true,
-      bill_status: 'generated',
-      pdf_url: storedPdf.pdfUrl,
-      pdf_path: storedPdf.pdfPath,
-      generated_at: storedPdf.generatedAt,
-      sent_at: '',
-      send_status: 'not_sent',
-      whatsapp_status: 'not_sent',
-      whatsapp_error: '',
+      confirmed_at: '',
+      public_bill_id: publicBillId,
+      bill_page_url: `/bill/${publicBillId}`,
+      payment_qr_snapshot: null,
+      upi_uri: upiUri,
+      pdf_ready: false,
+      bill_status: 'not_generated',
+      pdf_url: '',
+      pdf_path: '',
+      generated_at: '',
       server_signature: serverSignature,
       notes,
-    });
+    };
+
+    if (clientRequestId) {
+      orderIdempotencyCache.set(`${customerSessionId}:${clientRequestId}`, {
+        expiresAt: Date.now() + ORDER_IDEMPOTENCY_TTL_MS,
+        payload: responsePayload,
+      });
+    }
+
+    res.json(responsePayload);
   } catch (err) {
-    console.error('[RikZen Order Verify & Bill Gen Error]', err);
+    console.error('[RikZen Order Verify Error]', err);
     res.status(500).json({
       success: false,
-      error: 'Unable to verify order and generate bill. Please try again.',
+      error: 'Unable to place your order right now. Please try again.',
     });
   }
 });
@@ -1296,6 +1511,11 @@ app.post('/api/bills/generate', async (req, res) => {
         total: authoritative.total,
         notes: ord.notes || '',
         createdAtIso: ord.created_at_iso || new Date().toISOString(),
+        confirmedAt: ord.confirmed_at || undefined,
+        status: ord.status || 'accepted',
+        paymentStatus: ord.payment_status || 'pending',
+        publicBillId: ord.public_bill_id || undefined,
+        existingQrSnapshot: ord.payment_qr_snapshot || null,
       },
       { forceRegenerate: Boolean(body.forceRegenerate) },
     );
@@ -1306,6 +1526,8 @@ app.post('/api/bills/generate', async (req, res) => {
       message: 'PDF generated successfully',
       order_id: stored.orderId,
       order_code: stored.orderCode,
+      public_bill_id: stored.publicBillId,
+      bill_page_url: stored.billPageUrl,
       filename: stored.filename,
       bill_status: 'generated',
       pdfUrl: stored.pdfUrl,
@@ -1315,6 +1537,7 @@ app.post('/api/bills/generate', async (req, res) => {
       size_bytes: stored.sizeBytes,
       upi_uri: stored.upiUri,
       upi_id: stored.upiId,
+      payment_qr_snapshot: stored.paymentQrSnapshot,
     });
   } catch (err) {
     console.error('[RikZen Bill Generation Error]', err);
@@ -1465,262 +1688,59 @@ app.get('/api/bills/file/:orderId/:filename', (req, res) => {
 });
 
 /**
- * Owner-authenticated WhatsApp Business Cloud API PDF Bill Delivery.
- * Never fakes delivery — reports real Meta Graph API status or clean WHATSAPP_NOT_CONFIGURED JSON.
+ * Website-Native Public Bill Endpoint (`/api/public/bills/:billId`).
+ * Zero customer login required; survives page refresh; exposes ONLY this customer's
+ * sanitized bill & immutable Payment QR snapshot (no admin data, no other orders).
  */
-app.post('/api/bills/whatsapp', async (req, res) => {
+app.get('/api/public/bills/:billId', (req, res) => {
   try {
-    const owner = await verifyOwnerIdToken(req.headers.authorization);
-    if (!owner) {
-      res.status(401).json({
+    const billId = String(req.params.billId || '').trim();
+    if (!/^RK[0-9]{4,8}-[a-fA-F0-9]{8,24}$/.test(billId)) {
+      res.status(404).json({
         success: false,
-        delivered: false,
-        provider: 'whatsapp',
-        status: 'failed',
-        bill_status: 'failed',
-        error: 'Owner authentication required.',
+        error: 'Bill not found. Please check the bill link or ask at the counter.',
       });
       return;
     }
 
-    const body = req.body as { order?: BillOrderRequest };
-    const ord = body?.order;
-    if (!ord || !ord.id) {
-      res.status(400).json({
+    const record = readPublicBillRecord(billId);
+    if (!record) {
+      res.status(404).json({
         success: false,
-        delivered: false,
-        provider: 'whatsapp',
-        status: 'failed',
-        bill_status: 'failed',
-        error: 'Order data is required to send the bill.',
+        error: 'Bill not found or not yet confirmed by the restaurant.',
       });
       return;
     }
 
-    const normalizedMobile = normalizeIndianMobile(ord.customer_mobile);
-    if (!normalizedMobile) {
-      res.status(400).json({
-        success: false,
-        delivered: false,
-        provider: 'whatsapp',
-        status: 'failed',
-        bill_status: 'failed',
-        error: 'Invalid customer mobile number. Please verify the 10-digit Indian mobile number.',
-      });
-      return;
-    }
-
-    const orderCode = (ord.order_code || `RK${ord.order_number}`).toUpperCase();
-    const normalizedSignable: SignableOrderPayload = {
-      id: ord.id,
-      order_number: Number(ord.order_number),
-      order_code: orderCode,
-      table_id: ord.table_id || `table_${ord.table_number}`,
-      table_number: Number(ord.table_number),
-      customer_name: ord.customer_name || 'Guest',
-      customer_mobile: normalizedMobile,
-      items: Array.isArray(ord.items)
-        ? ord.items.map((line) => ({
-            menu_item_id: line.menu_item_id,
-            name: line.name,
-            regular_price: line.regular_price ?? line.unit_price,
-            unit_price: line.unit_price,
-            quantity: line.quantity,
-            line_total: line.line_total,
-          }))
-        : [],
-      subtotal: Number(ord.subtotal),
-      discount: Number(ord.discount ?? 0),
-      total: Number(ord.total),
-      customer_session_id: ord.customer_session_id || '',
-    };
-
-    const sigValid = verifyOrderSignature(normalizedSignable, ord.server_signature);
-    const authoritative = computeAuthoritativeBillAmounts(normalizedSignable.items, sigValid);
-
-    // 1. Ensure PDF exists in persistent storage
-    const stored = await ensureStoredBillPdf({
-      orderId: normalizedSignable.id,
-      orderCode,
-      tableNumber: normalizedSignable.table_number,
-      customerName: normalizedSignable.customer_name,
-      customerMobile: normalizedMobile,
-      items: authoritative.items,
-      subtotal: authoritative.subtotal,
-      discount: authoritative.discount,
-      total: authoritative.total,
-      notes: ord.notes || '',
-      createdAtIso: ord.created_at_iso || new Date().toISOString(),
-    });
-
-    // 2. Verify WhatsApp Business API secrets on server
-    const accessToken = process.env.WHATSAPP_ACCESS_TOKEN?.trim();
-    const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim();
-    const apiVersion = process.env.WHATSAPP_API_VERSION?.trim() || 'v21.0';
-
-    if (!accessToken || !phoneNumberId) {
-      res.status(503).json({
-        success: false,
-        delivered: false,
-        provider: 'whatsapp',
-        code: 'WHATSAPP_NOT_CONFIGURED',
-        status: 'failed',
-        bill_status: 'failed',
-        pdf_url: stored.pdfUrl,
-        pdf_path: stored.pdfPath,
-        generated_at: stored.generatedAt,
-        error: 'WhatsApp API is not configured.',
-      });
-      return;
-    }
-
-    // 3. Upload verified PDF binary to Meta Graph API /media
-    const pdfBuffer = fs.readFileSync(stored.absolutePath);
-    if (pdfBuffer.length < 512 || pdfBuffer.subarray(0, 5).toString('utf8') !== '%PDF-') {
-      res.status(500).json({
-        success: false,
-        delivered: false,
-        provider: 'whatsapp',
-        status: 'failed',
-        bill_status: 'failed',
-        error: 'Stored PDF file failed integrity check before WhatsApp upload.',
-      });
-      return;
-    }
-
-    const formData = new FormData();
-    formData.append('messaging_product', 'whatsapp');
-    formData.append('type', 'application/pdf');
-    formData.append(
-      'file',
-      new Blob([new Uint8Array(pdfBuffer)], { type: 'application/pdf' }),
-      stored.filename,
-    );
-
-    const uploadResp = await fetch(
-      `https://graph.facebook.com/${encodeURIComponent(apiVersion)}/${encodeURIComponent(phoneNumberId)}/media`,
-      {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${accessToken}` },
-        body: formData,
-      },
-    );
-
-    const parsedUpload = await safeParseProviderJson<{
-      id?: string;
-      error?: { message?: string };
-    }>(uploadResp);
-
-    if (!uploadResp.ok || !parsedUpload.data?.id) {
-      const uploadErr =
-        parsedUpload.data?.error?.message ||
-        `WhatsApp media upload failed (HTTP ${uploadResp.status}).`;
-      console.error('[RikZen WhatsApp Upload Error]', {
-        status: uploadResp.status,
-        error: uploadErr,
-        rawSnippet: parsedUpload.rawText.slice(0, 300),
-      });
-      res.status(502).json({
-        success: false,
-        delivered: false,
-        provider: 'whatsapp',
-        status: 'failed',
-        bill_status: 'failed',
-        pdf_url: stored.pdfUrl,
-        pdf_path: stored.pdfPath,
-        generated_at: stored.generatedAt,
-        error: uploadErr,
-      });
-      return;
-    }
-
-    // 4. Send WhatsApp Document message to customer's verified +91 mobile number
-    const recipientDigits = normalizedMobile.replace(/\D/g, ''); // 91XXXXXXXXXX
-    const caption = [
-      `Hello ${normalizedSignable.customer_name} 👋`,
-      '',
-      'Thank you for visiting RikZen Fast Food 🍔',
-      '',
-      `Your bill for Order #${stored.orderCode} is attached.`,
-      '',
-      `Total: ₹${Math.round(authoritative.total).toLocaleString('en-IN')}`,
-      '',
-      'You can scan the UPI QR inside the bill to pay the exact amount.',
-      '',
-      'Thank you ❤️',
-    ].join('\n');
-
-    const msgResp = await fetch(
-      `https://graph.facebook.com/${encodeURIComponent(apiVersion)}/${encodeURIComponent(phoneNumberId)}/messages`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          messaging_product: 'whatsapp',
-          to: recipientDigits,
-          type: 'document',
-          document: {
-            id: parsedUpload.data.id,
-            filename: stored.filename,
-            caption,
-          },
-        }),
-      },
-    );
-
-    const parsedMsg = await safeParseProviderJson<{
-      messages?: Array<{ id?: string }>;
-      error?: { message?: string };
-    }>(msgResp);
-
-    if (!msgResp.ok || !parsedMsg.data?.messages?.[0]?.id) {
-      const sendErr =
-        parsedMsg.data?.error?.message ||
-        `WhatsApp message delivery failed (HTTP ${msgResp.status}).`;
-      console.error('[RikZen WhatsApp Send Error]', {
-        status: msgResp.status,
-        error: sendErr,
-        rawSnippet: parsedMsg.rawText.slice(0, 300),
-      });
-      res.status(502).json({
-        success: false,
-        delivered: false,
-        provider: 'whatsapp',
-        status: 'failed',
-        bill_status: 'failed',
-        pdf_url: stored.pdfUrl,
-        pdf_path: stored.pdfPath,
-        generated_at: stored.generatedAt,
-        error: sendErr,
-      });
-      return;
-    }
-
-    const sentAt = new Date().toISOString();
+    res.setHeader('Cache-Control', 'no-store');
     res.json({
       success: true,
-      delivered: true,
-      provider: 'whatsapp',
-      status: 'sent',
-      bill_status: 'sent',
-      messageId: parsedMsg.data.messages[0].id,
-      sent_at: sentAt,
-      pdf_url: stored.pdfUrl,
-      pdf_path: stored.pdfPath,
-      generated_at: stored.generatedAt,
+      bill: {
+        public_bill_id: record.public_bill_id,
+        order_code: record.order_code,
+        table_number: record.table_number,
+        customer_name: record.customer_name,
+        customer_mobile: record.customer_mobile,
+        items: record.items,
+        subtotal: record.subtotal,
+        discount: record.discount,
+        total: record.total,
+        notes: record.notes,
+        status: record.status,
+        payment_status: record.payment_status,
+        created_at_iso: record.created_at_iso,
+        confirmed_at: record.confirmed_at,
+        generated_at: record.generated_at,
+        pdf_url: record.pdf_url,
+        filename: record.filename,
+        payment_qr_snapshot: record.payment_qr_snapshot,
+      },
     });
   } catch (err) {
-    console.error('[RikZen WhatsApp Delivery Exception]', err);
+    console.error('[RikZen Public Bill Read Error]', err);
     res.status(500).json({
       success: false,
-      delivered: false,
-      provider: 'whatsapp',
-      status: 'failed',
-      bill_status: 'failed',
-      error: err instanceof Error ? err.message : 'Unexpected WhatsApp delivery failure.',
+      error: 'Unable to load this bill right now. Please try again.',
     });
   }
 });

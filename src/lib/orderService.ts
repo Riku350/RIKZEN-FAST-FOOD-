@@ -26,12 +26,13 @@ import {
   OfferRecord,
   OrderRecord,
   OrderStatus,
+  PaymentMode,
+  PaymentQrSnapshot,
   PaymentSettings,
   PaymentStatus,
   TableRecord,
   TableStatus,
   VerifiedOrderQuote,
-  WhatsAppDeliveryStatus,
 } from '../types/restaurant';
 import { auth, BOOTSTRAPPED_OWNER_EMAIL, db } from './firebase';
 import { handleFirestoreError, OperationType } from './firestoreErrors';
@@ -204,24 +205,68 @@ export function getTableQrUrl(tableNumber: number): string {
   return `${origin}/menu?table=${tableNumber}`;
 }
 
+export function toCustomerFriendlyError(err: unknown): string {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    return 'Connection lost. Please check your internet and try again.';
+  }
+  const raw = err instanceof Error ? err.message : String(err || '');
+  const lower = raw.toLowerCase();
+  if (
+    lower.includes('network') ||
+    lower.includes('failed to fetch') ||
+    lower.includes('offline') ||
+    lower.includes('unavailable')
+  ) {
+    return 'Connection lost. Please check your internet and try again.';
+  }
+  if (
+    lower.includes('missing or insufficient permissions') ||
+    lower.includes('permission-denied') ||
+    lower.includes('firestore') ||
+    lower.includes('operationtype') ||
+    lower.includes('authinfo')
+  ) {
+    return 'Something went wrong. Please try again.';
+  }
+  if (raw.trim().length > 0 && raw.trim().length < 160 && !raw.trim().startsWith('{')) {
+    return raw.trim();
+  }
+  return 'Something went wrong. Please try again.';
+}
+
 export function normalizeOrderRecord(raw: Partial<OrderRecord>): OrderRecord {
   const orderNumber = Number(raw.order_number || 1000);
   const orderCode = (raw.order_code || `RK${orderNumber}`).toUpperCase();
-  const whatsappStatus: WhatsAppDeliveryStatus = raw.whatsapp_status || raw.send_status || 'not_sent';
-  const sendStatus: WhatsAppDeliveryStatus = raw.send_status || whatsappStatus;
 
   let billStatus: BillStatus = raw.bill_status || 'not_generated';
   if (!raw.bill_status) {
-    if (whatsappStatus === 'sent') billStatus = 'sent';
-    else if (whatsappStatus === 'sending') billStatus = 'sending';
-    else if (whatsappStatus === 'retrying') billStatus = 'retrying';
-    else if (whatsappStatus === 'failed') billStatus = 'failed';
-    else if (raw.pdf_ready) billStatus = 'generated';
+    billStatus = raw.pdf_ready ? 'generated' : 'not_generated';
+  }
+  // Map any legacy 'sent' / 'sending' / 'retrying' bill status cleanly to website-native 'generated'
+  if (
+    billStatus !== 'not_generated' &&
+    billStatus !== 'generating' &&
+    billStatus !== 'generated' &&
+    billStatus !== 'failed'
+  ) {
+    billStatus = raw.pdf_ready ? 'generated' : 'not_generated';
   }
 
   const defaultPaymentStatus: PaymentStatus =
-    raw.payment_status ||
-    (raw.status === 'completed' ? 'paid' : 'pending');
+    raw.payment_status || (raw.status === 'completed' ? 'paid' : 'pending');
+
+  const rawSnapshot = raw.payment_qr_snapshot as PaymentQrSnapshot | null | undefined;
+  const paymentQrSnapshot: PaymentQrSnapshot | null =
+    rawSnapshot && typeof rawSnapshot === 'object'
+      ? {
+          mode: rawSnapshot.mode === 'uploaded_qr' ? 'uploaded_qr' : 'dynamic_upi',
+          merchant_name: rawSnapshot.merchant_name || 'RikZen Fast Food',
+          upi_id: rawSnapshot.upi_id || '',
+          upi_uri: rawSnapshot.upi_uri || '',
+          qr_image_url: rawSnapshot.qr_image_url || '',
+          captured_at: rawSnapshot.captured_at || '',
+        }
+      : null;
 
   return {
     id: raw.id || '',
@@ -248,16 +293,15 @@ export function normalizeOrderRecord(raw: Partial<OrderRecord>): OrderRecord {
     status: (raw.status || 'pending') as OrderStatus,
     payment_status: defaultPaymentStatus,
     paid_at: typeof raw.paid_at === 'string' ? raw.paid_at : '',
+    confirmed_at: typeof raw.confirmed_at === 'string' ? raw.confirmed_at : '',
+    public_bill_id: typeof raw.public_bill_id === 'string' ? raw.public_bill_id : '',
+    payment_qr_snapshot: paymentQrSnapshot,
     upi_uri: typeof raw.upi_uri === 'string' ? raw.upi_uri : '',
-    pdf_ready: Boolean(raw.pdf_ready ?? (billStatus === 'generated' || billStatus === 'sent')),
+    pdf_ready: Boolean(raw.pdf_ready ?? billStatus === 'generated'),
     bill_status: billStatus,
     pdf_url: typeof raw.pdf_url === 'string' ? raw.pdf_url : '',
     pdf_path: typeof raw.pdf_path === 'string' ? raw.pdf_path : '',
     generated_at: typeof raw.generated_at === 'string' ? raw.generated_at : '',
-    sent_at: typeof raw.sent_at === 'string' ? raw.sent_at : '',
-    send_status: sendStatus,
-    whatsapp_status: whatsappStatus,
-    whatsapp_error: typeof raw.whatsapp_error === 'string' ? raw.whatsapp_error : '',
     customer_session_id: raw.customer_session_id || '',
     server_signature: raw.server_signature || '',
     notes: raw.notes || '',
@@ -343,6 +387,11 @@ function buildOrderPayloadForServer(order: OrderRecord) {
     subtotal: order.subtotal,
     discount: order.discount ?? 0,
     total: order.total,
+    status: order.status,
+    payment_status: order.payment_status,
+    confirmed_at: order.confirmed_at || '',
+    public_bill_id: order.public_bill_id || '',
+    payment_qr_snapshot: order.payment_qr_snapshot || null,
     customer_session_id: order.customer_session_id,
     server_signature: order.server_signature,
     notes: order.notes || '',
@@ -401,14 +450,22 @@ export function subscribeToPaymentSettings(
         return;
       }
       const raw = snapshot.data() as Partial<PaymentSettings>;
+      const qrImageUrl = typeof raw.qr_image_url === 'string' ? raw.qr_image_url.trim() : '';
+      const paymentMode: PaymentMode =
+        raw.payment_mode === 'uploaded_qr' || raw.payment_mode === 'dynamic_upi'
+          ? raw.payment_mode
+          : qrImageUrl
+            ? 'uploaded_qr'
+            : 'dynamic_upi';
       onSettings({
         id: 'payment',
+        payment_mode: paymentMode,
         upi_id: typeof raw.upi_id === 'string' ? raw.upi_id.trim() : '',
         merchant_name:
           typeof raw.merchant_name === 'string' && raw.merchant_name.trim()
             ? raw.merchant_name.trim()
             : DEFAULT_PAYMENT_SETTINGS.merchant_name,
-        qr_image_url: typeof raw.qr_image_url === 'string' ? raw.qr_image_url.trim() : '',
+        qr_image_url: qrImageUrl,
         updated_at: raw.updated_at,
       });
     },
@@ -424,7 +481,7 @@ export function subscribeToPaymentSettings(
 
 /**
  * Syncs owner's Firestore PaymentSettings into the Express backend so server-generated PDFs
- * immediately embed the exact-amount dynamic UPI QR.
+ * immediately use the latest saved QR mode and settings for new bills.
  */
 export async function syncPaymentSettingsToServer(settings: PaymentSettings): Promise<void> {
   try {
@@ -433,6 +490,7 @@ export async function syncPaymentSettingsToServer(settings: PaymentSettings): Pr
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...headers },
       body: JSON.stringify({
+        payment_mode: settings.payment_mode || 'dynamic_upi',
         upi_id: settings.upi_id.trim(),
         merchant_name: settings.merchant_name.trim() || 'RikZen Fast Food',
         qr_image_url: settings.qr_image_url.trim(),
@@ -444,14 +502,14 @@ export async function syncPaymentSettingsToServer(settings: PaymentSettings): Pr
 }
 
 /**
- * Owner action: Uploads restaurant Payment QR screenshot (JPEG/PNG/WebP <= 2 MB) to confined server storage.
+ * Owner action: Uploads restaurant Payment QR image (PNG/JPG/JPEG/WEBP <= 5 MB) to confined server storage.
  */
 export async function ownerUploadPaymentQrImage(file: File): Promise<string> {
   if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
-    throw new Error('Please upload a JPEG, PNG, or WebP QR screenshot.');
+    throw new Error('Please upload a PNG, JPG, JPEG, or WEBP QR image.');
   }
-  if (file.size > 2 * 1024 * 1024) {
-    throw new Error('Payment QR image must be smaller than 2 MB.');
+  if (file.size > 5 * 1024 * 1024) {
+    throw new Error('Payment QR image must be smaller than 5 MB.');
   }
 
   const dataUrl = await new Promise<string>((resolve, reject) => {
@@ -479,22 +537,72 @@ export async function ownerUploadPaymentQrImage(file: File): Promise<string> {
 }
 
 /**
- * Owner action: Saves Restaurant UPI ID, Merchant Name, and Reference QR Image to both Firestore and Express backend.
+ * Owner action: Deletes currently uploaded QR image reference (older bills retain their snapshot).
+ */
+export async function ownerDeletePaymentQr(currentSettings: PaymentSettings): Promise<PaymentSettings> {
+  const headers = await getOwnerAuthHeader();
+  const res = await fetch('/api/owner/payment-qr', {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json', ...headers },
+  });
+  const { data: json, errorMessage } = await safeReadJson<{
+    success?: boolean;
+    settings?: PaymentSettings;
+    error?: string;
+  }>(res, 'Delete payment QR');
+  if (!res.ok || !json?.success) {
+    throw new Error(json?.error || errorMessage || 'Could not remove uploaded payment QR.');
+  }
+
+  const nextSettings: PaymentSettings = json.settings || {
+    ...currentSettings,
+    qr_image_url: '',
+    payment_mode: currentSettings.upi_id ? 'dynamic_upi' : 'uploaded_qr',
+    updated_at: new Date().toISOString(),
+  };
+
+  try {
+    await setDoc(doc(db, 'shop_settings', 'payment'), {
+      id: 'payment',
+      payment_mode: nextSettings.payment_mode,
+      upi_id: nextSettings.upi_id,
+      merchant_name: nextSettings.merchant_name,
+      qr_image_url: '',
+      updated_at: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, 'shop_settings/payment');
+  }
+
+  return nextSettings;
+}
+
+/**
+ * Owner action: Saves honest 2-mode Restaurant Payment Settings to both Express backend and Firestore.
  */
 export async function ownerSavePaymentSettings(payload: {
+  payment_mode: PaymentMode;
   upi_id: string;
   merchant_name: string;
   qr_image_url: string;
 }): Promise<PaymentSettings> {
+  const paymentMode: PaymentMode =
+    payload.payment_mode === 'uploaded_qr' ? 'uploaded_qr' : 'dynamic_upi';
   const trimmedUpi = payload.upi_id.trim();
   if (trimmedUpi !== '' && !isValidUpiId(trimmedUpi)) {
     throw new Error('Please enter a valid UPI ID (example: rikzenfastfood@okaxis or 9876543210@ybl).');
+  }
+  if (paymentMode === 'dynamic_upi' && trimmedUpi === '') {
+    throw new Error('Enter a valid Restaurant UPI ID for Dynamic Amount UPI QR mode.');
   }
   const merchantName = payload.merchant_name.trim().slice(0, 80);
   if (merchantName.length < 2) {
     throw new Error('Restaurant name must be at least 2 characters.');
   }
   const qrImageUrl = payload.qr_image_url.trim().slice(0, 500);
+  if (paymentMode === 'uploaded_qr' && !qrImageUrl) {
+    throw new Error('Please upload your restaurant payment QR image first.');
+  }
 
   // 1. Sync to Express server first (validates & persists for immediate PDF QR generation)
   const headers = await getOwnerAuthHeader();
@@ -502,6 +610,7 @@ export async function ownerSavePaymentSettings(payload: {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify({
+      payment_mode: paymentMode,
       upi_id: trimmedUpi,
       merchant_name: merchantName,
       qr_image_url: qrImageUrl,
@@ -521,6 +630,7 @@ export async function ownerSavePaymentSettings(payload: {
   try {
     await setDoc(doc(db, 'shop_settings', 'payment'), {
       id: 'payment',
+      payment_mode: paymentMode,
       upi_id: trimmedUpi,
       merchant_name: merchantName,
       qr_image_url: qrImageUrl,
@@ -533,6 +643,7 @@ export async function ownerSavePaymentSettings(payload: {
   return (
     json.settings || {
       id: 'payment',
+      payment_mode: paymentMode,
       upi_id: trimmedUpi,
       merchant_name: merchantName,
       qr_image_url: qrImageUrl,
@@ -542,74 +653,26 @@ export async function ownerSavePaymentSettings(payload: {
 }
 
 export async function fetchOwnerConfigStatus(): Promise<{
-  whatsappConfigured: boolean;
-  hasToken?: boolean;
-  hasPhoneId?: boolean;
-  apiVersion?: string;
+  voiceTtsConfigured: boolean;
+  paymentMode?: PaymentMode;
+  paymentConfigured?: boolean;
 }> {
   try {
     const headers = await getOwnerAuthHeader();
     const res = await fetch('/api/owner/config-status', { headers });
-    if (!res.ok) return { whatsappConfigured: false };
+    if (!res.ok) return { voiceTtsConfigured: false };
     const { data } = await safeReadJson<{
-      whatsappConfigured?: boolean;
-      hasToken?: boolean;
-      hasPhoneId?: boolean;
-      apiVersion?: string;
+      voiceTtsConfigured?: boolean;
+      paymentMode?: PaymentMode;
+      paymentConfigured?: boolean;
     }>(res, 'Owner config status');
     return {
-      whatsappConfigured: Boolean(data?.whatsappConfigured),
-      hasToken: Boolean(data?.hasToken),
-      hasPhoneId: Boolean(data?.hasPhoneId),
-      apiVersion: data?.apiVersion || 'v21.0',
+      voiceTtsConfigured: Boolean(data?.voiceTtsConfigured),
+      paymentMode: data?.paymentMode,
+      paymentConfigured: Boolean(data?.paymentConfigured),
     };
   } catch {
-    return { whatsappConfigured: false };
-  }
-}
-
-export async function verifyWhatsAppConnectionOnServer(): Promise<{
-  connected: boolean;
-  displayPhoneNumber?: string;
-  verifiedName?: string;
-  qualityRating?: string;
-  code?: string;
-  error?: string;
-}> {
-  try {
-    const headers = await getOwnerAuthHeader();
-    const res = await fetch('/api/owner/whatsapp/verify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...headers },
-    });
-    const { data, errorMessage } = await safeReadJson<{
-      connected?: boolean;
-      displayPhoneNumber?: string;
-      verifiedName?: string;
-      qualityRating?: string;
-      code?: string;
-      error?: string;
-    }>(res, 'WhatsApp connection check');
-
-    if (res.ok && data?.connected) {
-      return {
-        connected: true,
-        displayPhoneNumber: data.displayPhoneNumber,
-        verifiedName: data.verifiedName,
-        qualityRating: data.qualityRating,
-      };
-    }
-
-    return {
-      connected: false,
-      code: data?.code,
-      error: data?.error || errorMessage || `Connection check failed (HTTP ${res.status}).`,
-    };
-  } catch (err) {
-    return {
-      connected: false,
-      error: err instanceof Error ? err.message : 'Unable to test WhatsApp API connection.',
-    };
+    return { voiceTtsConfigured: false };
   }
 }
 
@@ -646,13 +709,14 @@ export async function uploadDishImageToServer(file: File): Promise<string> {
 }
 
 /**
- * Sends table, customer details, and cart items to Express backend for authoritative
- * server-side price, offer discount, HMAC signing, AND immediate real PDF generation/storage.
+ * Sends table, customer details, idempotency key, and cart items to Express backend for
+ * authoritative server-side price, offer discount, and HMAC signing.
  */
 export async function verifyOrderOnServer(
   tableNumber: number,
   cartItems: CartItem[],
   customer: CustomerDetails,
+  clientRequestId?: string,
 ): Promise<VerifiedOrderQuote> {
   const customerSessionId = getOrCreateCustomerSessionId();
   const payload = {
@@ -660,6 +724,7 @@ export async function verifyOrderOnServer(
     customerName: customer.name.trim(),
     customerMobile: `+91${customer.mobileDigits.trim()}`,
     customerSessionId,
+    clientRequestId: clientRequestId || undefined,
     notes: customer.notes.trim().slice(0, 200),
     items: cartItems.map((entry) => ({
       id: entry.id,
@@ -668,25 +733,31 @@ export async function verifyOrderOnServer(
     })),
   };
 
-  const response = await fetch('/api/orders/verify', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+  let response: Response;
+  try {
+    response = await fetch('/api/orders/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    console.error('[RikZen Order Verify Network Error]', err);
+    throw new Error('Connection lost. Please check your internet and try again.');
+  }
 
   const { data, errorMessage } = await safeReadJson<VerifiedOrderQuote & { error?: string }>(
     response,
     'Order verification',
   );
   if (!response.ok || !data) {
-    throw new Error(data?.error || errorMessage || 'Could not validate order with server.');
+    throw new Error(data?.error || errorMessage || 'Something went wrong. Please try again.');
   }
   return data;
 }
 
 /**
- * Persists a server-verified order (including its generated PDF URL, storage path, and bill status)
- * into Firestore so both Customer and Owner Dashboard see it live and after refresh.
+ * Persists a server-verified order into Firestore as `status: 'pending'` so the Owner
+ * Dashboard receives it immediately in real time. Never writes to `menu_items`.
  */
 export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<string> {
   const path = `orders/${quote.id}`;
@@ -707,16 +778,15 @@ export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<s
       status: 'pending',
       payment_status: 'pending',
       paid_at: '',
+      confirmed_at: '',
+      public_bill_id: quote.public_bill_id || '',
+      payment_qr_snapshot: quote.payment_qr_snapshot || null,
       upi_uri: quote.upi_uri || '',
       pdf_ready: Boolean(quote.pdf_ready),
-      bill_status: quote.bill_status || 'generated',
+      bill_status: quote.bill_status || 'not_generated',
       pdf_url: quote.pdf_url || '',
       pdf_path: quote.pdf_path || '',
       generated_at: quote.generated_at || '',
-      sent_at: '',
-      send_status: 'not_sent',
-      whatsapp_status: 'not_sent',
-      whatsapp_error: '',
       customer_session_id: quote.customer_session_id,
       server_signature: quote.server_signature,
       notes: quote.notes.slice(0, 200),
@@ -726,15 +796,58 @@ export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<s
     setStoredOrderIdForTable(quote.table_number, quote.id);
     return quote.id;
   } catch (error) {
-    handleFirestoreError(error, OperationType.CREATE, path);
+    // Log structured detail to console for engineering diagnostics, but never expose raw Firebase text to customers
+    console.error('[RikZen Customer Order Create Error]', { path, error });
+    throw new Error(toCustomerFriendlyError(error));
   }
 }
 
 /**
+ * Fetches a website-native public bill by `public_bill_id` (zero login required).
+ */
+export interface PublicBillPayload {
+  public_bill_id: string;
+  order_code: string;
+  table_number: number;
+  customer_name: string;
+  customer_mobile: string;
+  items: OrderRecord['items'];
+  subtotal: number;
+  discount: number;
+  total: number;
+  notes: string;
+  status: OrderStatus;
+  payment_status: PaymentStatus;
+  created_at_iso: string;
+  confirmed_at: string;
+  generated_at: string;
+  pdf_url: string;
+  filename: string;
+  payment_qr_snapshot: PaymentQrSnapshot | null;
+}
+
+export async function fetchPublicBillById(billId: string): Promise<PublicBillPayload> {
+  const res = await fetch(`/api/public/bills/${encodeURIComponent(billId)}`, {
+    method: 'GET',
+    cache: 'no-store',
+  });
+  const { data, errorMessage } = await safeReadJson<{
+    success?: boolean;
+    bill?: PublicBillPayload;
+    error?: string;
+  }>(res, 'Load bill');
+
+  if (!res.ok || !data?.success || !data.bill) {
+    throw new Error(data?.error || errorMessage || 'Bill not found.');
+  }
+  return data.bill;
+}
+
+/**
  * Unified PDF Bill Generation & Verification Helper.
- * Guarantees the actual `.pdf` exists in `/bills/{orderId}/RikZen-Fast-Food-Bill-{orderCode}.pdf`
- * on the backend server and syncs `pdf_url`, `pdf_path`, `generated_at`, `bill_status` to Firestore
- * when signed in as the verified owner.
+ * Guarantees the actual `.pdf` and immutable public bill snapshot exist on the backend server
+ * and syncs `pdf_url`, `pdf_path`, `public_bill_id`, `payment_qr_snapshot`, `generated_at`,
+ * and `bill_status` to Firestore when signed in as the verified owner.
  */
 export async function ensureOrderPdfGenerated(
   order: OrderRecord,
@@ -766,7 +879,7 @@ export async function ensureOrderPdfGenerated(
     });
   } catch (networkErr) {
     console.error('[RikZen PDF Generate Network Error]', networkErr);
-    throw new Error('Network error while generating PDF bill. Please check your connection and try again.');
+    throw new Error('Connection lost while generating PDF bill. Please try again.');
   }
 
   const { data: parsedJson, errorMessage: parseErrMsg } = await safeReadJson<
@@ -794,38 +907,39 @@ export async function ensureOrderPdfGenerated(
     ok: true,
     order_id: json.order_id || order.id,
     order_code: json.order_code || order.order_code,
+    public_bill_id: json.public_bill_id || order.public_bill_id || '',
+    bill_page_url:
+      json.bill_page_url || (json.public_bill_id ? `/bill/${json.public_bill_id}` : ''),
     filename: json.filename || getOrderBillFilename(order),
-    bill_status: json.bill_status || 'generated',
+    bill_status: 'generated',
     pdf_url: json.pdf_url,
     pdf_path: json.pdf_path,
     generated_at: json.generated_at || new Date().toISOString(),
     size_bytes: Number(json.size_bytes || 0),
     upi_uri: typeof json.upi_uri === 'string' ? json.upi_uri : order.upi_uri || '',
     upi_id: typeof json.upi_id === 'string' ? json.upi_id : '',
+    payment_qr_snapshot: json.payment_qr_snapshot || order.payment_qr_snapshot || null,
   };
 
   if (
     isOwnerSession &&
     (order.pdf_url !== result.pdf_url ||
       order.pdf_path !== result.pdf_path ||
+      order.public_bill_id !== result.public_bill_id ||
       order.upi_uri !== result.upi_uri ||
       !order.pdf_ready ||
-      order.bill_status === 'not_generated' ||
-      order.bill_status === 'generating')
+      !order.payment_qr_snapshot ||
+      order.bill_status !== 'generated')
   ) {
     try {
-      const preservedBillStatus: BillStatus =
-        order.send_status === 'sent' || order.whatsapp_status === 'sent'
-          ? 'sent'
-          : order.send_status === 'failed' || order.whatsapp_status === 'failed'
-            ? 'failed'
-            : 'generated';
       await updateDoc(doc(db, 'orders', order.id), {
         pdf_ready: true,
-        bill_status: preservedBillStatus,
+        bill_status: 'generated',
         pdf_url: result.pdf_url,
         pdf_path: result.pdf_path,
         generated_at: result.generated_at,
+        ...(result.public_bill_id ? { public_bill_id: result.public_bill_id } : {}),
+        ...(result.payment_qr_snapshot ? { payment_qr_snapshot: result.payment_qr_snapshot } : {}),
         ...(result.upi_uri ? { upi_uri: result.upi_uri } : {}),
         updated_at: serverTimestamp(),
       });
@@ -972,129 +1086,7 @@ export async function downloadSalesReportPdf(params: {
   return params.filename;
 }
 
-/**
- * Owner action: Sends the stored PDF bill via configured WhatsApp Business Cloud API.
- * Maintains real Firestore statuses: `sending` / `retrying` -> `sent` or `failed`.
- * Retry reuses the exact same order ID and PDF storage path without creating duplicates.
- */
-export async function ownerSendWhatsAppBill(
-  order: OrderRecord,
-): Promise<{
-  delivered: boolean;
-  status: WhatsAppDeliveryStatus;
-  billStatus: BillStatus;
-  code?: string;
-  whatsappNotConfigured?: boolean;
-  error?: string;
-}> {
-  const orderPath = `orders/${order.id}`;
-  const isRetry =
-    order.send_status === 'failed' ||
-    order.whatsapp_status === 'failed' ||
-    order.bill_status === 'failed';
-  const activeState: WhatsAppDeliveryStatus = isRetry ? 'retrying' : 'sending';
 
-  try {
-    await updateDoc(doc(db, 'orders', order.id), {
-      bill_status: activeState,
-      send_status: activeState,
-      whatsapp_status: activeState,
-      whatsapp_error: '',
-      updated_at: serverTimestamp(),
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, orderPath);
-  }
-
-  try {
-    const headers = await getOwnerAuthHeader();
-    const res = await fetch('/api/bills/whatsapp', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...headers },
-      body: JSON.stringify({
-        order: buildOrderPayloadForServer(order),
-      }),
-    });
-
-    const { data: parsedJson, errorMessage: parseErrMsg } = await safeReadJson<{
-      delivered?: boolean;
-      code?: string;
-      status?: WhatsAppDeliveryStatus;
-      bill_status?: BillStatus;
-      sent_at?: string;
-      pdf_url?: string;
-      pdf_path?: string;
-      generated_at?: string;
-      error?: string;
-    }>(res, 'WhatsApp bill delivery');
-
-    const json = parsedJson || {};
-
-    if (res.ok && json.delivered) {
-      const sentAt = json.sent_at || new Date().toISOString();
-      await updateDoc(doc(db, 'orders', order.id), {
-        pdf_ready: true,
-        bill_status: 'sent',
-        send_status: 'sent',
-        whatsapp_status: 'sent',
-        whatsapp_error: '',
-        sent_at: sentAt,
-        ...(json.pdf_url ? { pdf_url: json.pdf_url } : {}),
-        ...(json.pdf_path ? { pdf_path: json.pdf_path } : {}),
-        ...(json.generated_at ? { generated_at: json.generated_at } : {}),
-        updated_at: serverTimestamp(),
-      });
-      return { delivered: true, status: 'sent', billStatus: 'sent' };
-    }
-
-    const isNotConfigured = json.code === 'WHATSAPP_NOT_CONFIGURED';
-    const errText = (
-      json.error ||
-      parseErrMsg ||
-      `WhatsApp delivery failed (HTTP ${res.status}).`
-    ).slice(0, 240);
-    console.error('[RikZen WhatsApp Send Failed]', {
-      orderId: order.id,
-      status: res.status,
-      code: json.code,
-      errText,
-    });
-    await updateDoc(doc(db, 'orders', order.id), {
-      pdf_ready: Boolean(json.pdf_url || order.pdf_ready),
-      bill_status: 'failed',
-      send_status: 'failed',
-      whatsapp_status: 'failed',
-      whatsapp_error: errText,
-      ...(json.pdf_url ? { pdf_url: json.pdf_url } : {}),
-      ...(json.pdf_path ? { pdf_path: json.pdf_path } : {}),
-      ...(json.generated_at ? { generated_at: json.generated_at } : {}),
-      updated_at: serverTimestamp(),
-    });
-    return {
-      delivered: false,
-      status: 'failed',
-      billStatus: 'failed',
-      code: json.code,
-      whatsappNotConfigured: isNotConfigured,
-      error: errText,
-    };
-  } catch (err) {
-    const errText = (err instanceof Error ? err.message : 'WhatsApp delivery error.').slice(0, 240);
-    console.error('[RikZen WhatsApp Send Exception]', { orderId: order.id, error: err });
-    try {
-      await updateDoc(doc(db, 'orders', order.id), {
-        bill_status: 'failed',
-        send_status: 'failed',
-        whatsapp_status: 'failed',
-        whatsapp_error: errText,
-        updated_at: serverTimestamp(),
-      });
-    } catch {
-      // Ignore secondary update error
-    }
-    return { delivered: false, status: 'failed', billStatus: 'failed', error: errText };
-  }
-}
 
 /**
  * Customer real-time listener for their own order document only.
@@ -1273,7 +1265,7 @@ export async function seedOwnerShopDataIfNeeded(ownerUser: User): Promise<void> 
     handleFirestoreError(error, OperationType.WRITE, 'tables');
   }
 
-  // 3. Menu Items (also migrates legacy docs missing offer_price)
+  // 3. Menu Items (seed only if empty; safely patch any legacy doc missing offer_price without batch failure)
   try {
     const existingMenu = await getDocs(collection(db, 'menu_items'));
     if (existingMenu.empty) {
@@ -1296,31 +1288,19 @@ export async function seedOwnerShopDataIfNeeded(ownerUser: User): Promise<void> 
       }
       await batch.commit();
     } else {
-      const batch = writeBatch(db);
-      let needsMigration = false;
       for (const docSnap of existingMenu.docs) {
         const data = docSnap.data();
         if (typeof data.offer_price !== 'number') {
-          needsMigration = true;
           const canonical = CANONICAL_MENU_ITEMS.find((c) => c.id === docSnap.id);
-          batch.set(doc(db, 'menu_items', docSnap.id), {
-            id: docSnap.id,
-            name: String(data.name || canonical?.name || 'Item').slice(0, 80),
-            category: (data.category || canonical?.category || 'special') as MenuCategoryId,
-            description: String(data.description || canonical?.description || 'Freshly made').slice(0, 220),
-            price: Number(data.price || canonical?.price || 80),
-            offer_price: canonical?.offer_price ?? 0,
-            image: String(data.image || canonical?.image || '/src/assets/images/food_chicken_roll_1795284803954.jpg').slice(0, 500),
-            available: Boolean(data.available ?? true),
-            is_veg: Boolean(data.is_veg ?? false),
-            featured: Boolean(data.featured ?? false),
-            created_at: data.created_at || serverTimestamp(),
-            updated_at: serverTimestamp(),
-          });
+          try {
+            await updateDoc(doc(db, 'menu_items', docSnap.id), {
+              offer_price: canonical?.offer_price ?? 0,
+              updated_at: serverTimestamp(),
+            });
+          } catch (docErr) {
+            console.warn('[RikZen Menu Migration Warning]', docSnap.id, docErr);
+          }
         }
-      }
-      if (needsMigration) {
-        await batch.commit();
       }
     }
   } catch (error) {
@@ -1424,29 +1404,46 @@ export async function ownerUpdateOrderStatus(
 ): Promise<GeneratedBillResult | null> {
   const orderPath = `orders/${order.id}`;
   let generatedBill: GeneratedBillResult | null = null;
+  const nowIso = new Date().toISOString();
+  const confirmedAt = order.confirmed_at || (nextStatus === 'accepted' ? nowIso : '');
 
-  // On accept or bill_ready, guarantee the real stored PDF exists on disk
-  if (nextStatus === 'accepted' || nextStatus === 'bill_ready') {
-    generatedBill = await ensureOrderPdfGenerated(order, { persistIfOwner: false });
+  // On confirm (accepted) or bill_ready, guarantee the real stored PDF + immutable QR snapshot exist
+  if (nextStatus === 'accepted' || nextStatus === 'bill_ready' || nextStatus === 'completed') {
+    generatedBill = await ensureOrderPdfGenerated(
+      {
+        ...order,
+        status: nextStatus,
+        confirmed_at: confirmedAt || nowIso,
+      },
+      { persistIfOwner: false },
+    );
   }
 
   try {
     const batch = writeBatch(db);
     const updatePayload: Record<string, unknown> = {
       status: nextStatus,
-      pdf_ready: nextStatus !== 'rejected',
+      pdf_ready: nextStatus !== 'rejected' && Boolean(generatedBill || order.pdf_ready),
       updated_at: serverTimestamp(),
     };
+
+    if (confirmedAt) {
+      updatePayload.confirmed_at = confirmedAt;
+    }
 
     if (generatedBill) {
       updatePayload.pdf_url = generatedBill.pdf_url;
       updatePayload.pdf_path = generatedBill.pdf_path;
       updatePayload.generated_at = generatedBill.generated_at;
+      updatePayload.bill_status = 'generated';
+      if (generatedBill.public_bill_id) {
+        updatePayload.public_bill_id = generatedBill.public_bill_id;
+      }
+      if (generatedBill.payment_qr_snapshot) {
+        updatePayload.payment_qr_snapshot = generatedBill.payment_qr_snapshot;
+      }
       if (generatedBill.upi_uri) {
         updatePayload.upi_uri = generatedBill.upi_uri;
-      }
-      if (order.send_status !== 'sent' && order.whatsapp_status !== 'sent') {
-        updatePayload.bill_status = 'generated';
       }
     }
 
@@ -1486,6 +1483,13 @@ export async function ownerUpdatePaymentStatus(
       paid_at: paymentStatus === 'paid' ? new Date().toISOString() : '',
       updated_at: serverTimestamp(),
     });
+    // Keep public bill page's payment_status in sync without mutating its immutable QR snapshot
+    if (order.pdf_ready || order.public_bill_id) {
+      ensureOrderPdfGenerated(
+        { ...order, payment_status: paymentStatus },
+        { persistIfOwner: false, forceRegenerate: false },
+      ).catch(() => {});
+    }
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, orderPath);
   }

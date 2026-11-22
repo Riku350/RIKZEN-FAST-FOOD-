@@ -67,21 +67,28 @@ export type BillStatus =
   | 'not_generated'
   | 'generating'
   | 'generated'
-  | 'sending'
-  | 'sent'
-  | 'failed'
-  | 'retrying';
-
-export type WhatsAppDeliveryStatus = 'not_sent' | 'sending' | 'retrying' | 'sent' | 'failed';
+  | 'failed';
 
 export type PaymentStatus = 'not_paid' | 'pending' | 'paid' | 'failed';
 
+export type PaymentMode = 'uploaded_qr' | 'dynamic_upi';
+
 export interface PaymentSettings {
   id: 'payment';
+  payment_mode: PaymentMode;
   upi_id: string;
   merchant_name: string;
   qr_image_url: string;
   updated_at?: unknown;
+}
+
+export interface PaymentQrSnapshot {
+  mode: PaymentMode;
+  merchant_name: string;
+  upi_id: string;
+  qr_image_url: string;
+  upi_uri: string;
+  captured_at: string;
 }
 
 export interface OrderLineItem {
@@ -115,16 +122,15 @@ export interface OrderRecord {
   status: OrderStatus;
   payment_status: PaymentStatus;
   paid_at: string;
+  confirmed_at: string;
   upi_uri: string;
+  public_bill_id: string;
+  payment_qr_snapshot?: PaymentQrSnapshot | null;
   pdf_ready: boolean;
   bill_status: BillStatus;
   pdf_url: string;
   pdf_path: string;
   generated_at: string;
-  sent_at: string;
-  send_status: WhatsAppDeliveryStatus;
-  whatsapp_status: WhatsAppDeliveryStatus;
-  whatsapp_error: string;
   customer_session_id: string;
   server_signature: string;
   notes: string;
@@ -158,16 +164,15 @@ export interface VerifiedOrderQuote {
   status: 'pending';
   payment_status: PaymentStatus;
   paid_at: string;
+  confirmed_at: string;
   upi_uri: string;
+  public_bill_id: string;
+  payment_qr_snapshot?: PaymentQrSnapshot | null;
   pdf_ready: boolean;
   bill_status: BillStatus;
   pdf_url: string;
   pdf_path: string;
   generated_at: string;
-  sent_at: string;
-  send_status: WhatsAppDeliveryStatus;
-  whatsapp_status: WhatsAppDeliveryStatus;
-  whatsapp_error: string;
   customer_session_id: string;
   server_signature: string;
   notes: string;
@@ -177,12 +182,15 @@ export interface GeneratedBillResult {
   ok: boolean;
   order_id: string;
   order_code: string;
+  public_bill_id: string;
+  bill_page_url: string;
   filename: string;
   bill_status: BillStatus;
   pdf_url: string;
   pdf_path: string;
   upi_uri?: string;
   upi_id?: string;
+  payment_qr_snapshot?: PaymentQrSnapshot | null;
   generated_at: string;
   size_bytes: number;
 }

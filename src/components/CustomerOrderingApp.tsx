@@ -7,7 +7,9 @@ import {
   Check,
   CheckCircle2,
   ChefHat,
+  Clock,
   Download,
+  ExternalLink,
   Eye,
   FileText,
   Info,
@@ -18,6 +20,7 @@ import {
   QrCode,
   Receipt,
   Search,
+  Share2,
   ShoppingBag,
   Smartphone,
   Tag,
@@ -29,6 +32,7 @@ import {
   HERO_FEAST_IMAGE,
   MENU_CATEGORIES,
 } from '../data/menuCatalog';
+import { shareBillNative } from '../lib/billShare';
 import {
   createConfirmedOrder,
   downloadOrderBillPdf,
@@ -47,6 +51,7 @@ import {
   subscribeToOffers,
   subscribeToOrder,
   subscribeToPaymentSettings,
+  toCustomerFriendlyError,
   verifyOrderOnServer,
 } from '../lib/orderService';
 import { buildDynamicUpiUri, DEFAULT_PAYMENT_SETTINGS } from '../lib/upiPayment';
@@ -102,6 +107,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
   const [detailsError, setDetailsError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const checkoutRequestIdRef = useRef<string>('');
 
   // Active real-time order state
   const [activeOrderId, setActiveOrderId] = useState<string | null>(() =>
@@ -109,6 +115,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
   );
   const [activeOrder, setActiveOrder] = useState<OrderRecord | null>(null);
   const [orderSyncError, setOrderSyncError] = useState<string | null>(null);
+  const [shareFeedback, setShareFeedback] = useState<string | null>(null);
   const [isRequestingBill, setIsRequestingBill] = useState(false);
   const [showThankYouManual, setShowThankYouManual] = useState(false);
   const [showBillModal, setShowBillModal] = useState(false);
@@ -154,7 +161,10 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
           setActiveOrderId(null);
         }
       },
-      (err) => setOrderSyncError(err.message),
+      (err) => {
+        console.error('[Customer Order Sync Error]', err);
+        setOrderSyncError(toCustomerFriendlyError(err));
+      },
     );
     return () => unsub();
   }, [activeOrderId, tableNumber]);
@@ -246,6 +256,8 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
   }, []);
 
   const updateCartQty = (kind: 'menu' | 'offer', id: string, delta: number) => {
+    // Cart changed -> fresh idempotency key for next checkout
+    checkoutRequestIdRef.current = '';
     const key = `${kind}:${id}`;
     const wasEmpty = !(cart[key] > 0);
     setCart((prev) => {
@@ -285,7 +297,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
       return;
     }
     if (!isValidIndianMobileDigits(cleanedDigits)) {
-      setDetailsError('Please enter a valid mobile number.');
+      setDetailsError('Please enter a valid 10-digit mobile number.');
       return;
     }
 
@@ -304,17 +316,25 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     setIsSubmitting(true);
     setSubmitError(null);
     try {
-      const verifiedQuote = await verifyOrderOnServer(tableNumber, cartList, customerDetails);
+      if (!checkoutRequestIdRef.current) {
+        checkoutRequestIdRef.current = `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+      }
+      const verifiedQuote = await verifyOrderOnServer(
+        tableNumber,
+        cartList,
+        customerDetails,
+        checkoutRequestIdRef.current,
+      );
       const orderId = await createConfirmedOrder(verifiedQuote);
+      checkoutRequestIdRef.current = '';
       setActiveOrderId(orderId);
       setCart({});
       setCheckoutStage('cart');
       setShowThankYouManual(false);
       setActiveTab('order');
     } catch (err) {
-      setSubmitError(
-        err instanceof Error ? err.message : 'Unable to place your order. Please try again.',
-      );
+      console.error('[Customer Place Order Error]', err);
+      setSubmitError(toCustomerFriendlyError(err));
     } finally {
       setIsSubmitting(false);
     }
@@ -327,9 +347,8 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     try {
       await requestOrderBill(activeOrder.id);
     } catch (err) {
-      setOrderSyncError(
-        err instanceof Error ? err.message : 'Could not send bill request. Please try again.',
-      );
+      console.error('[Customer Request Bill Error]', err);
+      setOrderSyncError(toCustomerFriendlyError(err));
     } finally {
       setIsRequestingBill(false);
     }
@@ -342,11 +361,28 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     try {
       await downloadOrderBillPdf(activeOrder);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Bill generation failed. Please try again.';
       console.error('[Customer PDF Download Error]', err);
-      setOrderSyncError(`Bill download failed: ${msg}`);
+      setOrderSyncError(toCustomerFriendlyError(err));
     } finally {
       setDownloadingPdf(false);
+    }
+  };
+
+  const handleShareCustomerBill = async () => {
+    if (!activeOrder) return;
+    const outcome = await shareBillNative({
+      order_code: activeOrder.order_code || `RK${activeOrder.order_number}`,
+      table_number: activeOrder.table_number,
+      customer_name: activeOrder.customer_name,
+      total: activeOrder.total,
+      public_bill_id: activeOrder.public_bill_id,
+      pdf_url: activeOrder.pdf_url,
+    });
+    if (outcome.method !== 'cancelled') {
+      setShareFeedback(outcome.message);
+      window.setTimeout(() => {
+        setShareFeedback((cur) => (cur === outcome.message ? null : cur));
+      }, 3000);
     }
   };
 
@@ -1168,7 +1204,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                     className="sm:flex-1 min-h-[52px] px-6 py-3.5 rounded-xl bg-emerald-700 text-white font-bold text-base hover:bg-emerald-800 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
                   >
                     <CheckCircle2 className="w-5 h-5" />
-                    {isSubmitting ? 'Sending Order & Generating Bill...' : 'Confirm Order'}
+                    {isSubmitting ? 'Placing Order...' : 'Place Order'}
                   </button>
                 </div>
               </div>
@@ -1242,25 +1278,20 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                         <motion.div
                           animate={prefersReducedMotion ? undefined : { scale: [1, 1.07, 1] }}
                           transition={{ duration: 1.8, delay: 0.35, repeat: Infinity, ease: 'easeInOut' }}
-                          className="w-10 h-10 rounded-xl bg-white shadow-xs border border-amber-100 text-[#E5391B] flex items-center justify-center"
+                          className="w-10 h-10 rounded-xl bg-white shadow-xs border border-amber-100 text-amber-700 flex items-center justify-center"
                         >
-                          <Receipt className="w-5 h-5" />
-                        </motion.div>
-                        <ArrowRight className="w-4 h-4 text-amber-500" />
-                        <motion.div
-                          animate={prefersReducedMotion ? undefined : { scale: [1, 1.08, 1] }}
-                          transition={{ duration: 1.8, delay: 0.7, repeat: Infinity, ease: 'easeInOut' }}
-                          className="w-10 h-10 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center"
-                        >
-                          <CheckCircle2 className="w-5 h-5" />
+                          <Clock className="w-5 h-5" />
                         </motion.div>
                       </div>
+                      <p className="text-xs font-extrabold uppercase tracking-wider text-amber-700">
+                        Pending Restaurant Confirmation
+                      </p>
                       <h2 className="text-2xl sm:text-3xl font-extrabold text-neutral-900">
-                        Order Sent!
+                        ORDER RECEIVED
                       </h2>
                       <p className="text-sm sm:text-base text-neutral-600">
-                        Your order has been sent to RikZen Fast Food. Waiting for kitchen
-                        confirmation.
+                        Waiting for restaurant confirmation... Your bill &amp; payment QR will
+                        appear here immediately once the kitchen confirms.
                       </p>
                     </div>
                   )}
@@ -1276,7 +1307,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                         <CheckCircle2 className="w-9 h-9" />
                       </motion.div>
                       <h2 className="text-2xl sm:text-3xl font-extrabold text-emerald-800">
-                        Order Confirmed
+                        ORDER CONFIRMED
                       </h2>
                       <p className="text-sm sm:text-base text-neutral-600">
                         Table {activeOrder.table_number} · Order{' '}
@@ -1289,7 +1320,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                         </span>
                       </p>
                       <p className="text-xs font-medium text-neutral-500">
-                        Your PDF bill is ready below — view or download anytime without signing in.
+                        Your bill is ready below — view, download, share, or pay anytime.
                       </p>
                     </div>
                   )}
@@ -1378,21 +1409,40 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                     <span>{formatRelativeTime(activeOrder.created_at, nowMs)}</span>
                   </div>
 
-                  {/* Customer Bill & Dynamic Exact-Amount UPI QR Card (Zero Login Required) */}
-                  {activeOrder.status !== 'rejected' && (() => {
+                  {/* Confirmed Customer Bill & Honest 2-Mode Payment QR Card (Only after Owner Confirms!) */}
+                  {activeOrder.status !== 'pending' && activeOrder.status !== 'rejected' && (() => {
+                    const snap = activeOrder.payment_qr_snapshot;
+                    const activeMode = snap?.mode || paymentSettings.payment_mode || 'dynamic_upi';
+                    const activeMerchant = snap?.merchant_name || paymentSettings.merchant_name || 'RikZen Fast Food';
+                    const activeQrImg = snap?.qr_image_url || paymentSettings.qr_image_url || '';
+                    const activeUpiId = snap?.upi_id || paymentSettings.upi_id || '';
                     const dynamicUpiUri =
-                      buildDynamicUpiUri({
-                        upiId: paymentSettings.upi_id,
-                        merchantName: paymentSettings.merchant_name,
-                        amount: activeOrder.total,
-                        orderCode: activeOrderCode,
-                        tableNumber: activeOrder.table_number,
-                      }) || activeOrder.upi_uri || '';
+                      activeMode === 'dynamic_upi'
+                        ? snap?.upi_uri ||
+                          buildDynamicUpiUri({
+                            upiId: activeUpiId,
+                            merchantName: activeMerchant,
+                            amount: activeOrder.total,
+                            orderCode: activeOrderCode,
+                            tableNumber: activeOrder.table_number,
+                          }) ||
+                          activeOrder.upi_uri ||
+                          ''
+                        : '';
+                    const showUploadedQr = activeMode === 'uploaded_qr' && Boolean(activeQrImg);
+                    const showDynamicUpi = activeMode === 'dynamic_upi' && Boolean(dynamicUpiUri);
                     const isPaid = activeOrder.payment_status === 'paid';
                     const isFailedPay = activeOrder.payment_status === 'failed';
 
                     return (
                       <div className="rounded-2xl border border-neutral-200 bg-neutral-50 p-5 space-y-4">
+                        {shareFeedback && (
+                          <div className="rounded-xl bg-emerald-50 border border-emerald-200 px-3.5 py-2 text-xs font-bold text-emerald-800 flex items-center gap-2">
+                            <CheckCircle2 className="w-4 h-4 shrink-0" />
+                            {shareFeedback}
+                          </div>
+                        )}
+
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                           <div className="flex items-center gap-3.5">
                             <div className="w-11 h-11 rounded-xl bg-white border border-neutral-200 text-[#E5391B] flex items-center justify-center shrink-0">
@@ -1424,48 +1474,73 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                                   {formatRupees(activeOrder.total)}
                                 </span>
                               </p>
-                              {activeOrder.whatsapp_status === 'sent' && (
-                                <p className="text-xs font-semibold text-emerald-700 mt-0.5">
-                                  Also sent to your WhatsApp
-                                </p>
-                              )}
                             </div>
                           </div>
 
-                          <div className="flex gap-2.5 shrink-0">
-                            <button
-                              type="button"
-                              onClick={() => setShowBillModal(true)}
-                              className="flex-1 sm:flex-none min-h-[44px] px-4 py-2 rounded-xl bg-white border border-neutral-200 text-neutral-900 font-bold text-xs hover:bg-neutral-100 inline-flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
-                            >
-                              <Eye className="w-4 h-4" />
-                              View Bill
-                            </button>
+                          <div className="flex flex-wrap gap-2 shrink-0">
+                            {activeOrder.public_bill_id ? (
+                              <button
+                                type="button"
+                                onClick={() => onNavigate(`/bill/${activeOrder.public_bill_id}`)}
+                                className="flex-1 sm:flex-none min-h-[44px] px-4 py-2 rounded-xl bg-[#E5391B] text-white font-bold text-xs hover:bg-[#C82E14] inline-flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                              >
+                                <ExternalLink className="w-4 h-4" />
+                                View Bill
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => setShowBillModal(true)}
+                                className="flex-1 sm:flex-none min-h-[44px] px-4 py-2 rounded-xl bg-[#E5391B] text-white font-bold text-xs hover:bg-[#C82E14] inline-flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                              >
+                                <Eye className="w-4 h-4" />
+                                View Bill
+                              </button>
+                            )}
                             <button
                               type="button"
                               disabled={downloadingPdf}
                               onClick={handleDirectDownloadPdf}
-                              className="flex-1 sm:flex-none min-h-[44px] px-4 py-2 rounded-xl bg-neutral-900 text-white font-bold text-xs hover:bg-neutral-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60 whitespace-nowrap"
+                              className="flex-1 sm:flex-none min-h-[44px] px-3.5 py-2 rounded-xl bg-neutral-900 text-white font-bold text-xs hover:bg-neutral-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60 whitespace-nowrap"
                             >
                               <Download className="w-4 h-4" />
                               {downloadingPdf ? 'Downloading...' : 'Download Bill'}
                             </button>
+                            <button
+                              type="button"
+                              onClick={handleShareCustomerBill}
+                              className="min-h-[44px] px-3.5 py-2 rounded-xl bg-white border border-neutral-200 text-neutral-900 font-bold text-xs hover:bg-neutral-100 inline-flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                            >
+                              <Share2 className="w-4 h-4" />
+                              Share Bill
+                            </button>
                           </div>
                         </div>
 
-                        {/* Static Crisp Dynamic-Amount UPI QR Box (Never Animated) */}
-                        {dynamicUpiUri && !isPaid && (
+                        {/* Honest 2-Mode Payment QR Box (Zero Cropping, Distortion, or Animation over QR) */}
+                        {(showUploadedQr || showDynamicUpi) && !isPaid && (
                           <div className="rounded-2xl border-2 border-neutral-900 bg-white p-4 sm:p-5 flex flex-col sm:flex-row items-center gap-5">
-                            <div className="bg-white p-2 rounded-xl border border-neutral-200 shrink-0">
-                              <QRCodeSVG
-                                value={dynamicUpiUri}
-                                size={184}
-                                level="H"
-                                includeMargin={true}
-                                fgColor="#000000"
-                                bgColor="#FFFFFF"
-                              />
-                            </div>
+                            {showUploadedQr ? (
+                              <div className="bg-white p-2 rounded-xl border border-neutral-200 shrink-0">
+                                <img
+                                  src={activeQrImg}
+                                  alt={`Payment QR for ${activeMerchant}`}
+                                  className="w-44 h-44 object-contain"
+                                />
+                              </div>
+                            ) : (
+                              <div className="bg-white p-2 rounded-xl border border-neutral-200 shrink-0">
+                                <QRCodeSVG
+                                  value={dynamicUpiUri}
+                                  size={184}
+                                  level="H"
+                                  includeMargin={true}
+                                  fgColor="#000000"
+                                  bgColor="#FFFFFF"
+                                />
+                              </div>
+                            )}
+
                             <div className="flex-1 text-center sm:text-left space-y-2 min-w-0">
                               <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#151110] text-white text-[11px] font-extrabold tracking-wide">
                                 <QrCode className="w-3.5 h-3.5 text-amber-300" />
@@ -1474,29 +1549,42 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                               <p className="font-mono text-2xl sm:text-3xl font-extrabold text-[#E5391B] tabular-nums">
                                 {formatRupees(activeOrder.total)}
                               </p>
-                              <p className="text-xs font-bold text-emerald-700">
-                                Pay this exact amount · No need to type amount
-                              </p>
-                              {paymentSettings.upi_id && (
-                                <p className="text-xs font-mono text-neutral-600 truncate">
-                                  UPI ID:{' '}
+                              <p className="text-xs font-bold text-neutral-900">{activeMerchant}</p>
+                              {showDynamicUpi ? (
+                                <>
+                                  <p className="text-xs font-bold text-emerald-700">
+                                    Scan to pay this exact amount · No need to type amount
+                                  </p>
+                                  {activeUpiId && (
+                                    <p className="text-xs font-mono text-neutral-600 truncate">
+                                      UPI ID:{' '}
+                                      <span className="font-bold text-neutral-900">
+                                        {activeUpiId}
+                                      </span>
+                                    </p>
+                                  )}
+                                  <div className="pt-1">
+                                    <a
+                                      href={dynamicUpiUri}
+                                      className="min-h-[42px] px-4 py-2 rounded-xl bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] inline-flex items-center justify-center gap-1.5"
+                                    >
+                                      <Smartphone className="w-4 h-4" />
+                                      Pay Now · {formatRupees(activeOrder.total)}
+                                    </a>
+                                  </div>
+                                </>
+                              ) : (
+                                <p className="text-xs font-medium text-neutral-700">
+                                  Scan this QR using any UPI app and pay{' '}
                                   <span className="font-bold text-neutral-900">
-                                    {paymentSettings.upi_id}
+                                    {formatRupees(activeOrder.total)}
                                   </span>
+                                  .
                                 </p>
                               )}
                               <p className="text-[11px] text-neutral-500">
-                                Scan using any UPI app · PhonePe · Google Pay · Paytm · BHIM
+                                PhonePe · Google Pay · Paytm · BHIM
                               </p>
-                              <div className="pt-1">
-                                <a
-                                  href={dynamicUpiUri}
-                                  className="min-h-[42px] px-4 py-2 rounded-xl bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] inline-flex items-center justify-center gap-1.5"
-                                >
-                                  <Smartphone className="w-4 h-4" />
-                                  Open UPI App
-                                </a>
-                              </div>
                             </div>
                           </div>
                         )}
@@ -1598,7 +1686,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                 <div>
                   <p className="text-xs font-semibold text-neutral-500">Billing</p>
                   <p className="font-bold text-neutral-900 mt-0.5">
-                    Instant PDF Invoice &amp; WhatsApp Bill
+                    Instant Website Bill, PDF Download &amp; UPI QR
                   </p>
                 </div>
                 <div>

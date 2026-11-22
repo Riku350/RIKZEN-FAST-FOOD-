@@ -14,9 +14,11 @@ export interface BillPdfInput {
   total: number;
   notes?: string;
   created_at_iso: string;
+  payment_mode?: 'uploaded_qr' | 'dynamic_upi';
   upi_id?: string;
   merchant_name?: string;
   upi_uri?: string;
+  uploaded_qr_buffer?: Buffer | null;
 }
 
 const DEJAVU_REGULAR = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
@@ -96,18 +98,33 @@ function drawPageFrame(doc: PDFKit.PDFDocument) {
     .stroke();
 }
 
+function isPdfKitSupportedImageBuffer(buf: Buffer | null | undefined): buf is Buffer {
+  if (!buf || buf.length < 12) return false;
+  // PNG signature: 89 50 4E 47
+  const isPng = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+  // JPEG signature: FF D8 FF
+  const isJpg = buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+  return isPng || isJpg;
+}
+
 /**
  * Generates a real, verified, branded RikZen Fast Food PDF invoice buffer
- * with an embedded high-resolution, error-correction-H exact-amount dynamic UPI QR.
+ * with an embedded honest Payment QR (either Mode 1 exact un-altered uploaded QR
+ * or Mode 2 exact-amount dynamic UPI QR).
  */
 export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise<Buffer> {
-  // Pre-render crisp monochrome high-resolution UPI QR PNG buffer if dynamic UPI URI is configured
-  let qrPngBuffer: Buffer | null = null;
   const trimmedUpiUri = typeof input.upi_uri === 'string' ? input.upi_uri.trim() : '';
   const trimmedUpiId = typeof input.upi_id === 'string' ? input.upi_id.trim() : '';
+  const mode = input.payment_mode === 'uploaded_qr' ? 'uploaded_qr' : 'dynamic_upi';
 
-  if (trimmedUpiUri && trimmedUpiUri.startsWith('upi://pay?')) {
-    qrPngBuffer = await QRCode.toBuffer(trimmedUpiUri, {
+  let qrImageBuffer: Buffer | null = null;
+  let isDynamicAmountQr = false;
+
+  if (mode === 'uploaded_qr' && isPdfKitSupportedImageBuffer(input.uploaded_qr_buffer)) {
+    qrImageBuffer = input.uploaded_qr_buffer;
+    isDynamicAmountQr = false;
+  } else if (mode === 'dynamic_upi' && trimmedUpiUri && trimmedUpiUri.startsWith('upi://pay?')) {
+    qrImageBuffer = await QRCode.toBuffer(trimmedUpiUri, {
       type: 'png',
       width: 512,
       margin: 4,
@@ -117,6 +134,10 @@ export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise
         light: '#FFFFFF',
       },
     });
+    isDynamicAmountQr = true;
+  } else if (isPdfKitSupportedImageBuffer(input.uploaded_qr_buffer)) {
+    qrImageBuffer = input.uploaded_qr_buffer;
+    isDynamicAmountQr = false;
   }
 
   return new Promise((resolve, reject) => {
@@ -320,11 +341,12 @@ export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise
       y += 6;
     }
 
-    // Check space needed for Totals + optional note + optional Dynamic UPI QR block
-    const qrBlockHeight = qrPngBuffer ? 132 : 0;
+    // Check space needed for Totals + optional note + optional Payment QR block
+    const hasQrBlock = Boolean(qrImageBuffer);
+    const qrBlockHeight = hasQrBlock ? 132 : 0;
     const noteHeight = input.notes?.trim() ? 20 : 0;
     const totalsHeight = 76;
-    const neededBelowItems = totalsHeight + noteHeight + (qrPngBuffer ? qrBlockHeight + 10 : 0);
+    const neededBelowItems = totalsHeight + noteHeight + (hasQrBlock ? qrBlockHeight + 10 : 0);
 
     if (y + neededBelowItems > footerY - 6) {
       doc.addPage();
@@ -383,8 +405,8 @@ export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise
       y += 16;
     }
 
-    // Dynamic Exact-Amount UPI Payment QR Card (Crisp monochrome, quiet-zone framed, high contrast)
-    if (qrPngBuffer) {
+    // Honest Payment QR Card (Mode 1: exact un-altered uploaded QR; Mode 2: exact-amount dynamic UPI QR)
+    if (qrImageBuffer) {
       y += 4;
       if (y + qrBlockHeight > footerY - 6) {
         doc.addPage();
@@ -403,31 +425,43 @@ export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise
         .strokeColor('#151110')
         .stroke();
 
-      // Left white frame holding razor-sharp monochrome QR (108pt x 108pt)
+      // Left clean white frame holding crisp QR image without distortion or cropping
       const qrSize = 108;
       const qrX = left + 10;
       const qrY = y + 9;
-      doc.image(qrPngBuffer, qrX, qrY, { width: qrSize, height: qrSize });
+      try {
+        doc.image(qrImageBuffer, qrX, qrY, {
+          fit: [qrSize, qrSize],
+          align: 'center',
+          valign: 'center',
+        });
+      } catch {
+        doc
+          .font(fontBody)
+          .fontSize(7.5)
+          .fillColor('#6B7280')
+          .text('Scan QR on Bill Page', qrX + 8, qrY + 42, { width: qrSize - 16, align: 'center' });
+      }
 
       // Right side clear payment details
       const infoX = qrX + qrSize + 14;
       const infoWidth = left + contentWidth - infoX - 10;
 
       doc
-        .roundedRect(infoX, y + 12, 86, 17, 4)
+        .roundedRect(infoX, y + 12, 92, 17, 4)
         .fillColor('#151110')
         .fill();
       doc
         .font(fontBold)
         .fontSize(8)
         .fillColor('#FFFFFF')
-        .text('SCAN TO PAY', infoX, y + 16, { width: 86, align: 'center' });
+        .text('PAY YOUR BILL', infoX, y + 16, { width: 92, align: 'center' });
 
       doc
         .font(fontBold)
-        .fontSize(16)
+        .fontSize(15.5)
         .fillColor('#E5391B')
-        .text(`Pay ${fmt(input.total)}`, infoX, y + 36, { width: infoWidth });
+        .text(`Total ${fmt(input.total)}`, infoX, y + 36, { width: infoWidth });
 
       doc
         .font(fontBold)
@@ -438,7 +472,7 @@ export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise
           ellipsis: true,
         });
 
-      if (trimmedUpiId) {
+      if (trimmedUpiId && isDynamicAmountQr) {
         doc
           .font(fontBody)
           .fontSize(7.8)
@@ -451,15 +485,22 @@ export async function generateBrandedBillPdfBuffer(input: BillPdfInput): Promise
 
       doc
         .font(fontBold)
-        .fontSize(7.8)
+        .fontSize(7.6)
         .fillColor('#15803D')
-        .text('Scan to pay this exact bill amount', infoX, y + 86, { width: infoWidth });
+        .text(
+          isDynamicAmountQr
+            ? 'Scan to pay this exact bill amount'
+            : 'Scan this QR using any UPI app to pay',
+          infoX,
+          trimmedUpiId && isDynamicAmountQr ? y + 86 : y + 74,
+          { width: infoWidth },
+        );
 
       doc
         .font(fontBody)
         .fontSize(7.3)
         .fillColor('#6B7280')
-        .text('PhonePe • Google Pay • Paytm • BHIM', infoX, y + 102, { width: infoWidth });
+        .text('PhonePe • Google Pay • Paytm • BHIM', infoX, y + 103, { width: infoWidth });
     }
 
     // Branded Fast-Food Footer Strip

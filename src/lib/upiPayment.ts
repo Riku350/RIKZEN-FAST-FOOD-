@@ -1,18 +1,15 @@
 /**
  * Shared NPCI UPI Payment URI & QR Payload Utilities
- * Used on both backend (authoritative PDF bill generation) and frontend (live bill preview & QR screenshot decoding).
+ * Supports both Mode 1 (Uploaded Static Restaurant QR) and Mode 2 (Dynamic Exact-Amount UPI QR).
  */
 
-export interface PaymentSettings {
-  id: 'payment';
-  upi_id: string;
-  merchant_name: string;
-  qr_image_url: string;
-  updated_at?: unknown;
-}
+import type { PaymentMode, PaymentQrSnapshot, PaymentSettings } from '../types/restaurant.ts';
+
+export type { PaymentMode, PaymentQrSnapshot, PaymentSettings };
 
 export const DEFAULT_PAYMENT_SETTINGS: PaymentSettings = {
   id: 'payment',
+  payment_mode: 'uploaded_qr',
   upi_id: '',
   merchant_name: 'RikZen Fast Food',
   qr_image_url: '',
@@ -38,12 +35,10 @@ export function parseUpiQrPayload(rawText: string): {
   const text = rawText.trim();
   if (!text) return null;
 
-  // Direct VPA text
   if (isValidUpiId(text)) {
     return { upiId: text, merchantName: '' };
   }
 
-  // Standard UPI URI: upi://pay?pa=...&pn=...
   if (text.toLowerCase().startsWith('upi://pay')) {
     try {
       const queryIndex = text.indexOf('?');
@@ -85,7 +80,11 @@ export function buildDynamicUpiUri(params: {
   }
 
   const cleanName = (params.merchantName || 'RikZen Fast Food').trim().slice(0, 80);
-  const cleanCode = (params.orderCode || 'ORDER').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 24);
+  const cleanCode = (params.orderCode || 'ORDER')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]/g, '')
+    .slice(0, 24);
   const formattedAmount = numericAmount.toFixed(2);
   const note = params.tableNumber
     ? `RikZen Bill ${cleanCode} Table ${params.tableNumber}`
@@ -101,4 +100,81 @@ export function buildDynamicUpiUri(params: {
   });
 
   return `upi://pay?${query.toString()}`;
+}
+
+/**
+ * Resolves the effective payment QR snapshot for a newly generated bill based on the current
+ * restaurant PaymentSettings, preserving an immutable snapshot so old bills keep their original QR.
+ */
+export function createPaymentQrSnapshot(params: {
+  settings: PaymentSettings;
+  amount: number;
+  orderCode: string;
+  tableNumber?: number;
+}): PaymentQrSnapshot {
+  const merchantName = (params.settings.merchant_name || 'RikZen Fast Food').trim().slice(0, 80);
+  const cleanUpi = isValidUpiId(params.settings.upi_id || '') ? params.settings.upi_id.trim() : '';
+  const qrImageUrl = (params.settings.qr_image_url || '').trim().slice(0, 500);
+
+  const requestedMode: PaymentMode =
+    params.settings.payment_mode === 'dynamic_upi' ? 'dynamic_upi' : 'uploaded_qr';
+
+  // Use Dynamic UPI QR when mode is dynamic_upi and UPI ID is valid (or if no uploaded QR exists)
+  if (requestedMode === 'dynamic_upi' && cleanUpi) {
+    const upiUri = buildDynamicUpiUri({
+      upiId: cleanUpi,
+      merchantName,
+      amount: params.amount,
+      orderCode: params.orderCode,
+      tableNumber: params.tableNumber,
+    });
+    return {
+      mode: 'dynamic_upi',
+      merchant_name: merchantName,
+      upi_id: cleanUpi,
+      qr_image_url: '',
+      upi_uri: upiUri,
+      captured_at: new Date().toISOString(),
+    };
+  }
+
+  // Mode 1: Uploaded Static QR (never altered, never falsely claims pre-filled amount)
+  if (qrImageUrl) {
+    return {
+      mode: 'uploaded_qr',
+      merchant_name: merchantName,
+      upi_id: cleanUpi,
+      qr_image_url: qrImageUrl,
+      upi_uri: '',
+      captured_at: new Date().toISOString(),
+    };
+  }
+
+  // Fallback to dynamic UPI if admin saved a UPI ID even while mode was uploaded_qr with no image
+  if (cleanUpi) {
+    const upiUri = buildDynamicUpiUri({
+      upiId: cleanUpi,
+      merchantName,
+      amount: params.amount,
+      orderCode: params.orderCode,
+      tableNumber: params.tableNumber,
+    });
+    return {
+      mode: 'dynamic_upi',
+      merchant_name: merchantName,
+      upi_id: cleanUpi,
+      qr_image_url: '',
+      upi_uri: upiUri,
+      captured_at: new Date().toISOString(),
+    };
+  }
+
+  return {
+    mode: requestedMode,
+    merchant_name: merchantName,
+    upi_id: '',
+    qr_image_url: '',
+    upi_uri: '',
+    captured_at: new Date().toISOString(),
+  };
 }

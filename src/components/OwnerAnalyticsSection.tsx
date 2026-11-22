@@ -11,7 +11,7 @@ import {
   Loader2,
   RefreshCw,
   Search,
-  Send,
+  Share2,
   TrendingUp,
 } from 'lucide-react';
 import {
@@ -193,10 +193,10 @@ interface OwnerAnalyticsSectionProps {
   orders: OrderRecord[];
   onViewOrder: (order: OrderRecord) => void;
   onDownloadBill: (order: OrderRecord) => void;
-  onSendWhatsApp: (order: OrderRecord) => void;
+  onShareBill: (order: OrderRecord) => void;
   onMarkPaid?: (order: OrderRecord) => void;
   downloadingBillId: string | null;
-  sendingWaOrderId: string | null;
+  sharingBillId: string | null;
   updatingPaymentId?: string | null;
   onToast: (msg: string) => void;
 }
@@ -215,10 +215,10 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
   orders,
   onViewOrder,
   onDownloadBill,
-  onSendWhatsApp,
+  onShareBill,
   onMarkPaid,
   downloadingBillId,
-  sendingWaOrderId,
+  sharingBillId,
   updatingPaymentId = null,
   onToast,
 }) => {
@@ -884,10 +884,7 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                 <tbody className="divide-y divide-neutral-100">
                   {filteredHistory.map((ord) => {
                     const { date, time } = formatOrderDate(ord.created_at);
-                    const isBusySend =
-                      sendingWaOrderId === ord.id ||
-                      ord.whatsapp_status === 'sending' ||
-                      ord.whatsapp_status === 'retrying';
+                    const isSharing = sharingBillId === ord.id;
                     const isDownloading = downloadingBillId === ord.id;
                     const itemSummary = ord.items
                       .map((l) => `${l.name} ×${l.quantity}`)
@@ -982,26 +979,16 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                                 </button>
                                 <button
                                   type="button"
-                                  disabled={isBusySend}
-                                  onClick={() => onSendWhatsApp(ord)}
-                                  className={`min-h-[34px] px-2.5 py-1 rounded-lg text-white text-xs font-bold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60 ${
-                                    ord.whatsapp_status === 'failed'
-                                      ? 'bg-red-700 hover:bg-red-800'
-                                      : 'bg-emerald-700 hover:bg-emerald-800'
-                                  }`}
+                                  disabled={isSharing}
+                                  onClick={() => onShareBill(ord)}
+                                  className="min-h-[34px] px-2.5 py-1 rounded-lg bg-[#E5391B] hover:bg-[#C82E14] text-white text-xs font-bold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
                                 >
-                                  {isBusySend ? (
-                                    <Clock className="w-3.5 h-3.5" />
-                                  ) : ord.whatsapp_status === 'failed' ? (
-                                    <RefreshCw className="w-3.5 h-3.5" />
+                                  {isSharing ? (
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
                                   ) : (
-                                    <Send className="w-3.5 h-3.5" />
+                                    <Share2 className="w-3.5 h-3.5" />
                                   )}
-                                  {ord.whatsapp_status === 'failed'
-                                    ? 'Retry'
-                                    : ord.whatsapp_status === 'sent'
-                                      ? 'Sent'
-                                      : 'Share Bill'}
+                                  Share Bill
                                 </button>
                               </>
                             )}
@@ -1029,10 +1016,7 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
             <div className="md:hidden space-y-3">
               {filteredHistory.map((ord) => {
                 const { date, time } = formatOrderDate(ord.created_at);
-                const isBusySend =
-                  sendingWaOrderId === ord.id ||
-                  ord.whatsapp_status === 'sending' ||
-                  ord.whatsapp_status === 'retrying';
+                const isSharing = sharingBillId === ord.id;
                 const isDownloading = downloadingBillId === ord.id;
 
                 return (
@@ -1119,18 +1103,12 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                           </button>
                           <button
                             type="button"
-                            disabled={isBusySend}
-                            onClick={() => onSendWhatsApp(ord)}
-                            className={`flex-1 min-h-[38px] px-2 py-1.5 rounded-xl text-white text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 ${
-                              ord.whatsapp_status === 'failed' ? 'bg-red-700' : 'bg-emerald-700'
-                            }`}
+                            disabled={isSharing}
+                            onClick={() => onShareBill(ord)}
+                            className="flex-1 min-h-[38px] px-2 py-1.5 rounded-xl bg-[#E5391B] text-white text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60"
                           >
-                            <Send className="w-3.5 h-3.5" />
-                            {ord.whatsapp_status === 'failed'
-                              ? 'Retry'
-                              : ord.whatsapp_status === 'sent'
-                                ? 'Sent'
-                                : 'Share Bill'}
+                            <Share2 className="w-3.5 h-3.5" />
+                            Share Bill
                           </button>
                         </>
                       )}

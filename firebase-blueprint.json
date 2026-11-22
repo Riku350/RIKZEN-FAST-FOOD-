@@ -289,9 +289,21 @@
           "type": "string",
           "maxLength": 64
         },
+        "confirmed_at": {
+          "type": "string",
+          "maxLength": 64
+        },
         "upi_uri": {
           "type": "string",
           "maxLength": 500
+        },
+        "public_bill_id": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "payment_qr_snapshot": {
+          "type": "object"
         },
         "pdf_ready": {
           "type": "boolean"
@@ -380,10 +392,6 @@
         "pdf_url",
         "pdf_path",
         "generated_at",
-        "sent_at",
-        "send_status",
-        "whatsapp_status",
-        "whatsapp_error",
         "customer_session_id",
         "server_signature",
         "notes",
@@ -393,12 +401,16 @@
     },
     "PaymentSettings": {
       "title": "PaymentSettings",
-      "description": "Public restaurant UPI payment destination configured by the shop owner (no secret credentials).",
+      "description": "Public restaurant payment QR settings (Uploaded QR or Dynamic UPI QR) configured by the shop owner with zero secret credentials.",
       "type": "object",
       "properties": {
         "id": {
           "type": "string",
           "enum": ["payment"]
+        },
+        "payment_mode": {
+          "type": "string",
+          "enum": ["uploaded_qr", "dynamic_upi"]
         },
         "upi_id": {
           "type": "string",
@@ -418,7 +430,7 @@
           "format": "date-time"
         }
       },
-      "required": ["id", "upi_id", "merchant_name", "qr_image_url", "updated_at"]
+      "required": ["id", "payment_mode", "upi_id", "merchant_name", "qr_image_url", "updated_at"]
     }
   },
   "firestore": {

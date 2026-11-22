@@ -3,23 +3,31 @@ import { AnimatePresence, motion } from 'motion/react';
 import { QRCodeSVG } from 'qrcode.react';
 import {
   AlertCircle,
+  Check,
   CheckCircle2,
-  Clock,
+  Copy,
   CreditCard,
   Download,
   ExternalLink,
   FileText,
   Heart,
   Loader2,
+  Printer,
   QrCode,
   Receipt,
   RefreshCw,
-  Send,
   Settings,
+  Share2,
   Smartphone,
   X,
   XCircle,
 } from 'lucide-react';
+import {
+  copyBillLinkToClipboard,
+  getPublicBillUrl,
+  shareBillNative,
+  shareBillPdfNative,
+} from '../lib/billShare';
 import {
   downloadOrderBillPdf,
   ensureOrderPdfGenerated,
@@ -35,12 +43,9 @@ interface BillPreviewModalProps {
   order: OrderRecord | null;
   onClose: () => void;
   isOwnerView?: boolean;
-  whatsappConfigured?: boolean;
   paymentSettings?: PaymentSettings;
-  onSendWhatsApp?: (order: OrderRecord) => Promise<void>;
   onMarkPaid?: (order: OrderRecord) => Promise<void>;
   onOpenSettings?: () => void;
-  isSendingWhatsApp?: boolean;
   isUpdatingPayment?: boolean;
 }
 
@@ -48,20 +53,20 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
   order,
   onClose,
   isOwnerView = false,
-  whatsappConfigured = true,
   paymentSettings = DEFAULT_PAYMENT_SETTINGS,
-  onSendWhatsApp,
   onMarkPaid,
   onOpenSettings,
-  isSendingWhatsApp = false,
   isUpdatingPayment = false,
 }) => {
-  const [viewMode, setViewMode] = useState<'pdf' | 'receipt'>('pdf');
+  const [viewMode, setViewMode] = useState<'receipt' | 'pdf'>('receipt');
   const [billMeta, setBillMeta] = useState<GeneratedBillResult | null>(null);
   const [loadingPdf, setLoadingPdf] = useState(false);
   const [pdfError, setPdfError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
+  const [sharingPdf, setSharingPdf] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [shareToast, setShareToast] = useState<string | null>(null);
+  const [copiedLink, setCopiedLink] = useState(false);
 
   const loadOrGeneratePdf = useCallback(
     async (targetOrder: OrderRecord, forceRegenerate = false) => {
@@ -89,12 +94,14 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
       setBillMeta(null);
       setPdfError(null);
       setDownloadError(null);
+      setShareToast(null);
       return;
     }
     setBillMeta(null);
     setPdfError(null);
     setDownloadError(null);
-    setViewMode('pdf');
+    setShareToast(null);
+    setViewMode('receipt');
     if (order.pdf_url || order.pdf_ready || order.bill_status !== 'not_generated') {
       void loadOrGeneratePdf(order, false);
     }
@@ -102,39 +109,51 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
 
   if (!order) return null;
 
-  const isNotGeneratedYet =
-    !loadingPdf &&
-    !pdfError &&
-    !billMeta?.pdf_url &&
-    !order.pdf_url &&
-    order.bill_status === 'not_generated';
-  const isWaNotConfiguredError =
-    order.whatsapp_error.toLowerCase().includes('not configured') ||
-    (!whatsappConfigured && order.whatsapp_status === 'failed');
+  const showToast = (msg: string) => {
+    setShareToast(msg);
+    window.setTimeout(() => {
+      setShareToast((cur) => (cur === msg ? null : cur));
+    }, 3200);
+  };
 
   const { date, time } = formatOrderDate(order.created_at);
   const orderCode = (order.order_code || `RK${order.order_number}`).toUpperCase();
   const activePdfUrl = billMeta?.pdf_url || order.pdf_url || '';
   const activeDownloadUrl = activePdfUrl ? `${activePdfUrl}&download=1` : '';
   const activeFilename = billMeta?.filename || `RikZen-Fast-Food-Bill-${orderCode}.pdf`;
-  const isBusySending =
-    isSendingWhatsApp ||
-    order.whatsapp_status === 'sending' ||
-    order.whatsapp_status === 'retrying';
+  const activePublicBillId = billMeta?.public_bill_id || order.public_bill_id || '';
+  const publicBillUrl = activePublicBillId ? getPublicBillUrl(activePublicBillId) : '';
 
-  const activeUpiId = billMeta?.upi_id || paymentSettings.upi_id || '';
-  const activeMerchantName = paymentSettings.merchant_name || 'RikZen Fast Food';
+  const isNotGeneratedYet =
+    !loadingPdf &&
+    !pdfError &&
+    !activePdfUrl &&
+    order.bill_status === 'not_generated';
+
+  // Use immutable payment_qr_snapshot first so old bills NEVER change if admin updates QR later
+  const snapshot = billMeta?.payment_qr_snapshot || order.payment_qr_snapshot || null;
+  const activeMode = snapshot?.mode || paymentSettings.payment_mode || 'dynamic_upi';
+  const activeMerchantName =
+    snapshot?.merchant_name || paymentSettings.merchant_name || 'RikZen Fast Food';
+  const activeQrImageUrl = snapshot?.qr_image_url || paymentSettings.qr_image_url || '';
+  const activeUpiId = snapshot?.upi_id || billMeta?.upi_id || paymentSettings.upi_id || '';
   const dynamicUpiUri =
-    buildDynamicUpiUri({
-      upiId: activeUpiId,
-      merchantName: activeMerchantName,
-      amount: order.total,
-      orderCode,
-      tableNumber: order.table_number,
-    }) ||
-    billMeta?.upi_uri ||
-    order.upi_uri ||
-    '';
+    activeMode === 'dynamic_upi'
+      ? snapshot?.upi_uri ||
+        buildDynamicUpiUri({
+          upiId: activeUpiId,
+          merchantName: activeMerchantName,
+          amount: order.total,
+          orderCode,
+          tableNumber: order.table_number,
+        }) ||
+        billMeta?.upi_uri ||
+        order.upi_uri ||
+        ''
+      : '';
+
+  const showUploadedQr = activeMode === 'uploaded_qr' && Boolean(activeQrImageUrl);
+  const showDynamicUpiQr = activeMode === 'dynamic_upi' && Boolean(dynamicUpiUri);
 
   const paymentStatus = order.payment_status || (order.status === 'completed' ? 'paid' : 'pending');
   const isPaid = paymentStatus === 'paid';
@@ -145,12 +164,84 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
     try {
       const result = await downloadOrderBillPdf(order);
       setBillMeta(result);
+      showToast('Bill PDF downloaded.');
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unable to download PDF bill.';
       console.error('[RikZen Bill Modal Download Error]', err);
       setDownloadError(msg);
     } finally {
       setDownloading(false);
+    }
+  };
+
+  const handleShareLink = async () => {
+    try {
+      let billId = activePublicBillId;
+      let pdfUrl = activePdfUrl;
+      if (!billId || !pdfUrl) {
+        const generated = await ensureOrderPdfGenerated(order, { persistIfOwner: isOwnerView });
+        setBillMeta(generated);
+        billId = generated.public_bill_id || billId;
+        pdfUrl = generated.pdf_url;
+      }
+      const outcome = await shareBillNative({
+        order_code: orderCode,
+        table_number: order.table_number,
+        customer_name: order.customer_name,
+        total: order.total,
+        public_bill_id: billId,
+        pdf_url: pdfUrl,
+        filename: activeFilename,
+      });
+      if (outcome.method === 'copied') {
+        setCopiedLink(true);
+        window.setTimeout(() => setCopiedLink(false), 2500);
+      }
+      if (outcome.method !== 'cancelled') {
+        showToast(outcome.message);
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Could not prepare bill link.');
+    }
+  };
+
+  const handleSharePdf = async () => {
+    setSharingPdf(true);
+    try {
+      const outcome = await shareBillPdfNative({
+        ...order,
+        public_bill_id: activePublicBillId || order.public_bill_id,
+        pdf_url: activePdfUrl || order.pdf_url,
+      });
+      if (outcome.method === 'copied') {
+        setCopiedLink(true);
+        window.setTimeout(() => setCopiedLink(false), 2500);
+      }
+      if (outcome.method !== 'cancelled') {
+        showToast(outcome.message);
+      }
+    } finally {
+      setSharingPdf(false);
+    }
+  };
+
+  const handleCopyBillLink = async () => {
+    let billId = activePublicBillId;
+    if (!billId) {
+      try {
+        const generated = await ensureOrderPdfGenerated(order, { persistIfOwner: isOwnerView });
+        setBillMeta(generated);
+        billId = generated.public_bill_id || '';
+      } catch {
+        // Ignore
+      }
+    }
+    if (!billId) return;
+    const ok = await copyBillLinkToClipboard(getPublicBillUrl(billId));
+    if (ok) {
+      setCopiedLink(true);
+      window.setTimeout(() => setCopiedLink(false), 2500);
+      showToast('Bill link copied to clipboard.');
     }
   };
 
@@ -198,21 +289,9 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
             </button>
           </div>
 
-          {/* Mode Switcher + Direct New-Tab PDF Link */}
+          {/* Mode Switcher + Direct Public Bill Page Link */}
           <div className="px-5 py-3 bg-neutral-50 border-b border-neutral-200 flex flex-wrap items-center justify-between gap-2 shrink-0">
             <div className="inline-flex rounded-xl bg-white border border-neutral-200 p-1">
-              <button
-                type="button"
-                onClick={() => setViewMode('pdf')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
-                  viewMode === 'pdf'
-                    ? 'bg-[#E5391B] text-white'
-                    : 'text-neutral-600 hover:text-neutral-900'
-                }`}
-              >
-                <FileText className="w-3.5 h-3.5" />
-                PDF Viewer
-              </button>
               <button
                 type="button"
                 onClick={() => setViewMode('receipt')}
@@ -223,25 +302,52 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
                 }`}
               >
                 <Receipt className="w-3.5 h-3.5" />
-                Receipt &amp; UPI QR
+                Bill &amp; Payment QR
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setViewMode('pdf');
+                  if (!activePdfUrl && !loadingPdf) {
+                    void loadOrGeneratePdf(order, false);
+                  }
+                }}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
+                  viewMode === 'pdf'
+                    ? 'bg-[#E5391B] text-white'
+                    : 'text-neutral-600 hover:text-neutral-900'
+                }`}
+              >
+                <FileText className="w-3.5 h-3.5" />
+                PDF Document
               </button>
             </div>
 
-            {activePdfUrl && !loadingPdf && !pdfError && (
-              <a
-                href={activePdfUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="min-h-[36px] px-3 py-1.5 rounded-xl bg-white border border-neutral-200 text-neutral-800 hover:bg-neutral-100 text-xs font-bold inline-flex items-center gap-1.5 whitespace-nowrap"
-              >
-                <ExternalLink className="w-3.5 h-3.5 text-[#E5391B]" />
-                Open PDF in New Tab
-              </a>
-            )}
+            <div className="flex items-center gap-2">
+              {publicBillUrl && activePdfUrl && (
+                <a
+                  href={publicBillUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="min-h-[36px] px-3 py-1.5 rounded-xl bg-white border border-neutral-200 text-neutral-800 hover:bg-neutral-100 text-xs font-bold inline-flex items-center gap-1.5 whitespace-nowrap"
+                >
+                  <ExternalLink className="w-3.5 h-3.5 text-[#E5391B]" />
+                  Open Bill Page
+                </a>
+              )}
+            </div>
           </div>
 
           {/* Body Area */}
           <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-4">
+            {/* Share / Download Toast */}
+            {shareToast && (
+              <div className="rounded-xl bg-emerald-50 border border-emerald-200 px-3.5 py-2 text-xs font-bold text-emerald-800 flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                {shareToast}
+              </div>
+            )}
+
             {/* Real-Time Payment Status Strip */}
             <div className="rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-2.5 text-xs">
@@ -307,16 +413,16 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
             {viewMode === 'pdf' && !pdfError && (
               <div className="space-y-3">
                 {isNotGeneratedYet ? (
-                  <div className="h-[360px] rounded-2xl border border-neutral-200 bg-neutral-50 flex flex-col items-center justify-center gap-4 text-center p-6">
+                  <div className="h-[340px] rounded-2xl border border-neutral-200 bg-neutral-50 flex flex-col items-center justify-center gap-4 text-center p-6">
                     <div className="w-12 h-12 rounded-2xl bg-amber-50 border border-amber-200 text-amber-700 flex items-center justify-center">
                       <FileText className="w-6 h-6" />
                     </div>
                     <div className="space-y-1">
                       <p className="text-base font-extrabold text-neutral-900">
-                        PDF is not generated yet.
+                        Bill PDF not generated yet
                       </p>
                       <p className="text-xs text-neutral-500 max-w-xs mx-auto">
-                        Generate the verified PDF receipt with exact-amount UPI QR for Order #{orderCode}.
+                        Generate the verified PDF bill &amp; shareable page for Order #{orderCode}.
                       </p>
                     </div>
                     <button
@@ -329,12 +435,12 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
                     </button>
                   </div>
                 ) : loadingPdf || !activePdfUrl ? (
-                  <div className="h-[400px] rounded-2xl border border-neutral-200 bg-neutral-50 flex flex-col items-center justify-center gap-3 text-center p-6">
+                  <div className="h-[380px] rounded-2xl border border-neutral-200 bg-neutral-50 flex flex-col items-center justify-center gap-3 text-center p-6">
                     <Loader2 className="w-8 h-8 text-[#E5391B] animate-spin" />
                     <div>
                       <p className="text-sm font-bold text-neutral-900">Generating PDF bill...</p>
                       <p className="text-xs text-neutral-500 mt-0.5">
-                        Verifying order #{orderCode} and embedding exact-amount UPI QR
+                        Preparing verified bill #{orderCode} and payment QR
                       </p>
                     </div>
                   </div>
@@ -344,23 +450,19 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
                       <iframe
                         src={activePdfUrl}
                         title={`RikZen Fast Food PDF Bill #${orderCode}`}
-                        className="w-full h-[420px] sm:h-[470px] bg-white"
+                        className="w-full h-[420px] sm:h-[460px] bg-white"
                       />
                     </div>
                     <p className="text-[11px] text-neutral-500 flex flex-wrap items-center justify-between gap-2 px-1">
                       <span className="font-mono truncate">{activeFilename}</span>
-                      <span>
-                        On mobile? Tap{' '}
-                        <a
-                          href={activePdfUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="font-bold text-[#E5391B] underline"
-                        >
-                          Open PDF in New Tab
-                        </a>{' '}
-                        or switch to Receipt &amp; UPI QR.
-                      </span>
+                      <a
+                        href={activePdfUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="font-bold text-[#E5391B] underline"
+                      >
+                        Open PDF in New Tab
+                      </a>
                     </p>
                   </div>
                 )}
@@ -470,20 +572,31 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
               </div>
             )}
 
-            {/* Dynamic Exact-Amount UPI Payment QR Card (Crisp static monochrome QR — never animated) */}
-            {order.status !== 'rejected' && (
-              dynamicUpiUri ? (
+            {/* Honest 2-Mode Payment QR Card (ZERO cropping/distortion/animation over QR) */}
+            {order.status !== 'rejected' &&
+              (showUploadedQr || showDynamicUpiQr ? (
                 <div className="rounded-2xl border-2 border-neutral-900 bg-white p-4 sm:p-5 flex flex-col sm:flex-row items-center gap-5">
-                  <div className="bg-white p-2 rounded-xl border border-neutral-200 shrink-0">
-                    <QRCodeSVG
-                      value={dynamicUpiUri}
-                      size={172}
-                      level="H"
-                      includeMargin={true}
-                      fgColor="#000000"
-                      bgColor="#FFFFFF"
-                    />
-                  </div>
+                  {showUploadedQr ? (
+                    <div className="bg-white p-2 rounded-xl border border-neutral-200 shrink-0">
+                      <img
+                        src={activeQrImageUrl}
+                        alt={`Payment QR for ${activeMerchantName}`}
+                        className="w-44 h-44 object-contain"
+                      />
+                    </div>
+                  ) : (
+                    <div className="bg-white p-2 rounded-xl border border-neutral-200 shrink-0">
+                      <QRCodeSVG
+                        value={dynamicUpiUri}
+                        size={172}
+                        level="H"
+                        includeMargin={true}
+                        fgColor="#000000"
+                        bgColor="#FFFFFF"
+                      />
+                    </div>
+                  )}
+
                   <div className="flex-1 text-center sm:text-left space-y-2 min-w-0">
                     <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#151110] text-white text-[11px] font-extrabold tracking-wide">
                       <QrCode className="w-3.5 h-3.5 text-amber-300" />
@@ -492,37 +605,49 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
                     <p className="font-mono text-2xl sm:text-3xl font-extrabold text-[#E5391B] tabular-nums">
                       {formatRupees(order.total)}
                     </p>
-                    <p className="text-xs font-bold text-emerald-700">
-                      Pay this exact amount · Order #{orderCode}
-                    </p>
-                    {activeUpiId && (
-                      <p className="text-xs font-mono text-neutral-600 truncate">
-                        UPI ID: <span className="font-bold text-neutral-900">{activeUpiId}</span>
+                    <p className="text-xs font-bold text-neutral-900">{activeMerchantName}</p>
+                    {showDynamicUpiQr ? (
+                      <>
+                        <p className="text-xs font-bold text-emerald-700">
+                          Scan to pay this exact amount · Order #{orderCode}
+                        </p>
+                        {activeUpiId && (
+                          <p className="text-xs font-mono text-neutral-600 truncate">
+                            UPI ID: <span className="font-bold text-neutral-900">{activeUpiId}</span>
+                          </p>
+                        )}
+                        {!isPaid && (
+                          <div className="pt-1">
+                            <a
+                              href={dynamicUpiUri}
+                              className="min-h-[40px] px-4 py-2 rounded-xl bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] inline-flex items-center gap-1.5"
+                            >
+                              <Smartphone className="w-4 h-4" />
+                              Pay Now · {formatRupees(order.total)}
+                            </a>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-xs text-neutral-700 font-medium">
+                        Scan this QR using any UPI app and pay{' '}
+                        <span className="font-bold text-neutral-900">
+                          {formatRupees(order.total)}
+                        </span>
+                        .
                       </p>
                     )}
                     <p className="text-[11px] text-neutral-500">
-                      Scan using any UPI app · PhonePe · Google Pay · Paytm · BHIM
+                      PhonePe · Google Pay · Paytm · BHIM
                     </p>
-                    {!isPaid && (
-                      <div className="pt-1">
-                        <a
-                          href={dynamicUpiUri}
-                          className="min-h-[40px] px-4 py-2 rounded-xl bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] inline-flex items-center gap-1.5"
-                        >
-                          <Smartphone className="w-4 h-4" />
-                          Open UPI App to Pay {formatRupees(order.total)}
-                        </a>
-                      </div>
-                    )}
                   </div>
                 </div>
               ) : isOwnerView ? (
                 <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 flex flex-wrap items-center justify-between gap-3">
                   <div className="text-xs text-amber-900">
-                    <p className="font-extrabold">UPI Payment QR not configured yet</p>
+                    <p className="font-extrabold">Payment QR not configured yet</p>
                     <p className="mt-0.5 text-amber-800">
-                      Add your Restaurant UPI ID or upload your QR screenshot in Payment Settings to
-                      embed dynamic exact-amount UPI QRs on every bill.
+                      Upload your restaurant payment QR or enter your UPI ID in Payment Settings.
                     </p>
                   </div>
                   {onOpenSettings && (
@@ -539,62 +664,9 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
                     </button>
                   )}
                 </div>
-              ) : null
-            )}
+              ) : null)}
 
-            {/* Owner WhatsApp Real Delivery Status Box */}
-            {isOwnerView && (
-              <div className="rounded-2xl border border-neutral-200 bg-neutral-50 p-3.5 space-y-1.5">
-                <div className="flex items-center justify-between gap-2 text-xs font-bold">
-                  <span className="text-neutral-600">WhatsApp PDF Bill Delivery</span>
-                  {order.whatsapp_status === 'sent' && (
-                    <span className="inline-flex items-center gap-1 text-emerald-700">
-                      <CheckCircle2 className="w-3.5 h-3.5" />
-                      BILL SENT
-                    </span>
-                  )}
-                  {(order.whatsapp_status === 'sending' || order.whatsapp_status === 'retrying') && (
-                    <span className="inline-flex items-center gap-1 text-blue-700">
-                      <Clock className="w-3.5 h-3.5" />
-                      {order.whatsapp_status === 'retrying' ? 'Retrying...' : 'Sending...'}
-                    </span>
-                  )}
-                  {order.whatsapp_status === 'failed' && (
-                    <span className="inline-flex items-center gap-1 text-red-700">
-                      <XCircle className="w-3.5 h-3.5" />
-                      SEND FAILED
-                    </span>
-                  )}
-                  {order.whatsapp_status === 'not_sent' && (
-                    <span className="text-neutral-500">Ready to Share</span>
-                  )}
-                </div>
-                {order.whatsapp_error && (
-                  <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-                    <p className="text-xs text-red-700 leading-relaxed">
-                      {isWaNotConfiguredError
-                        ? 'WhatsApp API is not configured.'
-                        : order.whatsapp_error}
-                    </p>
-                    {isWaNotConfiguredError && onOpenSettings && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          onClose();
-                          onOpenSettings();
-                        }}
-                        className="px-3 py-1.5 rounded-lg bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-1.5 cursor-pointer shrink-0"
-                      >
-                        <Settings className="w-3.5 h-3.5" />
-                        Open Settings
-                      </button>
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Download Error Feedback + Explicit Retry & Direct Fallback Link */}
+            {/* Download Error Feedback */}
             {downloadError && (
               <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 space-y-2">
                 <p className="text-xs font-bold text-red-800">Download failed: {downloadError}</p>
@@ -621,56 +693,71 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
             )}
           </div>
 
-          {/* Modal Action Footer */}
-          <div className="p-4 sm:p-5 bg-neutral-50 border-t border-neutral-200 flex flex-wrap gap-2.5 shrink-0">
-            <button
-              type="button"
-              disabled={downloading || loadingPdf}
-              onClick={handleDownload}
-              className="flex-1 min-h-[48px] px-4 py-2.5 rounded-xl bg-neutral-900 text-white font-bold text-sm hover:bg-neutral-800 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60 whitespace-nowrap"
-            >
-              {downloading ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Download className="w-4 h-4" />
-              )}
-              {downloading ? 'Downloading PDF...' : 'Download PDF'}
-            </button>
-
-            {isOwnerView && onSendWhatsApp && (
+          {/* Website-Native Modal Action Footer */}
+          <div className="p-4 sm:p-5 bg-neutral-50 border-t border-neutral-200 space-y-2 shrink-0">
+            <div className="flex flex-wrap gap-2">
               <button
                 type="button"
-                disabled={isBusySending || loadingPdf}
-                onClick={() => onSendWhatsApp(order)}
-                className={`flex-1 min-h-[48px] px-4 py-2.5 rounded-xl text-white font-bold text-sm active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60 whitespace-nowrap ${
-                  order.whatsapp_status === 'failed'
-                    ? 'bg-red-700 hover:bg-red-800'
-                    : 'bg-emerald-700 hover:bg-emerald-800'
-                }`}
+                disabled={downloading || loadingPdf}
+                onClick={handleDownload}
+                className="flex-1 min-h-[46px] px-4 py-2.5 rounded-xl bg-neutral-900 text-white font-bold text-sm hover:bg-neutral-800 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60 whitespace-nowrap"
               >
-                {isBusySending ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    {order.whatsapp_status === 'retrying' ? 'Retrying...' : 'Sending...'}
-                  </>
-                ) : order.whatsapp_status === 'failed' ? (
-                  <>
-                    <RefreshCw className="w-4 h-4" />
-                    Retry Share
-                  </>
-                ) : order.whatsapp_status === 'sent' ? (
-                  <>
-                    <CheckCircle2 className="w-4 h-4" />
-                    Bill Sent (Resend)
-                  </>
+                {downloading ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
-                  <>
-                    <Send className="w-4 h-4" />
-                    Share Bill
-                  </>
+                  <Download className="w-4 h-4" />
                 )}
+                {downloading ? 'Downloading...' : 'Download Bill'}
               </button>
-            )}
+
+              <button
+                type="button"
+                disabled={loadingPdf}
+                onClick={handleShareLink}
+                className="flex-1 min-h-[46px] px-4 py-2.5 rounded-xl bg-[#E5391B] text-white font-bold text-sm hover:bg-[#C82E14] active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60 whitespace-nowrap"
+              >
+                <Share2 className="w-4 h-4" />
+                Share Bill
+              </button>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2">
+              <button
+                type="button"
+                disabled={sharingPdf || loadingPdf}
+                onClick={handleSharePdf}
+                className="min-h-[38px] px-3 py-1.5 rounded-xl bg-white border border-neutral-200 hover:bg-neutral-100 text-neutral-800 font-bold text-xs inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+              >
+                {sharingPdf ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <FileText className="w-3.5 h-3.5" />
+                )}
+                Share PDF
+              </button>
+
+              <button
+                type="button"
+                onClick={handleCopyBillLink}
+                className="min-h-[38px] px-3 py-1.5 rounded-xl bg-white border border-neutral-200 hover:bg-neutral-100 text-neutral-800 font-bold text-xs inline-flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                {copiedLink ? (
+                  <Check className="w-3.5 h-3.5 text-emerald-700" />
+                ) : (
+                  <Copy className="w-3.5 h-3.5" />
+                )}
+                {copiedLink ? 'Copied Link' : 'Copy Bill Link'}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => window.print()}
+                className="min-h-[38px] px-3 py-1.5 rounded-xl bg-white border border-neutral-200 hover:bg-neutral-100 text-neutral-800 font-bold text-xs inline-flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                <Printer className="w-3.5 h-3.5" />
+                Print
+              </button>
+            </div>
           </div>
         </motion.div>
       </div>
