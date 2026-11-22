@@ -143,11 +143,6 @@ export const RikZenIntro: React.FC<RikZenIntroProps> = ({ onComplete, mode = 'fu
     };
   }, [onComplete, isQuick]);
 
-  const handleSkip = () => {
-    if (exiting) return;
-    setExiting(true);
-    window.setTimeout(() => onComplete(), 180);
-  };
 
   return (
     <AnimatePresence>
@@ -328,14 +323,6 @@ export const RikZenIntro: React.FC<RikZenIntroProps> = ({ onComplete, mode = 'fu
           </motion.div>
         </div>
 
-        {/* Quiet Non-Distracting Skip Control */}
-        <button
-          type="button"
-          onClick={handleSkip}
-          className="absolute top-5 right-5 z-20 min-h-[40px] px-3.5 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-xs font-semibold text-white/80 hover:text-white transition-colors cursor-pointer"
-        >
-          Skip
-        </button>
       </motion.div>
     </AnimatePresence>
   );

@@ -103,10 +103,11 @@ export const ShopEntrance: React.FC<ShopEntranceProps> = ({ onNavigate }) => {
           <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-2">
             <div>
               <h2 className="text-2xl sm:text-3xl font-extrabold text-neutral-900">
-                Scan or Tap Any Table QR
+                Select Your Table (Tables 1–6)
               </h2>
               <p className="text-sm text-neutral-600 mt-1">
-                Every table URL automatically locks the customer&apos;s seat without manual entry.
+                No login required. Tap your table below or scan your table QR to open the live menu
+                immediately.
               </p>
             </div>
             <p className="text-xs font-mono text-neutral-500">/menu?table=1 – 6</p>

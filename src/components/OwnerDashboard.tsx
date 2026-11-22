@@ -3,13 +3,13 @@ import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/aut
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { QRCodeSVG } from 'qrcode.react';
 import {
+  AlertTriangle,
   ArrowLeft,
   BarChart3,
   Bell,
   Check,
   CheckCircle2,
   ChefHat,
-  Clock,
   Copy,
   CreditCard,
   Download,
@@ -19,6 +19,7 @@ import {
   FileText,
   FolderArchive,
   Gift,
+  Globe,
   Home,
   LayoutGrid,
   Loader2,
@@ -32,8 +33,8 @@ import {
   Receipt,
   RefreshCw,
   Save,
-  Send,
   Settings,
+  Share2,
   ShieldAlert,
   Square,
   Tag,
@@ -52,20 +53,21 @@ import {
   MENU_CATEGORIES,
   TABLE_NUMBERS,
 } from '../data/menuCatalog';
+import { shareBillNative } from '../lib/billShare';
 import { auth, BOOTSTRAPPED_OWNER_EMAIL, googleProvider } from '../lib/firebase';
 import {
   checkIsOwnerAccount,
   downloadOrderBillPdf,
   downloadSalesReportPdf,
-  fetchOwnerConfigStatus,
+  ensureOrderPdfGenerated,
   formatIndianMobileDisplay,
   formatRelativeTime,
   formatRupees,
   getTableQrUrl,
   ownerDeleteMenuItem,
   ownerDeleteOffer,
+  ownerDeletePaymentQr,
   ownerSavePaymentSettings,
-  ownerSendWhatsAppBill,
   ownerToggleMenuItemAvailability,
   ownerToggleOfferActive,
   ownerUpdateOrderStatus,
@@ -81,7 +83,6 @@ import {
   syncCatalogToServer,
   syncPaymentSettingsToServer,
   timestampToDate,
-  verifyWhatsAppConnectionOnServer,
 } from '../lib/orderService';
 import {
   buildHourlySalesSeries,
@@ -91,7 +92,9 @@ import {
 import {
   decodeUpiQrFromImageFile,
   downloadAllTableQrsZip,
+  downloadMainMenuQrPng,
   downloadSingleTableQrPng,
+  getMainMenuQrUrl,
 } from '../lib/tableQrExport';
 import { buildDynamicUpiUri, DEFAULT_PAYMENT_SETTINGS, isValidUpiId } from '../lib/upiPayment';
 import {
@@ -109,6 +112,7 @@ import {
   OfferRecord,
   OrderRecord,
   OrderStatus,
+  PaymentMode,
   PaymentSettings,
   TableRecord,
   TableStatus,
@@ -122,6 +126,49 @@ import {
   OwnerAnalyticsSection,
 } from './OwnerAnalyticsSection';
 import { MenuItemModal, OfferModal } from './OwnerModals';
+
+interface OwnerDiagnosticInfo {
+  operation: string;
+  path: string;
+  status: string;
+  reason: string;
+  suggestedFix: string;
+}
+
+function parseOwnerDiagnosticError(raw: string): OwnerDiagnosticInfo {
+  try {
+    const parsed = JSON.parse(raw) as {
+      error?: string;
+      operationType?: string;
+      path?: string;
+    };
+    if (parsed && typeof parsed === 'object' && (parsed.error || parsed.operationType || parsed.path)) {
+      const reason = parsed.error || raw;
+      const isPerm = reason.toLowerCase().includes('permission');
+      return {
+        operation: (parsed.operationType || 'unknown').toUpperCase(),
+        path: parsed.path || 'Firestore',
+        status: isPerm ? 'PERMISSION_DENIED' : 'FIRESTORE_ERROR',
+        reason,
+        suggestedFix: isPerm
+          ? `Confirm you are signed in with the authorized owner account (${BOOTSTRAPPED_OWNER_EMAIL}) and click Retry.`
+          : 'Check your network connection and click Retry to re-sync live shop data.',
+      };
+    }
+  } catch {
+    // Plain error string
+  }
+  const isPerm = raw.toLowerCase().includes('permission');
+  return {
+    operation: 'REQUEST',
+    path: 'Owner POS',
+    status: isPerm ? 'PERMISSION_DENIED' : 'ERROR',
+    reason: raw,
+    suggestedFix: isPerm
+      ? `Sign out and sign back in with ${BOOTSTRAPPED_OWNER_EMAIL} to refresh your owner session.`
+      : 'Review the error details above and click Retry.',
+  };
+}
 
 interface OwnerDashboardProps {
   onNavigate: (path: string) => void;
@@ -173,51 +220,41 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   const [tables, setTables] = useState<TableRecord[]>([]);
   const [menuItems, setMenuItems] = useState<MenuItem[]>(CANONICAL_MENU_ITEMS);
   const [offers, setOffers] = useState<OfferRecord[]>(CANONICAL_OFFERS);
-  const [whatsappConfigured, setWhatsappConfigured] = useState(false);
-  const [waConfigMeta, setWaConfigMeta] = useState<{
-    hasToken: boolean;
-    hasPhoneId: boolean;
-    apiVersion: string;
-  }>({ hasToken: false, hasPhoneId: false, apiVersion: 'v21.0' });
-  const [waLiveCheck, setWaLiveCheck] = useState<{
-    testing: boolean;
-    connected: boolean;
-    displayPhoneNumber?: string;
-    verifiedName?: string;
-    qualityRating?: string;
-    error?: string;
-  }>({ testing: false, connected: false });
   const [dataError, setDataError] = useState<string | null>(null);
 
   // Action busy states
   const [busyOrderId, setBusyOrderId] = useState<string | null>(null);
-  const [sendingWaOrderId, setSendingWaOrderId] = useState<string | null>(null);
+  const [sharingBillId, setSharingBillId] = useState<string | null>(null);
   const [downloadingBillId, setDownloadingBillId] = useState<string | null>(null);
   const [updatingPaymentId, setUpdatingPaymentId] = useState<string | null>(null);
   const [billErrors, setBillErrors] = useState<Record<string, string>>({});
   const [confirmDeleteItemId, setConfirmDeleteItemId] = useState<string | null>(null);
   const [confirmDeleteOfferId, setConfirmDeleteOfferId] = useState<string | null>(null);
 
-  // Payment settings state (Restaurant UPI ID, Merchant Name, Uploaded Reference QR)
+  // Honest 2-mode Payment Settings state (Uploaded Payment QR OR Dynamic Exact-Amount UPI QR)
   const [paymentSettings, setPaymentSettings] = useState<PaymentSettings>(DEFAULT_PAYMENT_SETTINGS);
   const [paymentDraft, setPaymentDraft] = useState<{
+    payment_mode: PaymentMode;
     upi_id: string;
     merchant_name: string;
     qr_image_url: string;
   }>({
+    payment_mode: DEFAULT_PAYMENT_SETTINGS.payment_mode,
     upi_id: DEFAULT_PAYMENT_SETTINGS.upi_id,
     merchant_name: DEFAULT_PAYMENT_SETTINGS.merchant_name,
     qr_image_url: DEFAULT_PAYMENT_SETTINGS.qr_image_url,
   });
   const [savingPayment, setSavingPayment] = useState(false);
   const [uploadingQr, setUploadingQr] = useState(false);
+  const [deletingQr, setDeletingQr] = useState(false);
+  const [testQrModalOpen, setTestQrModalOpen] = useState(false);
   const [qrScanNotice, setQrScanNotice] = useState<string | null>(null);
   const [paymentFormError, setPaymentFormError] = useState<string | null>(null);
   const paymentDraftDirtyRef = useRef(false);
 
-  // Table QR Download & Print state
-  const [downloadingTableQr, setDownloadingTableQr] = useState<number | 'all' | null>(null);
-  const [printTableNumbers, setPrintTableNumbers] = useState<number[]>([...TABLE_NUMBERS]);
+  // Table & Main Website QR Download & Print state
+  const [downloadingTableQr, setDownloadingTableQr] = useState<number | 'all' | 'main' | null>(null);
+  const [printQrTargets, setPrintQrTargets] = useState<Array<number | 'main'>>([...TABLE_NUMBERS]);
 
   // Modals & inspector state
   const [itemModalOpen, setItemModalOpen] = useState(false);
@@ -234,7 +271,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     voiceOrderAlertManager.getState(),
   );
   const [dismissedVoiceError, setDismissedVoiceError] = useState<string | null>(null);
-  const [copiedTable, setCopiedTable] = useState<number | null>(null);
+  const [copiedTable, setCopiedTable] = useState<number | 'main' | null>(null);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const [liveAlertOrders, setLiveAlertOrders] = useState<OrderRecord[]>([]);
   const [quickReportBusy, setQuickReportBusy] = useState(false);
@@ -284,25 +321,6 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
         if (verified) {
           try {
             await seedOwnerShopDataIfNeeded(nextUser);
-            const cfg = await fetchOwnerConfigStatus();
-            setWhatsappConfigured(cfg.whatsappConfigured);
-            setWaConfigMeta({
-              hasToken: Boolean(cfg.hasToken),
-              hasPhoneId: Boolean(cfg.hasPhoneId),
-              apiVersion: cfg.apiVersion || 'v21.0',
-            });
-            if (cfg.whatsappConfigured) {
-              setWaLiveCheck({ testing: true, connected: false });
-              const live = await verifyWhatsAppConnectionOnServer();
-              setWaLiveCheck({
-                testing: false,
-                connected: live.connected,
-                displayPhoneNumber: live.displayPhoneNumber,
-                verifiedName: live.verifiedName,
-                qualityRating: live.qualityRating,
-                error: live.error,
-              });
-            }
           } catch (err) {
             setDataError(err instanceof Error ? err.message : 'Unable to initialize shop data.');
           }
@@ -406,6 +424,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
       setPaymentSettings(settings);
       if (!paymentDraftDirtyRef.current) {
         setPaymentDraft({
+          payment_mode: settings.payment_mode,
           upi_id: settings.upi_id,
           merchant_name: settings.merchant_name,
           qr_image_url: settings.qr_image_url,
@@ -423,10 +442,10 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     };
   }, [authReady, user, isOwner]);
 
-  // Restore all 6 table cards after printing a single table card
+  // Restore all 6 table cards after printing a single card
   useEffect(() => {
     const handleAfterPrint = () => {
-      setPrintTableNumbers([...TABLE_NUMBERS]);
+      setPrintQrTargets([...TABLE_NUMBERS]);
     };
     window.addEventListener('afterprint', handleAfterPrint);
     return () => window.removeEventListener('afterprint', handleAfterPrint);
@@ -505,46 +524,30 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     setVoiceSettings(voiceOrderAlertManager.getSettings());
   };
 
-  const handleTestWhatsAppConnection = async () => {
-    if (waLiveCheck.testing) return;
-    setWaLiveCheck((prev) => ({ ...prev, testing: true, error: undefined }));
-    const cfg = await fetchOwnerConfigStatus();
-    setWhatsappConfigured(cfg.whatsappConfigured);
-    setWaConfigMeta({
-      hasToken: Boolean(cfg.hasToken),
-      hasPhoneId: Boolean(cfg.hasPhoneId),
-      apiVersion: cfg.apiVersion || 'v21.0',
-    });
-    const res = await verifyWhatsAppConnectionOnServer();
-    setWaLiveCheck({
-      testing: false,
-      connected: res.connected,
-      displayPhoneNumber: res.displayPhoneNumber,
-      verifiedName: res.verifiedName,
-      qualityRating: res.qualityRating,
-      error: res.error,
-    });
-    if (res.connected) {
-      showToast(
-        `WhatsApp Connected${res.displayPhoneNumber ? ` (${res.displayPhoneNumber})` : ''}`,
-      );
-    } else if (res.error) {
-      showToast(res.error);
-    }
-  };
-
-  const handleSendWhatsApp = async (order: OrderRecord) => {
-    if (sendingWaOrderId) return;
-    setSendingWaOrderId(order.id);
+  const handleShareBill = async (order: OrderRecord) => {
+    if (sharingBillId) return;
+    setSharingBillId(order.id);
     try {
-      const result = await ownerSendWhatsAppBill(order);
-      if (result.delivered) {
-        showToast(`Bill #${order.order_code} sent to ${order.customer_name} on WhatsApp.`);
-      } else {
-        showToast(result.error || 'WhatsApp delivery failed.');
+      let publicBillId = order.public_bill_id || '';
+      if (!publicBillId || !order.pdf_url) {
+        const generated = await ensureOrderPdfGenerated(order, { persistIfOwner: true });
+        publicBillId = generated.public_bill_id || publicBillId;
       }
+      const outcome = await shareBillNative({
+        order_code: order.order_code,
+        table_number: order.table_number,
+        customer_name: order.customer_name,
+        total: order.total,
+        public_bill_id: publicBillId,
+        pdf_url: order.pdf_url,
+      });
+      if (outcome.method !== 'cancelled') {
+        showToast(outcome.message);
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Unable to share bill right now.');
     } finally {
-      setSendingWaOrderId(null);
+      setSharingBillId(null);
     }
   };
 
@@ -555,15 +558,13 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     try {
       await ownerUpdateOrderStatus(order, nextStatus);
       if (nextStatus === 'accepted') {
-        showToast(`Order #${order.order_code} confirmed & PDF bill ready.`);
-        // Automatically attempt WhatsApp delivery when WhatsApp Business API is configured
-        if (whatsappConfigured) {
-          void handleSendWhatsApp(order);
-        }
+        showToast(`Order #${order.order_code} confirmed & customer bill is ready.`);
       } else if (nextStatus === 'bill_ready') {
         showToast(`Bill ready for Table ${order.table_number}.`);
       } else if (nextStatus === 'completed') {
         showToast(`Table ${order.table_number} completed & available.`);
+      } else if (nextStatus === 'rejected') {
+        showToast(`Order #${order.order_code} rejected & table freed.`);
       }
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Could not update order status.');
@@ -597,17 +598,11 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     const status = order.bill_status || (order.pdf_ready ? 'generated' : 'not_generated');
     switch (status) {
       case 'generating':
-        return { label: 'Generating bill...', color: 'text-amber-700', dot: 'bg-amber-500' };
-      case 'sending':
-        return { label: 'Sending...', color: 'text-blue-700', dot: 'bg-blue-600' };
-      case 'retrying':
-        return { label: 'Retrying...', color: 'text-blue-700', dot: 'bg-blue-600' };
-      case 'sent':
-        return { label: 'BILL SENT', color: 'text-emerald-700', dot: 'bg-emerald-600' };
+        return { label: 'Generating Bill...', color: 'text-amber-700', dot: 'bg-amber-500' };
       case 'failed':
-        return { label: 'SEND FAILED', color: 'text-red-700', dot: 'bg-red-600' };
+        return { label: 'Bill Failed', color: 'text-red-700', dot: 'bg-red-600' };
       case 'generated':
-        return { label: 'PDF Ready', color: 'text-emerald-700', dot: 'bg-emerald-600' };
+        return { label: 'Bill Ready', color: 'text-emerald-700', dot: 'bg-emerald-600' };
       default:
         return { label: 'Not Generated', color: 'text-neutral-500', dot: 'bg-neutral-400' };
     }
@@ -643,6 +638,16 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     }
   };
 
+  const handleCopyMainQrUrl = async () => {
+    try {
+      await navigator.clipboard.writeText(getMainMenuQrUrl());
+      setCopiedTable('main');
+      window.setTimeout(() => setCopiedTable(null), 1800);
+    } catch {
+      // Ignore clipboard errors
+    }
+  };
+
   const handleMarkPaid = async (order: OrderRecord) => {
     if (updatingPaymentId) return;
     setUpdatingPaymentId(order.id);
@@ -666,13 +671,12 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     setPaymentFormError(null);
     setQrScanNotice(null);
     try {
-      // 1. Auto-decode UPI ID & Merchant Name directly from the uploaded QR screenshot
       const decoded = await decodeUpiQrFromImageFile(file);
-      // 2. Upload reference QR image safely to server storage
       const uploadedUrl = await ownerUploadPaymentQrImage(file);
 
       paymentDraftDirtyRef.current = true;
       setPaymentDraft((prev) => ({
+        payment_mode: 'uploaded_qr',
         upi_id: decoded.upiId || prev.upi_id,
         merchant_name: decoded.merchantName || prev.merchant_name || 'RikZen Fast Food',
         qr_image_url: uploadedUrl,
@@ -680,11 +684,11 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
 
       if (decoded.upiId) {
         setQrScanNotice(
-          `UPI ID detected automatically from your QR: ${decoded.upiId}. Review and click Save Payment Settings.`,
+          `QR uploaded & UPI ID detected (${decoded.upiId}). Keep "Uploaded Payment QR" to show your exact QR image, or switch to "Dynamic UPI QR" for exact pre-filled amounts, then click Save.`,
         );
       } else {
         setQrScanNotice(
-          'QR screenshot uploaded! Enter your Restaurant UPI ID below and click Save so every bill generates a dynamic exact-amount QR.',
+          'Payment QR uploaded cleanly! Preview below and click Save Payment Settings to activate it for new bills.',
         );
       }
     } catch (err) {
@@ -693,6 +697,35 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
       );
     } finally {
       setUploadingQr(false);
+    }
+  };
+
+  const handleDeletePaymentQr = async () => {
+    if (deletingQr) return;
+    setDeletingQr(true);
+    setPaymentFormError(null);
+    setQrScanNotice(null);
+    try {
+      const updated = await ownerDeletePaymentQr({
+        ...paymentSettings,
+        payment_mode: paymentDraft.payment_mode,
+        upi_id: paymentDraft.upi_id,
+        merchant_name: paymentDraft.merchant_name,
+        qr_image_url: paymentDraft.qr_image_url,
+      });
+      paymentDraftDirtyRef.current = false;
+      setPaymentSettings(updated);
+      setPaymentDraft({
+        payment_mode: updated.payment_mode,
+        upi_id: updated.upi_id,
+        merchant_name: updated.merchant_name,
+        qr_image_url: updated.qr_image_url,
+      });
+      showToast('Uploaded payment QR removed.');
+    } catch (err) {
+      setPaymentFormError(err instanceof Error ? err.message : 'Could not delete payment QR.');
+    } finally {
+      setDeletingQr(false);
     }
   };
 
@@ -709,21 +742,26 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
       );
       return;
     }
+    if (paymentDraft.payment_mode === 'dynamic_upi' && !trimmedUpi) {
+      setPaymentFormError('Enter your Restaurant UPI ID to use Dynamic Exact-Amount UPI QR mode.');
+      return;
+    }
+    if (paymentDraft.payment_mode === 'uploaded_qr' && !paymentDraft.qr_image_url.trim()) {
+      setPaymentFormError('Please upload your restaurant payment QR image first.');
+      return;
+    }
 
     setSavingPayment(true);
     try {
       const saved = await ownerSavePaymentSettings({
+        payment_mode: paymentDraft.payment_mode,
         upi_id: trimmedUpi,
         merchant_name: paymentDraft.merchant_name.trim() || 'RikZen Fast Food',
         qr_image_url: paymentDraft.qr_image_url.trim(),
       });
       paymentDraftDirtyRef.current = false;
       setPaymentSettings(saved);
-      showToast(
-        trimmedUpi
-          ? `Payment Settings saved (${trimmedUpi}). Bills now embed dynamic exact-amount UPI QRs.`
-          : 'Payment Settings saved.',
-      );
+      showToast('Payment QR saved successfully.');
     } catch (err) {
       setPaymentFormError(
         err instanceof Error ? err.message : 'Could not save payment settings.',
@@ -746,12 +784,25 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     }
   };
 
+  const handleDownloadMainMenuQr = async () => {
+    if (downloadingTableQr !== null) return;
+    setDownloadingTableQr('main');
+    try {
+      const filename = await downloadMainMenuQrPng();
+      showToast(`Downloaded ${filename}`);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to download Main Website QR PNG.');
+    } finally {
+      setDownloadingTableQr(null);
+    }
+  };
+
   const handleDownloadAllTableQrs = async () => {
     if (downloadingTableQr !== null) return;
     setDownloadingTableQr('all');
     try {
       const filename = await downloadAllTableQrsZip();
-      showToast(`Downloaded ${filename} (Tables 1–6)`);
+      showToast(`Downloaded ${filename} (Tables 1–6 + Main QR)`);
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Failed to generate Table QR ZIP.');
     } finally {
@@ -759,8 +810,8 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     }
   };
 
-  const handlePrintTableQrs = (tableNums: number[]) => {
-    setPrintTableNumbers(tableNums);
+  const handlePrintTableQrs = (targets: Array<number | 'main'>) => {
+    setPrintQrTargets(targets);
     window.setTimeout(() => {
       window.print();
     }, 120);
@@ -1070,7 +1121,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
               {section === 'menu' && 'Menu Management'}
               {section === 'offers' && 'Offers'}
               {section === 'tables' && 'Tables & QR Codes'}
-              {section === 'bills' && 'Customer Bills & WhatsApp'}
+              {section === 'bills' && 'Customer Bills & Sharing'}
               {section === 'reports' && 'Sales Reports & History'}
               {section === 'settings' && 'Shop Settings'}
             </h1>
@@ -1332,11 +1383,55 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
         </AnimatePresence>
 
         <main className="flex-1 p-4 sm:p-6 pb-24 lg:pb-10 max-w-6xl w-full mx-auto space-y-6">
-          {dataError && (
-            <div className="p-4 rounded-xl bg-red-50 border border-red-200 text-sm text-red-800">
-              {dataError}
-            </div>
-          )}
+          {dataError && (() => {
+            const diag = parseOwnerDiagnosticError(dataError);
+            return (
+              <div className="rounded-2xl bg-red-50 border border-red-200 p-4 sm:p-5 space-y-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="flex items-start gap-2.5">
+                    <AlertTriangle className="w-5 h-5 text-red-700 shrink-0 mt-0.5" />
+                    <div>
+                      <p className="text-sm font-extrabold text-red-900">
+                        Owner Diagnostic Panel · {diag.status}
+                      </p>
+                      <p className="text-xs text-red-800 mt-0.5">{diag.reason}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => window.location.reload()}
+                      className="min-h-[34px] px-3 py-1 rounded-xl bg-red-700 text-white text-xs font-bold hover:bg-red-800 inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      Retry
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDataError(null)}
+                      className="min-h-[34px] px-2.5 py-1 rounded-xl border border-red-200 bg-white text-red-800 text-xs font-semibold hover:bg-red-100 cursor-pointer"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                  <div className="rounded-xl bg-white/80 border border-red-200/70 px-3 py-2">
+                    <span className="font-bold text-red-700 block">Operation</span>
+                    <span className="font-mono font-semibold text-neutral-900">{diag.operation}</span>
+                  </div>
+                  <div className="rounded-xl bg-white/80 border border-red-200/70 px-3 py-2">
+                    <span className="font-bold text-red-700 block">Collection / Path</span>
+                    <span className="font-mono font-semibold text-neutral-900 break-all">{diag.path}</span>
+                  </div>
+                  <div className="rounded-xl bg-white/80 border border-red-200/70 px-3 py-2">
+                    <span className="font-bold text-red-700 block">Suggested Fix</span>
+                    <span className="text-neutral-800">{diag.suggestedFix}</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* ========================================================== */}
           {/* SECTION 1: LIVE POS DASHBOARD                              */}
@@ -1698,7 +1793,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                   <AnimatePresence initial={false}>
                     {filteredOrders.map((order) => {
                       const isBusy = busyOrderId === order.id;
-                      const isSendingWa = sendingWaOrderId === order.id;
+                      const isSharing = sharingBillId === order.id;
                       const isConfirmedStage = !['pending', 'rejected'].includes(order.status);
                       const isBeingAnnounced = voiceQueueState.currentOrderId === order.id;
 
@@ -1810,13 +1905,9 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                               )}
                             </div>
 
-                            {/* Real Stored PDF Bill & WhatsApp Delivery Strip */}
+                            {/* Website-Native Bill & Share Strip */}
                             {isConfirmedStage && (() => {
                               const billMeta = getBillStatusMeta(order);
-                              const isBusySend =
-                                isSendingWa ||
-                                order.whatsapp_status === 'sending' ||
-                                order.whatsapp_status === 'retrying';
                               const cardBillErr = billErrors[order.id];
 
                               return (
@@ -1860,26 +1951,6 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                                     </div>
                                   )}
 
-                                  {order.whatsapp_status === 'failed' && order.whatsapp_error && (
-                                    <div className="rounded-xl bg-red-50 border border-red-200 p-2.5 flex flex-wrap items-center justify-between gap-2">
-                                      <p className="text-[11px] font-semibold text-red-800 leading-snug">
-                                        {order.whatsapp_error.toLowerCase().includes('not configured')
-                                          ? 'WhatsApp API is not configured.'
-                                          : order.whatsapp_error}
-                                      </p>
-                                      {order.whatsapp_error.toLowerCase().includes('not configured') && (
-                                        <button
-                                          type="button"
-                                          onClick={() => setSection('settings')}
-                                          className="px-2.5 py-1 rounded-lg bg-neutral-900 text-white text-[11px] font-bold inline-flex items-center gap-1 cursor-pointer shrink-0"
-                                        >
-                                          <Settings className="w-3 h-3" />
-                                          Open Settings
-                                        </button>
-                                      )}
-                                    </div>
-                                  )}
-
                                   <div className="grid grid-cols-3 gap-2">
                                     <button
                                       type="button"
@@ -1887,7 +1958,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                                       className="min-h-[40px] px-2.5 py-1.5 rounded-xl bg-white border border-neutral-200 text-neutral-900 text-xs font-bold hover:bg-neutral-100 inline-flex items-center justify-center gap-1 cursor-pointer whitespace-nowrap"
                                     >
                                       <Eye className="w-3.5 h-3.5" />
-                                      View PDF
+                                      View Bill
                                     </button>
                                     <button
                                       type="button"
@@ -1900,37 +1971,16 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                                     </button>
                                     <button
                                       type="button"
-                                      disabled={isBusySend}
-                                      onClick={() => handleSendWhatsApp(order)}
-                                      className={`min-h-[40px] px-2.5 py-1.5 rounded-xl text-white text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 whitespace-nowrap ${
-                                        order.whatsapp_status === 'failed'
-                                          ? 'bg-red-700 hover:bg-red-800'
-                                          : 'bg-emerald-700 hover:bg-emerald-800'
-                                      }`}
+                                      disabled={isSharing}
+                                      onClick={() => handleShareBill(order)}
+                                      className="min-h-[40px] px-2.5 py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 whitespace-nowrap"
                                     >
-                                      {isBusySend ? (
-                                        <>
-                                          <Clock className="w-3.5 h-3.5" />
-                                          {order.whatsapp_status === 'retrying'
-                                            ? 'Retrying'
-                                            : 'Sending'}
-                                        </>
-                                      ) : order.whatsapp_status === 'failed' ? (
-                                        <>
-                                          <RefreshCw className="w-3.5 h-3.5" />
-                                          Retry
-                                        </>
-                                      ) : order.whatsapp_status === 'sent' ? (
-                                        <>
-                                          <CheckCircle2 className="w-3.5 h-3.5" />
-                                          Sent
-                                        </>
+                                      {isSharing ? (
+                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
                                       ) : (
-                                        <>
-                                          <Send className="w-3.5 h-3.5" />
-                                          Share Bill
-                                        </>
+                                        <Share2 className="w-3.5 h-3.5" />
                                       )}
+                                      {isSharing ? 'Sharing...' : 'Share Bill'}
                                     </button>
                                   </div>
 
@@ -1963,7 +2013,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                                   className="flex-1 min-h-[50px] px-4 py-3 rounded-xl bg-emerald-700 text-white font-bold text-sm hover:bg-emerald-800 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
                                 >
                                   <CheckCircle2 className="w-5 h-5" />
-                                  Accept Order
+                                  {isBusy ? 'Confirming...' : 'Confirm Order'}
                                 </button>
                                 <button
                                   type="button"
@@ -2538,7 +2588,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                             }
                             className="min-h-[44px] px-5 py-2 rounded-xl bg-emerald-700 text-white text-sm font-bold cursor-pointer"
                           >
-                            Accept Order
+                            Confirm Order
                           </button>
                         )}
                         {selectedTableData.activeOrder.status === 'bill_ready' && (
@@ -2576,41 +2626,27 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
           )}
 
           {/* ========================================================== */}
-          {/* SECTION 5: BILLS & WHATSAPP DELIVERY CENTER                */}
+          {/* SECTION 5: WEBSITE-NATIVE CUSTOMER BILLS & SHARING         */}
           {/* ========================================================== */}
           {section === 'bills' && (
             <div className="space-y-5">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
                   <h2 className="text-2xl font-extrabold text-neutral-900">
-                    Customer Bills &amp; WhatsApp
+                    Customer Bills &amp; Sharing
                   </h2>
                   <p className="text-sm text-neutral-500">
-                    View, download, or deliver server-verified PDF bills to customer WhatsApp
-                    numbers.
+                    View, download, or share direct website PDF bills with payment QR — zero login
+                    needed for customers.
                   </p>
                 </div>
                 <button
                   type="button"
                   onClick={() => setSection('settings')}
-                  className={`text-xs font-bold px-3.5 py-2 rounded-xl border inline-flex items-center gap-2 cursor-pointer transition-colors ${
-                    waLiveCheck.connected
-                      ? 'bg-emerald-50 border-emerald-200 text-emerald-800 hover:bg-emerald-100'
-                      : whatsappConfigured
-                        ? 'bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100'
-                        : 'bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100'
-                  }`}
+                  className="text-xs font-bold px-3.5 py-2 rounded-xl border border-neutral-200 bg-white text-neutral-800 hover:bg-neutral-50 inline-flex items-center gap-2 cursor-pointer transition-colors"
                 >
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      waLiveCheck.connected ? 'bg-emerald-600' : 'bg-amber-500'
-                    }`}
-                  />
-                  {waLiveCheck.connected
-                    ? `WhatsApp Connected${waLiveCheck.displayPhoneNumber ? ` · ${waLiveCheck.displayPhoneNumber}` : ''}`
-                    : whatsappConfigured
-                      ? 'WhatsApp Keys Saved — Tap to Verify'
-                      : 'WhatsApp API Pending Setup (Open Settings)'}
+                  <QrCode className="w-4 h-4 text-[#E5391B]" />
+                  Payment QR Settings
                 </button>
               </div>
 
@@ -2618,17 +2654,15 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                 <div className="bg-white rounded-3xl border border-neutral-200 p-10 text-center">
                   <p className="text-base font-bold text-neutral-900 mb-1">No bills generated yet</p>
                   <p className="text-sm text-neutral-500">
-                    Confirmed customer orders automatically generate branded PDF bills here.
+                    Confirmed customer orders automatically generate branded PDF bills and shareable
+                    links here.
                   </p>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {billOrders.map((order) => {
                     const billMeta = getBillStatusMeta(order);
-                    const isBusySend =
-                      sendingWaOrderId === order.id ||
-                      order.whatsapp_status === 'sending' ||
-                      order.whatsapp_status === 'retrying';
+                    const isSharingThis = sharingBillId === order.id;
                     const cardBillErr = billErrors[order.id];
 
                     return (
@@ -2692,26 +2726,6 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                           </div>
                         )}
 
-                        {order.whatsapp_status === 'failed' && order.whatsapp_error && (
-                          <div className="rounded-xl bg-red-50 border border-red-200 p-2.5 flex flex-wrap items-center justify-between gap-2">
-                            <p className="text-xs font-semibold text-red-800">
-                              {order.whatsapp_error.toLowerCase().includes('not configured')
-                                ? 'WhatsApp API is not configured.'
-                                : order.whatsapp_error}
-                            </p>
-                            {order.whatsapp_error.toLowerCase().includes('not configured') && (
-                              <button
-                                type="button"
-                                onClick={() => setSection('settings')}
-                                className="px-3 py-1.5 rounded-lg bg-neutral-900 text-white text-xs font-bold inline-flex items-center gap-1 cursor-pointer shrink-0"
-                              >
-                                <Settings className="w-3.5 h-3.5" />
-                                Open Settings
-                              </button>
-                            )}
-                          </div>
-                        )}
-
                         <div className="grid grid-cols-3 gap-2">
                           <button
                             type="button"
@@ -2719,7 +2733,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                             className="min-h-[42px] px-3 py-2 rounded-xl border border-neutral-200 text-neutral-900 text-xs font-bold hover:bg-neutral-50 inline-flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
                           >
                             <Eye className="w-3.5 h-3.5" />
-                            View PDF
+                            View Bill
                           </button>
                           <button
                             type="button"
@@ -2732,35 +2746,16 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                           </button>
                           <button
                             type="button"
-                            disabled={isBusySend}
-                            onClick={() => handleSendWhatsApp(order)}
-                            className={`min-h-[42px] px-3 py-2 rounded-xl text-white text-xs font-bold inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60 whitespace-nowrap ${
-                              order.whatsapp_status === 'failed'
-                                ? 'bg-red-700 hover:bg-red-800'
-                                : 'bg-emerald-700 hover:bg-emerald-800'
-                            }`}
+                            disabled={isSharingThis}
+                            onClick={() => handleShareBill(order)}
+                            className="min-h-[42px] px-3 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60 whitespace-nowrap"
                           >
-                            {isBusySend ? (
-                              <>
-                                <Clock className="w-3.5 h-3.5" />
-                                {order.whatsapp_status === 'retrying' ? 'Retrying...' : 'Sending...'}
-                              </>
-                            ) : order.whatsapp_status === 'failed' ? (
-                              <>
-                                <RefreshCw className="w-3.5 h-3.5" />
-                                Retry
-                              </>
-                            ) : order.whatsapp_status === 'sent' ? (
-                              <>
-                                <CheckCircle2 className="w-3.5 h-3.5" />
-                                Bill Sent
-                              </>
+                            {isSharingThis ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
                             ) : (
-                              <>
-                                <Send className="w-3.5 h-3.5" />
-                                Share Bill
-                              </>
+                              <Share2 className="w-3.5 h-3.5" />
                             )}
+                            {isSharingThis ? 'Sharing...' : 'Share Bill'}
                           </button>
                         </div>
 
@@ -2791,17 +2786,17 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
               orders={orders}
               onViewOrder={(ord) => setPreviewBillOrder(ord)}
               onDownloadBill={handleDownloadPdf}
-              onSendWhatsApp={handleSendWhatsApp}
+              onShareBill={handleShareBill}
               onMarkPaid={handleMarkPaid}
               downloadingBillId={downloadingBillId}
-              sendingWaOrderId={sendingWaOrderId}
+              sharingBillId={sharingBillId}
               updatingPaymentId={updatingPaymentId}
               onToast={showToast}
             />
           )}
 
           {/* ========================================================== */}
-          {/* SECTION 7: VOICE ALERTS, PAYMENT, WHATSAPP & 6-TABLE QR    */}
+          {/* SECTION 7: VOICE ALERTS, PAYMENT QR & TABLE QR CODES     */}
           {/* ========================================================== */}
           {section === 'settings' && (
             <div className="space-y-6">
@@ -2939,7 +2934,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                 </div>
               </div>
 
-              {/* 1. Restaurant Payment Settings (UPI ID + Merchant Name + Upload UPI QR Screenshot) */}
+              {/* 1. Honest 2-Mode Restaurant Payment QR Settings */}
               <form
                 onSubmit={handleSavePaymentSettings}
                 className="bg-white rounded-3xl border border-neutral-200 p-6 space-y-5"
@@ -2948,28 +2943,85 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                   <div>
                     <h2 className="text-lg font-extrabold text-neutral-900 inline-flex items-center gap-2">
                       <CreditCard className="w-5 h-5 text-[#E5391B]" />
-                      Payment Settings (Dynamic UPI Bill QR)
+                      Payment QR Settings
                     </h2>
                     <p className="text-sm text-neutral-600 mt-0.5">
-                      Upload your restaurant UPI QR screenshot or enter your UPI ID. Every customer
-                      bill automatically generates an exact-amount UPI QR pre-filled with the bill
-                      total.
+                      Choose how customers pay on their bill: display your exact uploaded restaurant
+                      QR image or generate a dynamic exact-amount UPI QR.
                     </p>
                   </div>
                   <span
                     className={`text-xs font-bold px-3 py-1.5 rounded-xl border inline-flex items-center gap-1.5 ${
-                      paymentSettings.upi_id
+                      (paymentSettings.payment_mode === 'uploaded_qr' &&
+                        Boolean(paymentSettings.qr_image_url)) ||
+                      (paymentSettings.payment_mode === 'dynamic_upi' &&
+                        Boolean(paymentSettings.upi_id))
                         ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
                         : 'bg-amber-50 border-amber-200 text-amber-800'
                     }`}
                   >
                     <span
                       className={`w-2 h-2 rounded-full ${
-                        paymentSettings.upi_id ? 'bg-emerald-600' : 'bg-amber-500'
+                        (paymentSettings.payment_mode === 'uploaded_qr' &&
+                          Boolean(paymentSettings.qr_image_url)) ||
+                        (paymentSettings.payment_mode === 'dynamic_upi' &&
+                          Boolean(paymentSettings.upi_id))
+                          ? 'bg-emerald-600'
+                          : 'bg-amber-500'
                       }`}
                     />
-                    {paymentSettings.upi_id ? `UPI Active · ${paymentSettings.upi_id}` : 'UPI Setup Needed'}
+                    {paymentSettings.payment_mode === 'uploaded_qr'
+                      ? paymentSettings.qr_image_url
+                        ? 'Mode 1 · Uploaded QR Active'
+                        : 'Upload QR Needed'
+                      : paymentSettings.upi_id
+                        ? `Mode 2 · Dynamic UPI (${paymentSettings.upi_id})`
+                        : 'UPI Setup Needed'}
                   </span>
+                </div>
+
+                {/* Honest 2-Mode Toggle */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      paymentDraftDirtyRef.current = true;
+                      setPaymentDraft((prev) => ({ ...prev, payment_mode: 'uploaded_qr' }));
+                    }}
+                    className={`text-left rounded-2xl border p-4 transition-colors cursor-pointer ${
+                      paymentDraft.payment_mode === 'uploaded_qr'
+                        ? 'border-[#E5391B] bg-[#FEF2F0]/60 ring-2 ring-[#E5391B]/15'
+                        : 'border-neutral-200 bg-neutral-50 hover:bg-neutral-100'
+                    }`}
+                  >
+                    <p className="text-xs font-extrabold text-neutral-900">
+                      Mode 1 · Uploaded Payment QR
+                    </p>
+                    <p className="text-[11px] text-neutral-600 mt-1 leading-relaxed">
+                      Shows your exact un-altered PhonePe / GPay / Paytm / BharatPe QR image on
+                      bills. Customers enter the bill amount manually in their UPI app.
+                    </p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      paymentDraftDirtyRef.current = true;
+                      setPaymentDraft((prev) => ({ ...prev, payment_mode: 'dynamic_upi' }));
+                    }}
+                    className={`text-left rounded-2xl border p-4 transition-colors cursor-pointer ${
+                      paymentDraft.payment_mode === 'dynamic_upi'
+                        ? 'border-[#E5391B] bg-[#FEF2F0]/60 ring-2 ring-[#E5391B]/15'
+                        : 'border-neutral-200 bg-neutral-50 hover:bg-neutral-100'
+                    }`}
+                  >
+                    <p className="text-xs font-extrabold text-neutral-900">
+                      Mode 2 · Dynamic Exact-Amount UPI QR
+                    </p>
+                    <p className="text-[11px] text-neutral-600 mt-1 leading-relaxed">
+                      Generates a fresh UPI QR for each bill with the exact final total pre-filled
+                      automatically using your Restaurant UPI ID.
+                    </p>
+                  </button>
                 </div>
 
                 {qrScanNotice && (
@@ -2988,31 +3040,10 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                   <div className="lg:col-span-7 space-y-4">
                     <div>
                       <label
-                        htmlFor="owner-upi-id"
-                        className="block text-xs font-bold text-neutral-700 mb-1.5"
-                      >
-                        Restaurant UPI ID
-                      </label>
-                      <input
-                        id="owner-upi-id"
-                        type="text"
-                        maxLength={120}
-                        value={paymentDraft.upi_id}
-                        onChange={(e) => {
-                          paymentDraftDirtyRef.current = true;
-                          setPaymentDraft((prev) => ({ ...prev, upi_id: e.target.value }));
-                        }}
-                        placeholder="e.g., rikzenfastfood@okaxis or 9876543210@ybl"
-                        className="w-full min-h-[46px] px-4 py-2.5 rounded-xl bg-neutral-50 border border-neutral-200 text-sm font-mono text-neutral-900 focus:outline-none focus:bg-white focus:border-[#E5391B]"
-                      />
-                    </div>
-
-                    <div>
-                      <label
                         htmlFor="owner-merchant-name"
                         className="block text-xs font-bold text-neutral-700 mb-1.5"
                       >
-                        Restaurant Name (shown inside UPI app)
+                        Restaurant Name
                       </label>
                       <input
                         id="owner-merchant-name"
@@ -3030,11 +3061,33 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                       />
                     </div>
 
+                    <div>
+                      <label
+                        htmlFor="owner-upi-id"
+                        className="block text-xs font-bold text-neutral-700 mb-1.5"
+                      >
+                        Restaurant UPI ID{' '}
+                        {paymentDraft.payment_mode === 'dynamic_upi' ? '(Required for Mode 2)' : '(Optional)'}
+                      </label>
+                      <input
+                        id="owner-upi-id"
+                        type="text"
+                        maxLength={120}
+                        value={paymentDraft.upi_id}
+                        onChange={(e) => {
+                          paymentDraftDirtyRef.current = true;
+                          setPaymentDraft((prev) => ({ ...prev, upi_id: e.target.value }));
+                        }}
+                        placeholder="e.g., rikzenfastfood@okaxis or 9876543210@ybl"
+                        className="w-full min-h-[46px] px-4 py-2.5 rounded-xl bg-neutral-50 border border-neutral-200 text-sm font-mono text-neutral-900 focus:outline-none focus:bg-white focus:border-[#E5391B]"
+                      />
+                    </div>
+
                     <div className="space-y-2">
                       <span className="block text-xs font-bold text-neutral-700">
-                        Payment QR Screenshot (Auto-reads your UPI ID)
+                        Restaurant Payment QR Image (PNG, JPG, JPEG, WEBP · Max 5 MB)
                       </span>
-                      <div className="flex flex-wrap items-center gap-3">
+                      <div className="flex flex-wrap items-center gap-2.5">
                         <label className="min-h-[44px] px-4 py-2.5 rounded-xl border border-neutral-300 bg-neutral-50 hover:bg-neutral-100 text-neutral-900 text-xs font-bold inline-flex items-center gap-2 cursor-pointer">
                           {uploadingQr ? (
                             <Loader2 className="w-4 h-4 animate-spin" />
@@ -3042,8 +3095,10 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                             <Upload className="w-4 h-4 text-[#E5391B]" />
                           )}
                           {uploadingQr
-                            ? 'Scanning & Uploading QR...'
-                            : 'Upload Restaurant Payment QR'}
+                            ? 'Uploading QR...'
+                            : paymentDraft.qr_image_url
+                              ? 'Replace Payment QR'
+                              : 'Upload Restaurant Payment QR'}
                           <input
                             type="file"
                             accept="image/png,image/jpeg,image/webp"
@@ -3053,19 +3108,28 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                           />
                         </label>
                         {paymentDraft.qr_image_url && (
-                          <span className="text-xs text-emerald-700 font-semibold">
-                            Reference QR uploaded
-                          </span>
+                          <button
+                            type="button"
+                            disabled={deletingQr || savingPayment}
+                            onClick={handleDeletePaymentQr}
+                            className="min-h-[44px] px-3.5 py-2 rounded-xl border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                          >
+                            {deletingQr ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                              <Trash2 className="w-4 h-4" />
+                            )}
+                            Delete QR
+                          </button>
                         )}
                       </div>
                       <p className="text-[11px] text-neutral-500">
-                        Upload your PhonePe / Google Pay / Paytm / BHIM QR screenshot once — we
-                        automatically extract your UPI ID so every bill embeds a dynamic
-                        exact-amount QR.
+                        Existing old bills keep their saved payment QR snapshot. New bills will use
+                        your latest saved QR.
                       </p>
                     </div>
 
-                    <div className="pt-1 flex flex-wrap gap-3">
+                    <div className="pt-1 flex flex-wrap gap-2.5">
                       <button
                         type="submit"
                         disabled={savingPayment || uploadingQr}
@@ -3076,29 +3140,62 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                         ) : (
                           <Save className="w-4 h-4" />
                         )}
-                        {savingPayment ? 'Saving Settings...' : 'Save Payment Settings'}
+                        {savingPayment ? 'Saving...' : 'Save Payment Settings'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setTestQrModalOpen(true)}
+                        className="min-h-[46px] px-5 py-2.5 rounded-xl border border-neutral-300 bg-white text-neutral-900 text-sm font-bold hover:bg-neutral-50 inline-flex items-center gap-2 cursor-pointer"
+                      >
+                        <QrCode className="w-4 h-4 text-[#E5391B]" />
+                        Test Payment QR
                       </button>
                     </div>
                   </div>
 
-                  {/* Right Preview: Live Exact-Amount Bill QR Test Preview + Uploaded Reference */}
+                  {/* Right Preview: Crisp Un-Altered Uploaded QR OR Dynamic Exact-Amount Preview */}
                   <div className="lg:col-span-5 rounded-2xl border border-neutral-200 bg-neutral-50 p-4 space-y-3 text-center">
                     <p className="text-xs font-extrabold text-neutral-700 inline-flex items-center gap-1.5">
                       <QrCode className="w-4 h-4 text-[#E5391B]" />
-                      Live Dynamic Bill QR Preview (Sample ₹493)
+                      {paymentDraft.payment_mode === 'uploaded_qr'
+                        ? 'Uploaded Restaurant QR Preview'
+                        : 'Dynamic Bill QR Preview (Sample ₹260)'}
                     </p>
-                    {isValidUpiId(paymentDraft.upi_id) ? (
+                    {paymentDraft.payment_mode === 'uploaded_qr' ? (
+                      paymentDraft.qr_image_url ? (
+                        <div className="flex flex-col items-center gap-2">
+                          <div className="p-2.5 bg-white rounded-xl border border-neutral-900 inline-flex items-center justify-center">
+                            <img
+                              src={paymentDraft.qr_image_url}
+                              alt="Uploaded restaurant payment QR"
+                              className="w-44 h-44 object-contain bg-white"
+                            />
+                          </div>
+                          <p className="text-xs font-bold text-neutral-800">
+                            Exact original QR (zero cropping or distortion)
+                          </p>
+                          <p className="text-[11px] text-neutral-600">
+                            Customer scans &amp; enters the bill amount in their UPI app.
+                          </p>
+                        </div>
+                      ) : (
+                        <div className="py-8 px-4 text-xs text-neutral-500">
+                          Upload your restaurant PhonePe / GPay / Paytm QR image to preview it
+                          cleanly here.
+                        </div>
+                      )
+                    ) : isValidUpiId(paymentDraft.upi_id) ? (
                       <div className="flex flex-col items-center gap-2">
                         <div className="p-2.5 bg-white rounded-xl border border-neutral-900 inline-block">
                           <QRCodeSVG
                             value={buildDynamicUpiUri({
                               upiId: paymentDraft.upi_id,
                               merchantName: paymentDraft.merchant_name || 'RikZen Fast Food',
-                              amount: 493,
+                              amount: 260,
                               orderCode: 'RK1042',
                               tableNumber: 3,
                             })}
-                            size={156}
+                            size={164}
                             level="H"
                             includeMargin={true}
                             fgColor="#000000"
@@ -3106,161 +3203,31 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                           />
                         </div>
                         <p className="text-xs font-extrabold text-emerald-700">
-                          Exact ₹493 pre-filled when scanned
+                          Exact ₹260 pre-filled automatically when scanned
                         </p>
                         <p className="text-[11px] font-mono text-neutral-600 break-all">
                           {paymentDraft.upi_id.trim()}
                         </p>
                       </div>
-                    ) : paymentDraft.qr_image_url ? (
-                      <div className="flex flex-col items-center gap-2">
-                        <img
-                          src={paymentDraft.qr_image_url}
-                          alt="Uploaded restaurant payment QR"
-                          className="w-40 h-40 object-contain rounded-xl border border-neutral-200 bg-white p-1.5"
-                        />
-                        <p className="text-[11px] text-amber-800 font-semibold">
-                          Enter your UPI ID on the left to enable exact-amount dynamic QRs on bills.
-                        </p>
-                      </div>
                     ) : (
                       <div className="py-8 px-4 text-xs text-neutral-500">
-                        Upload your UPI QR screenshot or type your UPI ID to preview your live
-                        exact-amount dynamic bill QR here.
+                        Enter a valid Restaurant UPI ID on the left to preview your live dynamic
+                        exact-amount QR.
                       </div>
                     )}
                   </div>
                 </div>
               </form>
 
-              {/* 2. WhatsApp API Integration Status Card */}
-              <div className="bg-white rounded-3xl border border-neutral-200 p-6 space-y-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h2 className="text-lg font-extrabold text-neutral-900">
-                      WhatsApp Business Cloud API
-                    </h2>
-                    <p className="text-sm text-neutral-600 mt-0.5">
-                      Uploads and delivers server-generated PDF bills automatically to customer
-                      WhatsApp numbers via Meta Graph API ({waConfigMeta.apiVersion}).
-                    </p>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span
-                      className={`text-xs font-bold px-3 py-1.5 rounded-xl border inline-flex items-center gap-1.5 ${
-                        waLiveCheck.connected
-                          ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
-                          : 'bg-amber-50 border-amber-200 text-amber-800'
-                      }`}
-                    >
-                      <span
-                        className={`w-2 h-2 rounded-full ${
-                          waLiveCheck.connected ? 'bg-emerald-600' : 'bg-amber-500'
-                        }`}
-                      />
-                      {waLiveCheck.testing
-                        ? 'Checking Meta API...'
-                        : waLiveCheck.connected
-                          ? 'Connected'
-                          : whatsappConfigured
-                            ? 'Verification Required'
-                            : 'Not Configured'}
-                    </span>
-                    <button
-                      type="button"
-                      disabled={waLiveCheck.testing}
-                      onClick={handleTestWhatsAppConnection}
-                      className="min-h-[36px] px-3.5 py-1.5 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
-                    >
-                      {waLiveCheck.testing ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <RefreshCw className="w-3.5 h-3.5" />
-                      )}
-                      Test WhatsApp Connection
-                    </button>
-                  </div>
-                </div>
-
-                {/* Live Verification Result */}
-                {waLiveCheck.connected && (
-                  <div className="rounded-2xl bg-emerald-50 border border-emerald-200 p-4 text-xs text-emerald-900 flex flex-wrap items-center justify-between gap-3">
-                    <div className="space-y-0.5">
-                      <p className="font-extrabold text-emerald-900 inline-flex items-center gap-1.5">
-                        <CheckCircle2 className="w-4 h-4 text-emerald-700" />
-                        Live WhatsApp Cloud API Verified
-                      </p>
-                      <p className="text-emerald-800">
-                        {waLiveCheck.verifiedName ? `${waLiveCheck.verifiedName} · ` : ''}
-                        <span className="font-mono font-bold">
-                          {waLiveCheck.displayPhoneNumber || 'Verified Business Number'}
-                        </span>
-                        {waLiveCheck.qualityRating ? ` · Quality: ${waLiveCheck.qualityRating}` : ''}
-                      </p>
-                    </div>
-                  </div>
-                )}
-
-                {waLiveCheck.error && !waLiveCheck.connected && (
-                  <div className="rounded-2xl bg-red-50 border border-red-200 p-4 text-xs text-red-800 font-semibold">
-                    {waLiveCheck.error}
-                  </div>
-                )}
-
-                {/* Secret Readiness Checklist */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div className="rounded-2xl bg-neutral-50 border border-neutral-200 p-3.5 flex items-center justify-between gap-2 text-xs">
-                    <span className="font-mono font-bold text-neutral-800">
-                      WHATSAPP_ACCESS_TOKEN
-                    </span>
-                    <span
-                      className={`font-bold ${
-                        waConfigMeta.hasToken ? 'text-emerald-700' : 'text-amber-700'
-                      }`}
-                    >
-                      {waConfigMeta.hasToken ? 'Configured' : 'Missing'}
-                    </span>
-                  </div>
-                  <div className="rounded-2xl bg-neutral-50 border border-neutral-200 p-3.5 flex items-center justify-between gap-2 text-xs">
-                    <span className="font-mono font-bold text-neutral-800">
-                      WHATSAPP_PHONE_NUMBER_ID
-                    </span>
-                    <span
-                      className={`font-bold ${
-                        waConfigMeta.hasPhoneId ? 'text-emerald-700' : 'text-amber-700'
-                      }`}
-                    >
-                      {waConfigMeta.hasPhoneId ? 'Configured' : 'Missing'}
-                    </span>
-                  </div>
-                </div>
-
-                {!waLiveCheck.connected && (
-                  <div className="rounded-2xl bg-neutral-50 border border-neutral-200 p-4 text-xs text-neutral-700 space-y-1.5 leading-relaxed">
-                    <p className="font-bold text-neutral-900">
-                      How to activate automated WhatsApp PDF delivery:
-                    </p>
-                    <p>
-                      Add <span className="font-mono font-semibold">WHATSAPP_ACCESS_TOKEN</span> and{' '}
-                      <span className="font-mono font-semibold">WHATSAPP_PHONE_NUMBER_ID</span> from
-                      Meta Developers → WhatsApp Cloud API in AI Studio Settings → Secrets, restart
-                      the server, then click <span className="font-bold">Test WhatsApp Connection</span>.
-                      Until configured, customers still receive instant downloadable PDF bills with
-                      dynamic UPI QR on their screen with zero login.
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              {/* 3. 6-Table QR Generator, PNG Download, All-6 ZIP & Print Center */}
+              {/* 2. Main Website QR & 6-Table QR Generator, PNG Download, ZIP & Print Center */}
               <div className="bg-white rounded-3xl border border-neutral-200 p-6 space-y-5">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h2 className="text-lg font-extrabold text-neutral-900">
-                      Table QR Generator (Tables 1–6)
+                      Main Website QR &amp; Table QRs (Tables 1–6)
                     </h2>
                     <p className="text-xs text-neutral-500">
-                      Download print-ready PNGs individually, grab all 6 in one ZIP, or print
+                      Download print-ready PNGs individually, grab all QRs in one ZIP, or print
                       table tent cards directly.
                     </p>
                   </div>
@@ -3276,15 +3243,92 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                       ) : (
                         <FolderArchive className="w-4 h-4" />
                       )}
-                      {downloadingTableQr === 'all' ? 'Building ZIP...' : 'Download All Table QR'}
+                      {downloadingTableQr === 'all' ? 'Building ZIP...' : 'Download All (ZIP)'}
                     </button>
                     <button
                       type="button"
-                      onClick={() => handlePrintTableQrs([...TABLE_NUMBERS])}
+                      onClick={() => handlePrintTableQrs(['main', ...TABLE_NUMBERS])}
                       className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-2 cursor-pointer whitespace-nowrap"
                     >
                       <Printer className="w-4 h-4" />
-                      Print All 6 QR Cards
+                      Print All QRs
+                    </button>
+                  </div>
+                </div>
+
+                {/* Featured Main Website QR (/menu) */}
+                <div className="rounded-2xl border-2 border-[#E5391B]/30 bg-[#FEF2F0]/40 p-5 flex flex-col sm:flex-row items-center justify-between gap-5">
+                  <div className="flex flex-col sm:flex-row items-center gap-5 text-center sm:text-left">
+                    <div className="p-2 bg-white rounded-xl border border-neutral-900 shrink-0">
+                      <QRCodeSVG
+                        value={getMainMenuQrUrl()}
+                        size={124}
+                        level="H"
+                        includeMargin={true}
+                        fgColor="#000000"
+                        bgColor="#FFFFFF"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <p className="text-xs font-extrabold text-[#E5391B] inline-flex items-center gap-1.5">
+                        <Globe className="w-3.5 h-3.5" />
+                        MAIN WEBSITE QR · COUNTER / ENTRANCE
+                      </p>
+                      <h3 className="text-lg font-extrabold text-neutral-900">
+                        RikZen Fast Food Main Menu
+                      </h3>
+                      <p className="text-xs text-neutral-600 max-w-md">
+                        Customers scan to pick their Table (1–6) and order with zero login.
+                      </p>
+                      <p className="text-xs font-mono text-neutral-500">/menu</p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 w-full sm:w-auto sm:min-w-[240px]">
+                    <button
+                      type="button"
+                      disabled={downloadingTableQr !== null}
+                      onClick={handleDownloadMainMenuQr}
+                      className="min-h-[40px] px-3 py-1.5 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60 whitespace-nowrap"
+                    >
+                      {downloadingTableQr === 'main' ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Download className="w-3.5 h-3.5" />
+                      )}
+                      Download
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handlePrintTableQrs(['main'])}
+                      className="min-h-[40px] px-3 py-1.5 rounded-xl bg-white border border-neutral-300 text-neutral-900 text-xs font-bold hover:bg-neutral-100 inline-flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                    >
+                      <Printer className="w-3.5 h-3.5" />
+                      Print
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleCopyMainQrUrl}
+                      className="min-h-[38px] px-3 py-1.5 rounded-xl bg-white border border-neutral-200 text-neutral-700 text-xs font-semibold hover:bg-neutral-50 inline-flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      {copiedTable === 'main' ? (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-emerald-700" />
+                          Copied
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          Copy Link
+                        </>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onNavigate('/menu')}
+                      className="min-h-[38px] px-3 py-1.5 rounded-xl bg-white border border-neutral-200 text-neutral-700 text-xs font-semibold hover:bg-neutral-50 inline-flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      Test
                     </button>
                   </div>
                 </div>
@@ -3327,7 +3371,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                             ) : (
                               <Download className="w-3.5 h-3.5" />
                             )}
-                            Download QR
+                            Download
                           </button>
                           <button
                             type="button"
@@ -3335,7 +3379,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                             className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-white border border-neutral-300 text-neutral-900 text-xs font-bold hover:bg-neutral-100 inline-flex items-center justify-center gap-1 cursor-pointer whitespace-nowrap"
                           >
                             <Printer className="w-3.5 h-3.5" />
-                            Print QR
+                            Print
                           </button>
                           <button
                             type="button"
@@ -3360,7 +3404,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                             className="min-h-[36px] px-2.5 py-1.5 rounded-xl border border-neutral-200 bg-white text-xs font-semibold text-neutral-700 hover:bg-neutral-50 inline-flex items-center justify-center gap-1 cursor-pointer"
                           >
                             <ExternalLink className="w-3.5 h-3.5" />
-                            Open Menu
+                            Test
                           </button>
                         </div>
                       </div>
@@ -3445,61 +3489,153 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
           order={livePreviewOrder}
           onClose={() => setPreviewBillOrder(null)}
           isOwnerView={true}
-          whatsappConfigured={whatsappConfigured}
           paymentSettings={paymentSettings}
-          onSendWhatsApp={handleSendWhatsApp}
           onMarkPaid={handleMarkPaid}
           onOpenSettings={() => setSection('settings')}
-          isSendingWhatsApp={sendingWaOrderId === livePreviewOrder.id}
           isUpdatingPayment={updatingPaymentId === livePreviewOrder.id}
         />
       )}
+
+      {/* Test Payment QR Modal */}
+      {testQrModalOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Test Payment QR Preview"
+        >
+          <div className="bg-white rounded-3xl border border-neutral-200 max-w-sm w-full p-6 space-y-4 text-center shadow-2xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-extrabold text-neutral-900">
+                Test Payment QR (Sample ₹260)
+              </h3>
+              <button
+                type="button"
+                onClick={() => setTestQrModalOpen(false)}
+                aria-label="Close test QR modal"
+                className="w-9 h-9 rounded-xl border border-neutral-200 flex items-center justify-center text-neutral-600 hover:bg-neutral-50 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {paymentDraft.payment_mode === 'uploaded_qr' ? (
+              paymentDraft.qr_image_url ? (
+                <div className="space-y-3">
+                  <div className="p-3 bg-white rounded-2xl border-2 border-neutral-900 inline-flex items-center justify-center">
+                    <img
+                      src={paymentDraft.qr_image_url}
+                      alt="Uploaded restaurant payment QR"
+                      className="w-56 h-56 object-contain bg-white"
+                    />
+                  </div>
+                  <p className="text-sm font-extrabold text-neutral-900">
+                    {paymentDraft.merchant_name || 'RikZen Fast Food'}
+                  </p>
+                  <p className="text-xs text-neutral-600">
+                    Scan with PhonePe / GPay / Paytm and enter{' '}
+                    <span className="font-mono font-bold text-neutral-900">₹260</span> to verify
+                    this QR works cleanly on customer phones.
+                  </p>
+                </div>
+              ) : (
+                <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl p-4">
+                  No uploaded payment QR image yet. Upload your QR screenshot first to test it.
+                </p>
+              )
+            ) : isValidUpiId(paymentDraft.upi_id) ? (
+              <div className="space-y-3">
+                <div className="p-3 bg-white rounded-2xl border-2 border-neutral-900 inline-block">
+                  <QRCodeSVG
+                    value={buildDynamicUpiUri({
+                      upiId: paymentDraft.upi_id,
+                      merchantName: paymentDraft.merchant_name || 'RikZen Fast Food',
+                      amount: 260,
+                      orderCode: 'TEST260',
+                      tableNumber: 3,
+                    })}
+                    size={216}
+                    level="H"
+                    includeMargin={true}
+                    fgColor="#000000"
+                    bgColor="#FFFFFF"
+                  />
+                </div>
+                <p className="text-sm font-extrabold text-emerald-700">
+                  Exact ₹260 pre-filled automatically
+                </p>
+                <p className="text-xs font-mono text-neutral-600 break-all">
+                  {paymentDraft.upi_id.trim()}
+                </p>
+              </div>
+            ) : (
+              <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl p-4">
+                Enter a valid Restaurant UPI ID first to test Dynamic Exact-Amount UPI QR mode.
+              </p>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setTestQrModalOpen(false)}
+              className="w-full min-h-[44px] rounded-xl bg-neutral-900 text-white text-sm font-bold hover:bg-neutral-800 cursor-pointer"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      )}
     </div>
 
-    {/* Dedicated Print-Only Branded Table QR Cards Sheet (Tables 1–6 or Single Selected Table) */}
+    {/* Dedicated Print-Only Branded QR Cards Sheet (Main Website QR & Tables 1–6) */}
     <div className="hidden print:block bg-white text-neutral-900 p-4">
       <div
         className={`grid gap-6 ${
-          printTableNumbers.length === 1 ? 'grid-cols-1 max-w-md mx-auto' : 'grid-cols-2'
+          printQrTargets.length === 1 ? 'grid-cols-1 max-w-md mx-auto' : 'grid-cols-2'
         }`}
       >
-        {printTableNumbers.map((num) => (
-          <div
-            key={num}
-            className="rikzen-print-break-avoid border-2 border-neutral-900 rounded-3xl p-6 text-center flex flex-col items-center justify-between bg-white"
-          >
-            <div className="w-full rounded-2xl bg-[#151110] text-white py-3 px-4 mb-4">
-              <p className="font-display text-xl font-extrabold tracking-tight">
-                RIKZEN FAST FOOD
+        {printQrTargets.map((target) => {
+          const isMain = target === 'main';
+          const qrValue = isMain ? getMainMenuQrUrl() : getTableQrUrl(target);
+          return (
+            <div
+              key={String(target)}
+              className="rikzen-print-break-avoid border-2 border-neutral-900 rounded-3xl p-6 text-center flex flex-col items-center justify-between bg-white"
+            >
+              <div className="w-full rounded-2xl bg-[#151110] text-white py-3 px-4 mb-4">
+                <p className="font-display text-xl font-extrabold tracking-tight">
+                  RIKZEN FAST FOOD
+                </p>
+                <p className="text-[11px] text-amber-200 font-semibold">
+                  Fresh · Fast · Delicious
+                </p>
+              </div>
+
+              <div className="px-6 py-1.5 rounded-xl bg-[#E5391B] text-white font-display text-2xl font-extrabold mb-3">
+                {isMain ? 'MAIN MENU' : `TABLE ${target}`}
+              </div>
+
+              <p className="text-base font-extrabold text-neutral-900 mb-3">Scan to Order</p>
+
+              <div className="p-3 bg-white border-2 border-neutral-900 rounded-2xl mb-4">
+                <QRCodeSVG
+                  value={qrValue}
+                  size={printQrTargets.length === 1 ? 260 : 200}
+                  level="H"
+                  includeMargin={true}
+                  fgColor="#000000"
+                  bgColor="#FFFFFF"
+                />
+              </div>
+
+              <p className="text-xs font-bold text-emerald-700">
+                NO LOGIN REQUIRED · SCAN · ORDER · ENJOY
               </p>
-              <p className="text-[11px] text-amber-200 font-semibold">
-                Fresh · Fast · Delicious
+              <p className="text-[11px] font-mono text-neutral-500 mt-1">
+                {isMain ? '/menu' : `/menu?table=${target}`}
               </p>
             </div>
-
-            <div className="px-6 py-1.5 rounded-xl bg-[#E5391B] text-white font-display text-2xl font-extrabold mb-3">
-              TABLE {num}
-            </div>
-
-            <p className="text-base font-extrabold text-neutral-900 mb-3">Scan to Order</p>
-
-            <div className="p-3 bg-white border-2 border-neutral-900 rounded-2xl mb-4">
-              <QRCodeSVG
-                value={getTableQrUrl(num)}
-                size={printTableNumbers.length === 1 ? 260 : 200}
-                level="H"
-                includeMargin={true}
-                fgColor="#000000"
-                bgColor="#FFFFFF"
-              />
-            </div>
-
-            <p className="text-xs font-bold text-emerald-700">
-              No Login Required · Instant Menu &amp; UPI Bill
-            </p>
-            <p className="text-[11px] font-mono text-neutral-500 mt-1">/menu?table={num}</p>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
     </>

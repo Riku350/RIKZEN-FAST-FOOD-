@@ -585,7 +585,8 @@ async function ensureStoredBillPdf(
 
   const qrSnapshot: PaymentQrSnapshot =
     (!options.forceRegenerate && (params.existingQrSnapshot || existingDiskSnapshot?.payment_qr_snapshot)) ||
-    createPaymentQrSnapshot(livePaymentSettings, {
+    createPaymentQrSnapshot({
+      settings: livePaymentSettings,
       amount: params.total,
       orderCode: storage.orderCode,
       tableNumber: params.tableNumber,
