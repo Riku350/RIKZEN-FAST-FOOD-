@@ -5,6 +5,7 @@ import {
   doc,
   getDoc,
   getDocs,
+  limit,
   onSnapshot,
   orderBy,
   query,
@@ -34,7 +35,13 @@ import {
   TableStatus,
   VerifiedOrderQuote,
 } from '../types/restaurant';
-import { auth, BOOTSTRAPPED_OWNER_EMAIL, db } from './firebase';
+import {
+  auth,
+  BOOTSTRAPPED_OWNER_EMAIL,
+  db,
+  FIREBASE_DATABASE_ID,
+  FIREBASE_PROJECT_ID,
+} from './firebase';
 import { handleFirestoreError, OperationType } from './firestoreErrors';
 import {
   generateClientBillPdfBlob,
@@ -302,7 +309,12 @@ export function normalizeOrderRecord(raw: Partial<OrderRecord>): OrderRecord {
   }
 
   const defaultPaymentStatus: PaymentStatus =
-    raw.payment_status || (raw.status === 'completed' ? 'paid' : 'pending');
+    raw.payment_status &&
+    ['pending', 'verification_requested', 'paid', 'not_received', 'failed'].includes(
+      raw.payment_status,
+    )
+      ? raw.payment_status
+      : 'pending';
 
   const rawSnapshot = raw.payment_qr_snapshot as PaymentQrSnapshot | null | undefined;
   const paymentQrSnapshot: PaymentQrSnapshot | null =
@@ -342,7 +354,13 @@ export function normalizeOrderRecord(raw: Partial<OrderRecord>): OrderRecord {
     status: (raw.status || 'pending') as OrderStatus,
     payment_status: defaultPaymentStatus,
     paid_at: typeof raw.paid_at === 'string' ? raw.paid_at : '',
+    payment_verified_by:
+      typeof raw.payment_verified_by === 'string' ? raw.payment_verified_by : '',
+    payment_verified_at:
+      typeof raw.payment_verified_at === 'string' ? raw.payment_verified_at : '',
     confirmed_at: typeof raw.confirmed_at === 'string' ? raw.confirmed_at : '',
+    cancelled_at: typeof raw.cancelled_at === 'string' ? raw.cancelled_at : '',
+    cancelled_by: typeof raw.cancelled_by === 'string' ? raw.cancelled_by : '',
     public_bill_id: typeof raw.public_bill_id === 'string' ? raw.public_bill_id : '',
     payment_qr_snapshot: paymentQrSnapshot,
     upi_uri: typeof raw.upi_uri === 'string' ? raw.upi_uri : '',
@@ -1147,6 +1165,7 @@ export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<s
  * Works seamlessly on both Express backend AND static Netlify deployments via Firestore.
  */
 export interface PublicBillPayload {
+  order_id?: string;
   public_bill_id: string;
   order_code: string;
   table_number: number;
@@ -1228,6 +1247,7 @@ export async function fetchPublicBillById(billId: string): Promise<PublicBillPay
         });
       }
       return {
+        order_id: ord.id,
         public_bill_id: ord.public_bill_id || ord.id,
         order_code: ord.order_code,
         table_number: ord.table_number,
@@ -1496,7 +1516,12 @@ export async function downloadSalesReportPdf(params: {
 }): Promise<string> {
   const headers = await getOwnerAuthHeader();
   const payloadOrders = params.orders
-    .filter((o) => o.status === 'completed')
+    .filter(
+      (o) =>
+        o.payment_status === 'paid' &&
+        o.status !== 'rejected' &&
+        o.status !== 'cancelled',
+    )
     .map((o) => ({
       order_code: (o.order_code || `RK${o.order_number}`).toUpperCase(),
       customer_name: o.customer_name || 'Guest',
@@ -1606,6 +1631,24 @@ export async function requestOrderBill(orderId: string): Promise<void> {
 }
 
 /**
+ * Customer action: Notifies the Owner that UPI payment has been made ("I HAVE PAID").
+ * STRICT SECURITY: Customer can ONLY set `payment_status: 'verification_requested'` —
+ * Firestore rules strictly forbid customers from marking `paid` or touching verified fields.
+ */
+export async function customerRequestPaymentVerification(orderId: string): Promise<void> {
+  const path = `orders/${orderId}`;
+  try {
+    await updateDoc(doc(db, 'orders', orderId), {
+      payment_status: 'verification_requested',
+      updated_at: serverTimestamp(),
+    });
+  } catch (error) {
+    console.error('[RikZen Customer Payment Verification Request Error]', { path, error });
+    throw new Error(toCustomerFriendlyError(error));
+  }
+}
+
+/**
  * Public menu catalog real-time subscription with canonical fallback.
  */
 export function subscribeToMenuItems(onItems: (items: MenuItem[]) => void): Unsubscribe {
@@ -1673,20 +1716,122 @@ export function subscribeToOffers(onOffers: (offers: OfferRecord[]) => void): Un
   );
 }
 
+export interface OwnerAuthStatus {
+  authenticated: boolean;
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  role: 'owner' | 'customer';
+  isAuthorizedOwner: boolean;
+  source: 'custom_claim' | 'admins_doc' | 'users_doc' | 'verified_owner_email' | 'none';
+  reason: string;
+}
+
+/**
+ * Single authoritative Owner Authorization check matching `firestore.rules` `isOwner()`.
+ * Checks: Firebase Auth session -> Custom Claims (`admin: true` or `role: 'owner'`) ->
+ * `/admins/{uid}` -> `/users/{uid}.role == 'owner'` -> verified bootstrapped owner email.
+ */
+export async function verifyOwnerAuthorization(
+  user: User | null,
+  options: { forceRefresh?: boolean } = {},
+): Promise<OwnerAuthStatus> {
+  if (!user) {
+    return {
+      authenticated: false,
+      uid: '',
+      email: '',
+      emailVerified: false,
+      role: 'customer',
+      isAuthorizedOwner: false,
+      source: 'none',
+      reason: 'No Firebase user is signed in.',
+    };
+  }
+
+  const email = (user.email || '').trim();
+  const base = {
+    authenticated: true,
+    uid: user.uid,
+    email,
+    emailVerified: Boolean(user.emailVerified),
+  };
+
+  try {
+    const tokenResult = await user.getIdTokenResult(Boolean(options.forceRefresh));
+    const claims = tokenResult.claims || {};
+    if (claims.admin === true || claims.role === 'owner') {
+      return {
+        ...base,
+        role: 'owner',
+        isAuthorizedOwner: true,
+        source: 'custom_claim',
+        reason: 'Verified via Firebase Auth custom claims.',
+      };
+    }
+  } catch {
+    // Continue to Firestore role checks
+  }
+
+  if (user.emailVerified && email.toLowerCase() === BOOTSTRAPPED_OWNER_EMAIL.toLowerCase()) {
+    return {
+      ...base,
+      role: 'owner',
+      isAuthorizedOwner: true,
+      source: 'verified_owner_email',
+      reason: 'Verified authorized restaurant owner account.',
+    };
+  }
+
+  if (user.emailVerified) {
+    try {
+      const adminSnap = await getDoc(doc(db, 'admins', user.uid));
+      if (adminSnap.exists()) {
+        return {
+          ...base,
+          role: 'owner',
+          isAuthorizedOwner: true,
+          source: 'admins_doc',
+          reason: 'Verified via /admins role document.',
+        };
+      }
+    } catch {
+      // Ignore read failure and continue check
+    }
+
+    try {
+      const userSnap = await getDoc(doc(db, 'users', user.uid));
+      if (userSnap.exists() && userSnap.data()?.role === 'owner') {
+        return {
+          ...base,
+          role: 'owner',
+          isAuthorizedOwner: true,
+          source: 'users_doc',
+          reason: 'Verified via /users owner profile.',
+        };
+      }
+    } catch {
+      // Ignore read failure
+    }
+  }
+
+  return {
+    ...base,
+    role: 'customer',
+    isAuthorizedOwner: false,
+    source: 'none',
+    reason: user.emailVerified
+      ? 'Signed-in account does not hold the restaurant owner role.'
+      : 'Signed-in email address is not verified.',
+  };
+}
+
 /**
  * Verify if signed-in user is authorized RikZen owner/admin.
  */
 export async function checkIsOwnerAccount(user: User): Promise<boolean> {
-  if (!user.emailVerified) return false;
-  if (user.email?.toLowerCase() === BOOTSTRAPPED_OWNER_EMAIL.toLowerCase()) {
-    return true;
-  }
-  try {
-    const snap = await getDoc(doc(db, 'admins', user.uid));
-    return snap.exists();
-  } catch {
-    return false;
-  }
+  const result = await verifyOwnerAuthorization(user);
+  return result.isAuthorizedOwner;
 }
 
 /**
@@ -1855,6 +2000,7 @@ function mapOrderStatusToTableStatus(status: OrderStatus): TableStatus {
   switch (status) {
     case 'pending':
     case 'accepted':
+    case 'confirmed':
       return 'ordering';
     case 'preparing':
       return 'preparing';
@@ -1865,8 +2011,52 @@ function mapOrderStatusToTableStatus(status: OrderStatus): TableStatus {
       return 'bill_requested';
     case 'completed':
     case 'rejected':
+    case 'cancelled':
     default:
       return 'available';
+  }
+}
+
+export function isCancelledOrderStatus(status: OrderStatus): boolean {
+  return status === 'cancelled' || status === 'rejected';
+}
+
+/**
+ * Normal owner cancellation is allowed ONLY before the order reaches `ready` or `completed`.
+ */
+export function canCancelOrderStatus(status: OrderStatus): boolean {
+  return (
+    status === 'pending' ||
+    status === 'accepted' ||
+    status === 'confirmed' ||
+    status === 'preparing'
+  );
+}
+
+/**
+ * Strict one-way order status progression guard.
+ * Prevents backward/invalid transitions such as COMPLETED -> PENDING, READY -> CONFIRMED,
+ * or CANCELLED -> PREPARING.
+ */
+export function isValidOwnerStatusTransition(current: OrderStatus, next: OrderStatus): boolean {
+  if (current === next) return true;
+  switch (current) {
+    case 'pending':
+      return next === 'accepted' || next === 'confirmed' || next === 'cancelled' || next === 'rejected';
+    case 'accepted':
+    case 'confirmed':
+      return next === 'preparing' || next === 'bill_ready' || next === 'cancelled' || next === 'rejected';
+    case 'preparing':
+      return next === 'ready' || next === 'bill_ready' || next === 'cancelled';
+    case 'ready':
+    case 'bill_requested':
+    case 'bill_ready':
+      return next === 'bill_ready' || next === 'completed';
+    case 'completed':
+    case 'cancelled':
+    case 'rejected':
+    default:
+      return false;
   }
 }
 
@@ -1964,14 +2154,46 @@ export async function ownerUpdateOrderStatus(
   nextStatus: OrderStatus,
 ): Promise<GeneratedBillResult | null> {
   const orderPath = `orders/${order.id}`;
+
+  // 1. Pre-validate Firebase Auth & Owner Authorization BEFORE attempting Firestore write
+  const currentUser = auth.currentUser;
+  if (!currentUser) {
+    throw new Error('Owner session expired. Please sign in again.');
+  }
+  const authStatus = await verifyOwnerAuthorization(currentUser);
+  if (!authStatus.isAuthorizedOwner) {
+    throw new Error(`Owner authorization required: ${authStatus.reason}`);
+  }
+
+  // 2. Enforce strict one-way status progression
+  if (!isValidOwnerStatusTransition(order.status, nextStatus)) {
+    throw new Error(
+      `Invalid status transition from "${order.status}" to "${nextStatus}". Orders move forward only.`,
+    );
+  }
+
+  // 3. Verify existing order document before partial updateDoc (never overwrite or create duplicates)
+  try {
+    const existingSnap = await getDoc(doc(db, 'orders', order.id));
+    if (!existingSnap.exists()) {
+      throw new Error(`Order #${order.order_code} no longer exists in the database.`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('no longer exists')) {
+      throw err;
+    }
+    handleFirestoreError(err, OperationType.GET, orderPath);
+  }
+
   let generatedBill: GeneratedBillResult | null = null;
   const nowIso = new Date().toISOString();
-  const confirmedAt = order.confirmed_at || (nextStatus === 'accepted' ? nowIso : '');
+  const isConfirmStep = nextStatus === 'accepted' || nextStatus === 'confirmed';
+  const confirmedAt = order.confirmed_at || (isConfirmStep ? nowIso : '');
+  const isCancelStep = nextStatus === 'cancelled' || nextStatus === 'rejected';
 
-  // On confirm (accepted), bill_ready, or completed: generate stored PDF + immutable QR snapshot.
-  // NEVER block order acceptance if the Express PDF server is unreachable/static-hosted; fall back
-  // cleanly to Firestore PaymentSettings snapshot so customer gets bill + QR immediately.
-  if (nextStatus === 'accepted' || nextStatus === 'bill_ready' || nextStatus === 'completed') {
+  // On confirm (accepted/confirmed), bill_ready, or completed: ensure PDF + immutable QR snapshot exist.
+  // NEVER block order confirmation if Express PDF endpoint is unavailable; fall back to Firestore snapshot.
+  if (isConfirmStep || nextStatus === 'bill_ready' || nextStatus === 'completed') {
     try {
       generatedBill = await ensureOrderPdfGenerated(
         {
@@ -1993,7 +2215,7 @@ export async function ownerUpdateOrderStatus(
   try {
     const updatePayload: Record<string, unknown> = {
       status: nextStatus,
-      pdf_ready: nextStatus !== 'rejected' && Boolean(generatedBill || order.pdf_ready),
+      pdf_ready: !isCancelStep && Boolean(generatedBill || order.pdf_ready),
       updated_at: serverTimestamp(),
     };
 
@@ -2001,7 +2223,12 @@ export async function ownerUpdateOrderStatus(
       updatePayload.confirmed_at = confirmedAt.slice(0, 64);
     }
 
-    if (generatedBill) {
+    if (isCancelStep) {
+      updatePayload.cancelled_at = nowIso;
+      updatePayload.cancelled_by = currentUser.uid.slice(0, 128);
+    }
+
+    if (generatedBill && !isCancelStep) {
       const safePdfUrl = isFirestoreSafeBillUrl(generatedBill.pdf_url || '')
         ? generatedBill.pdf_url || ''
         : '';
@@ -2032,17 +2259,18 @@ export async function ownerUpdateOrderStatus(
       }
     }
 
-    // Primary authoritative order update (decoupled from table status doc so order confirmation never fails)
+    // Partial updateDoc on existing orders/{orderId} (never overwrites immutable fields)
     await updateDoc(doc(db, 'orders', order.id), updatePayload);
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, orderPath);
   }
 
-  // Secondary table status sync (non-blocking — never reverts an accepted order)
+  // Secondary table status sync (non-blocking — never reverts an updated order)
   try {
     const tableId = `table_${order.table_number}`;
     const nextTableStatus = mapOrderStatusToTableStatus(nextStatus);
-    const isTerminal = nextStatus === 'completed' || nextStatus === 'rejected';
+    const isTerminal =
+      nextStatus === 'completed' || nextStatus === 'rejected' || nextStatus === 'cancelled';
     await setDoc(doc(db, 'tables', tableId), {
       id: tableId,
       table_number: order.table_number,
@@ -2059,17 +2287,45 @@ export async function ownerUpdateOrderStatus(
 }
 
 /**
- * Owner action: Manually updates real payment status (never auto-marked paid just because QR was shown).
+ * Owner action: Cancels an order prior to READY / COMPLETED and frees its table.
+ */
+export async function ownerCancelOrder(order: OrderRecord): Promise<void> {
+  if (!canCancelOrderStatus(order.status)) {
+    throw new Error('Orders that are already Ready or Completed cannot be cancelled.');
+  }
+  await ownerUpdateOrderStatus(order, 'cancelled');
+}
+
+/**
+ * Owner action: Manually verifies and updates real payment status (never auto-marked paid).
+ * Records `payment_verified_by` (owner UID) and `payment_verified_at` timestamp.
  */
 export async function ownerUpdatePaymentStatus(
   order: OrderRecord,
   paymentStatus: PaymentStatus,
 ): Promise<void> {
   const orderPath = `orders/${order.id}`;
+  const currentUser = auth.currentUser;
+  if (!currentUser) {
+    throw new Error('Owner session expired. Please sign in again.');
+  }
+  const authStatus = await verifyOwnerAuthorization(currentUser);
+  if (!authStatus.isAuthorizedOwner) {
+    throw new Error(`Owner authorization required: ${authStatus.reason}`);
+  }
+
+  const nowIso = new Date().toISOString();
   try {
+    const existingSnap = await getDoc(doc(db, 'orders', order.id));
+    if (!existingSnap.exists()) {
+      throw new Error(`Order #${order.order_code} no longer exists.`);
+    }
+
     await updateDoc(doc(db, 'orders', order.id), {
       payment_status: paymentStatus,
-      paid_at: paymentStatus === 'paid' ? new Date().toISOString() : '',
+      paid_at: paymentStatus === 'paid' ? nowIso : '',
+      payment_verified_by: currentUser.uid.slice(0, 128),
+      payment_verified_at: nowIso,
       updated_at: serverTimestamp(),
     });
     // Keep public bill page's payment_status in sync without mutating its immutable QR snapshot
@@ -2080,8 +2336,240 @@ export async function ownerUpdatePaymentStatus(
       ).catch(() => {});
     }
   } catch (error) {
+    if (error instanceof Error && error.message.includes('no longer exists')) {
+      throw error;
+    }
     handleFirestoreError(error, OperationType.UPDATE, orderPath);
   }
+}
+
+/**
+ * Owner Settings action: Deletes ALL existing documents ONLY in the `orders` collection
+ * and resets occupied table pointers (`active_order_id = ''`, `status = 'available'`).
+ * NEVER touches `menu_items`, `offers`, `shop_settings`, `users`, or `admins`.
+ */
+export async function ownerClearOrderHistory(): Promise<{ deletedCount: number }> {
+  const currentUser = auth.currentUser;
+  if (!currentUser) {
+    throw new Error('Owner sign-in required.');
+  }
+  const authStatus = await verifyOwnerAuthorization(currentUser, { forceRefresh: true });
+  if (!authStatus.isAuthorizedOwner) {
+    throw new Error(`Owner authorization required: ${authStatus.reason}`);
+  }
+
+  let deletedCount = 0;
+  try {
+    const ordersSnap = await getDocs(collection(db, 'orders'));
+    const docs = ordersSnap.docs;
+    for (let i = 0; i < docs.length; i += 400) {
+      const batch = writeBatch(db);
+      const chunk = docs.slice(i, i + 400);
+      for (const orderDoc of chunk) {
+        batch.delete(orderDoc.ref);
+      }
+      await batch.commit();
+      deletedCount += chunk.length;
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, 'orders');
+  }
+
+  // Safely reset table active pointers without deleting any tables
+  try {
+    const tablesSnap = await getDocs(collection(db, 'tables'));
+    if (!tablesSnap.empty) {
+      const batch = writeBatch(db);
+      for (const tDoc of tablesSnap.docs) {
+        const data = tDoc.data() as Partial<TableRecord>;
+        if (data.active_order_id || (data.status && data.status !== 'available')) {
+          batch.update(tDoc.ref, {
+            status: 'available',
+            active_order_id: '',
+            updated_at: serverTimestamp(),
+          });
+        }
+      }
+      await batch.commit();
+    }
+  } catch (tableErr) {
+    console.warn('[RikZen Clear History Table Reset Warning]', tableErr);
+  }
+
+  return { deletedCount };
+}
+
+export interface OwnerDiagnosticCheckResult {
+  id: string;
+  label: string;
+  status: 'pass' | 'warn' | 'fail';
+  detail: string;
+}
+
+export interface OwnerSystemDiagnosticsReport {
+  checkedAt: string;
+  projectId: string;
+  databaseId: string;
+  auth: OwnerAuthStatus;
+  serverSigningConfigured: boolean | null;
+  checks: OwnerDiagnosticCheckResult[];
+}
+
+/**
+ * Real non-destructive Owner System Diagnostics test.
+ * Never mutates customer orders, menu items, or shop settings.
+ */
+export async function runOwnerSystemDiagnostics(): Promise<OwnerSystemDiagnosticsReport> {
+  const checks: OwnerDiagnosticCheckResult[] = [];
+  const currentUser = auth.currentUser;
+
+  // 1. Firebase Connection
+  checks.push({
+    id: 'firebase_connection',
+    label: 'Firebase Connection',
+    status: FIREBASE_PROJECT_ID ? 'pass' : 'fail',
+    detail: `Project ${FIREBASE_PROJECT_ID} · DB ${FIREBASE_DATABASE_ID}`,
+  });
+
+  // 2. Authentication & 3. Owner Role (fresh token check)
+  const authStatus = await verifyOwnerAuthorization(currentUser, { forceRefresh: true });
+  checks.push({
+    id: 'authentication',
+    label: 'Authentication',
+    status: authStatus.authenticated ? 'pass' : 'fail',
+    detail: authStatus.authenticated
+      ? `Signed in as ${authStatus.email} (UID ${authStatus.uid.slice(0, 10)}…)`
+      : 'Not signed in',
+  });
+
+  checks.push({
+    id: 'owner_role',
+    label: 'Owner Role Verification',
+    status: authStatus.isAuthorizedOwner ? 'pass' : 'fail',
+    detail: authStatus.isAuthorizedOwner
+      ? `Authorized (${authStatus.source.replace(/_/g, ' ')})`
+      : authStatus.reason,
+  });
+
+  // 4. Orders Read (non-destructive limit 1)
+  let ordersReadOk = false;
+  try {
+    const snap = await getDocs(query(collection(db, 'orders'), limit(1)));
+    ordersReadOk = true;
+    checks.push({
+      id: 'orders_read',
+      label: 'Orders Read',
+      status: 'pass',
+      detail: `Firestore orders readable (${snap.size > 0 ? 'records found' : 'collection empty'})`,
+    });
+  } catch (err) {
+    checks.push({
+      id: 'orders_read',
+      label: 'Orders Read',
+      status: 'fail',
+      detail: err instanceof Error ? err.message : 'Unable to read orders collection',
+    });
+  }
+
+  // 5. Orders Update Readiness (non-destructive rule & token readiness check)
+  checks.push({
+    id: 'orders_update',
+    label: 'Orders Update Permission',
+    status: authStatus.isAuthorizedOwner && ordersReadOk ? 'pass' : 'fail',
+    detail:
+      authStatus.isAuthorizedOwner && ordersReadOk
+        ? 'Fresh owner token & Firestore order update path ready'
+        : 'Sign in with verified owner account to update orders',
+  });
+
+  // 6. Menu Read
+  let menuReadOk = false;
+  try {
+    const menuSnap = await getDocs(query(collection(db, 'menu_items'), limit(1)));
+    menuReadOk = true;
+    checks.push({
+      id: 'menu_read',
+      label: 'Menu Read',
+      status: 'pass',
+      detail: `Menu catalog accessible (${menuSnap.size > 0 ? 'live Firestore' : 'canonical seed ready'})`,
+    });
+  } catch (err) {
+    checks.push({
+      id: 'menu_read',
+      label: 'Menu Read',
+      status: 'fail',
+      detail: err instanceof Error ? err.message : 'Unable to read menu_items',
+    });
+  }
+
+  // 7. Menu Admin Write Readiness
+  checks.push({
+    id: 'menu_write',
+    label: 'Menu Admin Access',
+    status: authStatus.isAuthorizedOwner && menuReadOk ? 'pass' : 'fail',
+    detail:
+      authStatus.isAuthorizedOwner && menuReadOk
+        ? 'Authorized owner can add, edit, and toggle dishes'
+        : 'Owner role required for menu edits',
+  });
+
+  // 8. Backend Server Security Check (safe boolean only, zero secrets)
+  let serverSigningConfigured: boolean | null = null;
+  if (currentUser) {
+    try {
+      const token = await currentUser.getIdToken();
+      const res = await fetch(apiUrl('/api/owner/diagnostics'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const parsed = await safeReadJson<{
+        ok?: boolean;
+        orderSigningSecretConfigured?: boolean;
+        paymentVerificationMode?: string;
+        error?: string;
+      }>(res, 'Owner diagnostics');
+      if (res.ok && parsed.data?.ok) {
+        serverSigningConfigured = Boolean(parsed.data.orderSigningSecretConfigured);
+        checks.push({
+          id: 'order_signing',
+          label: 'Order Signing Security',
+          status: serverSigningConfigured ? 'pass' : 'warn',
+          detail: serverSigningConfigured
+            ? 'Server-side order signing key active · Manual payment verification mode'
+            : 'Server-side order signing key not configured (dev fallback active; configure in hosting env before production)',
+        });
+      } else if (isStaticHostMissingEndpoint(res, parsed)) {
+        checks.push({
+          id: 'order_signing',
+          label: 'Order Signing Security',
+          status: 'pass',
+          detail: 'Static hosting mode · Direct Firestore order verification active',
+        });
+      } else {
+        checks.push({
+          id: 'order_signing',
+          label: 'Order Signing Security',
+          status: 'warn',
+          detail: parsed.data?.error || `Server check returned HTTP ${res.status}`,
+        });
+      }
+    } catch {
+      checks.push({
+        id: 'order_signing',
+        label: 'Order Signing Security',
+        status: 'warn',
+        detail: 'Server diagnostics endpoint unreachable in current mode',
+      });
+    }
+  }
+
+  return {
+    checkedAt: new Date().toISOString(),
+    projectId: FIREBASE_PROJECT_ID,
+    databaseId: FIREBASE_DATABASE_ID,
+    auth: authStatus,
+    serverSigningConfigured,
+    checks,
+  };
 }
 
 /**

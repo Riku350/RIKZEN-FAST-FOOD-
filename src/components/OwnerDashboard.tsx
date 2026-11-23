@@ -36,6 +36,7 @@ import {
   Settings,
   Share2,
   ShieldAlert,
+  ShieldCheck,
   Square,
   Tag,
   Trash2,
@@ -54,26 +55,39 @@ import {
   TABLE_NUMBERS,
 } from '../data/menuCatalog';
 import { shareBillNative } from '../lib/billShare';
-import { auth, BOOTSTRAPPED_OWNER_EMAIL, googleProvider } from '../lib/firebase';
 import {
-  checkIsOwnerAccount,
+  auth,
+  BOOTSTRAPPED_OWNER_EMAIL,
+  FIREBASE_DATABASE_ID,
+  FIREBASE_PROJECT_ID,
+  googleProvider,
+} from '../lib/firebase';
+import {
+  canCancelOrderStatus,
   downloadOrderBillPdf,
   downloadSalesReportPdf,
   ensureOrderPdfGenerated,
   formatIndianMobileDisplay,
+  formatOrderDate,
   formatRelativeTime,
   formatRupees,
   getTableQrUrl,
+  isCancelledOrderStatus,
+  OwnerAuthStatus,
+  ownerCancelOrder,
+  ownerClearOrderHistory,
   ownerDeleteMenuItem,
   ownerDeleteOffer,
   ownerDeletePaymentQr,
   ownerSavePaymentSettings,
+  OwnerSystemDiagnosticsReport,
   ownerToggleMenuItemAvailability,
   ownerToggleOfferActive,
   ownerUpdateOrderStatus,
   ownerUpdatePaymentStatus,
   ownerUploadPaymentQrImage,
   playKitchenAlertChime,
+  runOwnerSystemDiagnostics,
   seedOwnerShopDataIfNeeded,
   subscribeToAllOrders,
   subscribeToMenuItems,
@@ -83,6 +97,7 @@ import {
   syncCatalogToServer,
   syncPaymentSettingsToServer,
   timestampToDate,
+  verifyOwnerAuthorization,
 } from '../lib/orderService';
 import {
   buildHourlySalesSeries,
@@ -210,17 +225,21 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   const [authReady, setAuthReady] = useState(false);
   const [user, setUser] = useState<User | null>(null);
   const [isOwner, setIsOwner] = useState(false);
+  const [ownerAuthStatus, setOwnerAuthStatus] = useState<OwnerAuthStatus | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const [isSigningIn, setIsSigningIn] = useState(false);
 
-  // Navigation & filter state
-  const [section, setSection] = useState<OwnerSection>('dashboard');
+  // Navigation & filter state (with browser history support for Back button)
+  const [section, setSectionState] = useState<OwnerSection>('dashboard');
+  const [sectionStack, setSectionStack] = useState<OwnerSection[]>([]);
   const [orderFilter, setOrderFilter] = useState<OrderFilter>('all_active');
   const [orders, setOrders] = useState<OrderRecord[]>([]);
   const [tables, setTables] = useState<TableRecord[]>([]);
   const [menuItems, setMenuItems] = useState<MenuItem[]>(CANONICAL_MENU_ITEMS);
   const [offers, setOffers] = useState<OfferRecord[]>(CANONICAL_OFFERS);
   const [dataError, setDataError] = useState<string | null>(null);
+  const [retryingDiagnostic, setRetryingDiagnostic] = useState(false);
+  const lastFailedActionRef = useRef<(() => Promise<void>) | null>(null);
 
   // Action busy states
   const [busyOrderId, setBusyOrderId] = useState<string | null>(null);
@@ -230,6 +249,16 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   const [billErrors, setBillErrors] = useState<Record<string, string>>({});
   const [confirmDeleteItemId, setConfirmDeleteItemId] = useState<string | null>(null);
   const [confirmDeleteOfferId, setConfirmDeleteOfferId] = useState<string | null>(null);
+
+  // Order Cancellation modal state
+  const [cancelModalOrder, setCancelModalOrder] = useState<OrderRecord | null>(null);
+  const [cancellingOrder, setCancellingOrder] = useState(false);
+
+  // Clear Order History modal & System Diagnostics state (Admin Settings)
+  const [clearHistoryModalOpen, setClearHistoryModalOpen] = useState(false);
+  const [clearingHistory, setClearingHistory] = useState(false);
+  const [diagnosticsReport, setDiagnosticsReport] = useState<OwnerSystemDiagnosticsReport | null>(null);
+  const [runningDiagnostics, setRunningDiagnostics] = useState(false);
 
   // Honest 2-mode Payment Settings state (Uploaded Payment QR OR Dynamic Exact-Amount UPI QR)
   const [paymentSettings, setPaymentSettings] = useState<PaymentSettings>(DEFAULT_PAYMENT_SETTINGS);
@@ -322,9 +351,59 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     };
   }, [isOwner]);
 
+  const setSection = (nextSection: OwnerSection) => {
+    if (nextSection === section) {
+      if (selectedTableNum !== null) setSelectedTableNum(null);
+      return;
+    }
+    setSelectedTableNum(null);
+    setSectionStack((prev) => [...prev.slice(-12), section]);
+    setSectionState(nextSection);
+    try {
+      const state = { rikzenOwnerSection: nextSection };
+      window.history.pushState(state, '', window.location.pathname + window.location.search);
+    } catch {
+      // Ignore history errors in restricted frames
+    }
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleAdminBack = () => {
+    if (selectedTableNum !== null) {
+      setSelectedTableNum(null);
+      return;
+    }
+    if (sectionStack.length > 0) {
+      const prevSection = sectionStack[sectionStack.length - 1];
+      setSectionStack((prev) => prev.slice(0, -1));
+      setSectionState(prevSection);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
+    if (section !== 'dashboard') {
+      setSectionState('dashboard');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
+  useEffect(() => {
+    const onPopState = (ev: PopStateEvent) => {
+      const st = ev.state as { rikzenOwnerSection?: OwnerSection } | null;
+      if (st?.rikzenOwnerSection) {
+        setSelectedTableNum(null);
+        setSectionState(st.rikzenOwnerSection);
+      } else if (section !== 'dashboard') {
+        setSelectedTableNum(null);
+        setSectionState('dashboard');
+      }
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [section]);
+
   const showToast = (msg: string) => {
     setToastMsg(msg);
-    window.setTimeout(() => setToastMsg((curr) => (curr === msg ? null : curr)), 2800);
+    window.setTimeout(() => setToastMsg((curr) => (curr === msg ? null : curr)), 3200);
   };
 
   useEffect(() => {
@@ -332,15 +411,16 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     return () => window.clearInterval(id);
   }, []);
 
-  // Auth listener
+  // Auth listener (authoritative role verification)
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (nextUser) => {
       setUser(nextUser);
       setAuthError(null);
       if (nextUser) {
-        const verified = await checkIsOwnerAccount(nextUser);
-        setIsOwner(verified);
-        if (verified) {
+        const status = await verifyOwnerAuthorization(nextUser);
+        setOwnerAuthStatus(status);
+        setIsOwner(status.isAuthorizedOwner);
+        if (status.isAuthorizedOwner) {
           try {
             await seedOwnerShopDataIfNeeded(nextUser);
           } catch (err) {
@@ -348,6 +428,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
           }
         }
       } else {
+        setOwnerAuthStatus(null);
         setIsOwner(false);
       }
       setAuthReady(true);
@@ -581,26 +662,131 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     void voiceOrderAlertManager.unlockOnUserGesture();
     setBusyOrderId(order.id);
     setDataError(null);
+    lastFailedActionRef.current = null;
     try {
       await ownerUpdateOrderStatus(order, nextStatus);
-      if (nextStatus === 'accepted') {
+      if (nextStatus === 'accepted' || nextStatus === 'confirmed') {
         showToast(`Order #${order.order_code} confirmed & customer bill is ready.`);
+      } else if (nextStatus === 'preparing') {
+        showToast(`Order #${order.order_code} is now preparing.`);
+      } else if (nextStatus === 'ready') {
+        showToast(`Order #${order.order_code} marked ready to serve.`);
       } else if (nextStatus === 'bill_ready') {
         showToast(`Bill ready for Table ${order.table_number}.`);
       } else if (nextStatus === 'completed') {
         showToast(`Table ${order.table_number} completed & available.`);
-      } else if (nextStatus === 'rejected') {
-        showToast(`Order #${order.order_code} rejected & table freed.`);
+      } else if (nextStatus === 'cancelled' || nextStatus === 'rejected') {
+        showToast(`Order #${order.order_code} cancelled & Table ${order.table_number} freed.`);
       }
       return true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Could not update order status.';
       console.error('[OwnerDashboard Status Update Error]', { orderId: order.id, nextStatus, err });
+      lastFailedActionRef.current = async () => {
+        await ownerUpdateOrderStatus(order, nextStatus);
+      };
       setDataError(msg);
       showToast(`Order update failed: ${msg}`);
       return false;
     } finally {
       setBusyOrderId(null);
+    }
+  };
+
+  const handleConfirmCancelOrder = async () => {
+    if (!cancelModalOrder || cancellingOrder) return;
+    const target = cancelModalOrder;
+    setCancellingOrder(true);
+    setDataError(null);
+    try {
+      await ownerCancelOrder(target);
+      setLiveAlertOrders((prev) => prev.filter((o) => o.id !== target.id));
+      setCancelModalOrder(null);
+      showToast(`Order #${target.order_code} cancelled. Customer notified.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Could not cancel order.';
+      lastFailedActionRef.current = async () => {
+        await ownerCancelOrder(target);
+      };
+      setDataError(msg);
+      showToast(`Cancel failed: ${msg}`);
+    } finally {
+      setCancellingOrder(false);
+    }
+  };
+
+  const handleDiagnosticRetry = async () => {
+    if (retryingDiagnostic) return;
+    setRetryingDiagnostic(true);
+    try {
+      const currentUser = auth.currentUser;
+      if (!currentUser) {
+        setDataError('Session expired. Please sign in again with your owner account.');
+        return;
+      }
+      // 1. Force refresh Firebase ID token and re-verify owner role
+      await currentUser.getIdToken(true);
+      const refreshedAuth = await verifyOwnerAuthorization(currentUser, { forceRefresh: true });
+      setOwnerAuthStatus(refreshedAuth);
+      setIsOwner(refreshedAuth.isAuthorizedOwner);
+      if (!refreshedAuth.isAuthorizedOwner) {
+        setDataError(`Owner authorization check failed: ${refreshedAuth.reason}`);
+        return;
+      }
+      // 2. Retry the exact failed operation if recorded
+      if (lastFailedActionRef.current) {
+        const retryFn = lastFailedActionRef.current;
+        await retryFn();
+        lastFailedActionRef.current = null;
+        setDataError(null);
+        showToast('Auth refreshed & failed action completed successfully.');
+      } else {
+        setDataError(null);
+        showToast('Owner session refreshed and verified.');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Retry failed.';
+      setDataError(msg);
+    } finally {
+      setRetryingDiagnostic(false);
+    }
+  };
+
+  const handleRunSystemTest = async () => {
+    if (runningDiagnostics) return;
+    setRunningDiagnostics(true);
+    try {
+      const report = await runOwnerSystemDiagnostics();
+      setDiagnosticsReport(report);
+      setOwnerAuthStatus(report.auth);
+      showToast('System diagnostic test completed.');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'System test failed.');
+    } finally {
+      setRunningDiagnostics(false);
+    }
+  };
+
+  const handleConfirmClearOrderHistory = async () => {
+    if (clearingHistory) return;
+    setClearingHistory(true);
+    setDataError(null);
+    try {
+      const { deletedCount } = await ownerClearOrderHistory();
+      setClearHistoryModalOpen(false);
+      setLiveAlertOrders([]);
+      setSelectedTableNum(null);
+      showToast(
+        deletedCount > 0
+          ? `✅ Order history cleared successfully (${deletedCount} orders removed).`
+          : '✅ Order history cleared successfully.',
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to clear order history.';
+      setDataError(msg);
+      showToast(`Clear history failed: ${msg}`);
+    } finally {
+      setClearingHistory(false);
     }
   };
 
@@ -683,11 +869,35 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     if (updatingPaymentId) return;
     setUpdatingPaymentId(order.id);
     setDataError(null);
+    lastFailedActionRef.current = null;
     try {
       await ownerUpdatePaymentStatus(order, 'paid');
-      showToast(`Payment marked as Paid for #${order.order_code}.`);
+      showToast(`✅ Payment verified & received for #${order.order_code}.`);
     } catch (err) {
-      setDataError(err instanceof Error ? err.message : 'Could not update payment status.');
+      const msg = err instanceof Error ? err.message : 'Could not update payment status.';
+      lastFailedActionRef.current = async () => {
+        await ownerUpdatePaymentStatus(order, 'paid');
+      };
+      setDataError(msg);
+    } finally {
+      setUpdatingPaymentId(null);
+    }
+  };
+
+  const handleMarkPaymentNotReceived = async (order: OrderRecord) => {
+    if (updatingPaymentId) return;
+    setUpdatingPaymentId(order.id);
+    setDataError(null);
+    lastFailedActionRef.current = null;
+    try {
+      await ownerUpdatePaymentStatus(order, 'not_received');
+      showToast(`Marked payment not received for #${order.order_code}. Customer notified.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Could not update payment status.';
+      lastFailedActionRef.current = async () => {
+        await ownerUpdatePaymentStatus(order, 'not_received');
+      };
+      setDataError(msg);
     } finally {
       setUpdatingPaymentId(null);
     }
@@ -852,7 +1062,10 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   const liveTableSummaries = useMemo(() => {
     const activeByTable = new Map<number, OrderRecord>();
     for (const order of orders) {
-      if (!['completed', 'rejected'].includes(order.status) && !activeByTable.has(order.table_number)) {
+      if (
+        !['completed', 'rejected', 'cancelled'].includes(order.status) &&
+        !activeByTable.has(order.table_number)
+      ) {
         activeByTable.set(order.table_number, order);
       }
     }
@@ -862,7 +1075,12 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
       const stored = tables.find((t) => t.table_number === num);
       let status: TableStatus = 'available';
       if (activeOrder) {
-        if (activeOrder.status === 'pending' || activeOrder.status === 'accepted') status = 'ordering';
+        if (
+          activeOrder.status === 'pending' ||
+          activeOrder.status === 'accepted' ||
+          activeOrder.status === 'confirmed'
+        )
+          status = 'ordering';
         else if (activeOrder.status === 'preparing') status = 'preparing';
         else if (activeOrder.status === 'ready') status = 'ready';
         else if (activeOrder.status === 'bill_requested' || activeOrder.status === 'bill_ready')
@@ -874,39 +1092,45 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     });
   }, [orders, tables]);
 
-  // Order Stage Counts & Real Completed-Only Revenue KPIs
+  // Order Stage Counts & Real Paid-Only Revenue KPIs
   const stats = useMemo(() => {
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
     const todayMs = startOfToday.getTime();
 
-    const todaysNonRejected = orders.filter(
-      (o) => timestampToDate(o.created_at).getTime() >= todayMs && o.status !== 'rejected',
+    const todaysActive = orders.filter(
+      (o) =>
+        timestampToDate(o.created_at).getTime() >= todayMs && !isCancelledOrderStatus(o.status),
     );
-    // STRICT REVENUE RULE: Only completed/paid orders count toward sales revenue
-    const todaysCompleted = todaysNonRejected.filter(isRevenueOrder);
-    const todaysSales = todaysCompleted.reduce((sum, o) => sum + o.total, 0);
-    const todaysDiscounts = todaysCompleted.reduce((sum, o) => sum + (o.discount || 0), 0);
+    // STRICT MANUAL PAYMENT REVENUE RULE: Only manually verified paid orders count toward revenue
+    const todaysPaidOrders = todaysActive.filter(isRevenueOrder);
+    const todaysSales = todaysPaidOrders.reduce((sum, o) => sum + o.total, 0);
+    const todaysDiscounts = todaysPaidOrders.reduce((sum, o) => sum + (o.discount || 0), 0);
 
     const newCount = orders.filter((o) => o.status === 'pending').length;
-    const preparingCount = orders.filter((o) => o.status === 'accepted' || o.status === 'preparing').length;
+    const preparingCount = orders.filter(
+      (o) => o.status === 'accepted' || o.status === 'confirmed' || o.status === 'preparing',
+    ).length;
     const readyCount = orders.filter((o) => o.status === 'ready').length;
-    const billReqCount = orders.filter((o) => o.status === 'bill_requested' || o.status === 'bill_ready').length;
+    const billReqCount = orders.filter(
+      (o) => o.status === 'bill_requested' || o.status === 'bill_ready',
+    ).length;
     const completedCount = orders.filter((o) => o.status === 'completed').length;
-    const todaysPaidCount = todaysNonRejected.filter((o) => o.payment_status === 'paid').length;
-    const todaysPendingPaymentCount = todaysNonRejected.filter(
+    const todaysPaidCount = todaysPaidOrders.length;
+    const todaysPendingPaymentCount = todaysActive.filter(
       (o) => o.payment_status !== 'paid',
     ).length;
     const activeTablesCount = liveTableSummaries.filter((t) => t.status !== 'available').length;
 
     return {
-      todaysOrders: todaysNonRejected.length,
-      todaysCompletedCount: todaysCompleted.length,
+      todaysOrders: todaysActive.length,
+      todaysCompletedCount: todaysPaidOrders.length,
       todaysPaidCount,
       todaysPendingPaymentCount,
       todaysSales,
       todaysDiscounts,
-      avgOrderValue: todaysCompleted.length > 0 ? Math.round(todaysSales / todaysCompleted.length) : 0,
+      avgOrderValue:
+        todaysPaidOrders.length > 0 ? Math.round(todaysSales / todaysPaidOrders.length) : 0,
       newCount,
       preparingCount,
       readyCount,
@@ -922,17 +1146,17 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     return orders.filter((o) => {
       switch (orderFilter) {
         case 'all_active':
-          return !['completed', 'rejected'].includes(o.status);
+          return !['completed', 'rejected', 'cancelled'].includes(o.status);
         case 'pending':
           return o.status === 'pending';
         case 'preparing':
-          return o.status === 'accepted' || o.status === 'preparing';
+          return o.status === 'accepted' || o.status === 'confirmed' || o.status === 'preparing';
         case 'ready':
           return o.status === 'ready';
         case 'bill_requested':
           return o.status === 'bill_requested' || o.status === 'bill_ready';
         case 'completed':
-          return o.status === 'completed' || o.status === 'rejected';
+          return o.status === 'completed' || isCancelledOrderStatus(o.status);
         default:
           return true;
       }
@@ -940,9 +1164,26 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   }, [orders, orderFilter]);
 
   const billOrders = useMemo(
-    () => orders.filter((o) => o.status !== 'rejected'),
+    () => orders.filter((o) => !isCancelledOrderStatus(o.status)),
     [orders],
   );
+
+  // Manual Payment Verification Queue: Verification Requested first, then Pending / Not Received
+  const paymentVerificationQueue = useMemo(() => {
+    return orders
+      .filter(
+        (o) =>
+          !isCancelledOrderStatus(o.status) &&
+          o.status !== 'pending' &&
+          o.payment_status !== 'paid',
+      )
+      .sort((a, b) => {
+        const aReq = a.payment_status === 'verification_requested' ? 0 : 1;
+        const bReq = b.payment_status === 'verification_requested' ? 0 : 1;
+        if (aReq !== bReq) return aReq - bReq;
+        return timestampToDate(b.created_at).getTime() - timestampToDate(a.created_at).getTime();
+      });
+  }, [orders]);
 
   const handleQuickDailyReportDownload = async () => {
     if (quickReportBusy) return;
@@ -1141,20 +1382,46 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
 
       {/* Main App Area */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Clean Sticky Header */}
-        <header className="sticky top-0 z-30 h-16 bg-white/95 backdrop-blur-md border-b border-neutral-200 px-4 sm:px-6 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3 min-w-0">
-            <span className="lg:hidden font-display text-lg font-extrabold tracking-tight text-neutral-900 whitespace-nowrap">
-              RikZen <span className="text-[#E5391B]">Fast Food</span>
+        {/* Clean Sticky Header with Back Button on Sub-Pages */}
+        <header className="sticky top-0 z-30 h-16 bg-white/95 backdrop-blur-md border-b border-neutral-200 px-4 sm:px-6 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 min-w-0">
+            {(section !== 'dashboard' || selectedTableNum !== null) && (
+              <button
+                type="button"
+                onClick={handleAdminBack}
+                className="min-h-[38px] px-3 py-1.5 rounded-xl bg-neutral-100 hover:bg-neutral-200 text-neutral-900 text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer shrink-0"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                <span>{selectedTableNum !== null ? 'Back' : 'Back'}</span>
+              </button>
+            )}
+            <span className="lg:hidden font-display text-base sm:text-lg font-extrabold tracking-tight text-neutral-900 whitespace-nowrap truncate">
+              {section === 'dashboard' ? (
+                <>
+                  RikZen <span className="text-[#E5391B]">Fast Food</span>
+                </>
+              ) : section === 'menu' ? (
+                'Menu'
+              ) : section === 'offers' ? (
+                'Offers'
+              ) : section === 'tables' ? (
+                'Tables'
+              ) : section === 'bills' ? (
+                'Bills & Payments'
+              ) : section === 'reports' ? (
+                'Sales & History'
+              ) : (
+                'Settings'
+              )}
             </span>
             <h1 className="hidden lg:block text-xl font-extrabold text-neutral-900 truncate">
               {section === 'dashboard' && 'Live Orders'}
               {section === 'menu' && 'Menu Management'}
               {section === 'offers' && 'Offers'}
               {section === 'tables' && 'Tables & QR Codes'}
-              {section === 'bills' && 'Customer Bills & Sharing'}
-              {section === 'reports' && 'Sales Reports & History'}
-              {section === 'settings' && 'Shop Settings'}
+              {section === 'bills' && 'Customer Bills & Payment Verification'}
+              {section === 'reports' && 'Sales Reports & Order History'}
+              {section === 'settings' && 'Shop Settings & System Diagnostics'}
             </h1>
           </div>
 
@@ -1367,7 +1634,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                   ))}
                 </div>
 
-                {/* Direct Confirm & Reject Actions */}
+                {/* Direct Confirm & Cancel Actions */}
                 <div className="grid grid-cols-2 gap-2.5">
                   <button
                     type="button"
@@ -1386,16 +1653,11 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                   <button
                     type="button"
                     disabled={isAlertBusy}
-                    onClick={async () => {
-                      const ok = await handleStatusChange(activeAlert, 'rejected');
-                      if (ok) {
-                        setLiveAlertOrders((prev) => prev.filter((o) => o.id !== activeAlert.id));
-                      }
-                    }}
+                    onClick={() => setCancelModalOrder(activeAlert)}
                     className="min-h-[46px] px-4 py-2.5 rounded-xl bg-red-600/20 hover:bg-red-600/35 border border-red-500/40 text-red-200 text-sm font-extrabold inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
                   >
                     <XCircle className="w-4 h-4" />
-                    REJECT
+                    CANCEL
                   </button>
                 </div>
               </motion.div>
@@ -1435,15 +1697,19 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => window.location.reload()}
-                      className="min-h-[34px] px-3 py-1 rounded-xl bg-red-700 text-white text-xs font-bold hover:bg-red-800 inline-flex items-center gap-1 cursor-pointer"
+                      disabled={retryingDiagnostic}
+                      onClick={handleDiagnosticRetry}
+                      className="min-h-[34px] px-3 py-1 rounded-xl bg-red-700 text-white text-xs font-bold hover:bg-red-800 inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
                     >
-                      <RefreshCw className="w-3.5 h-3.5" />
-                      Retry
+                      <RefreshCw className={`w-3.5 h-3.5 ${retryingDiagnostic ? 'animate-spin' : ''}`} />
+                      {retryingDiagnostic ? 'Retrying...' : 'Retry'}
                     </button>
                     <button
                       type="button"
-                      onClick={() => setDataError(null)}
+                      onClick={() => {
+                        lastFailedActionRef.current = null;
+                        setDataError(null);
+                      }}
                       className="min-h-[34px] px-2.5 py-1 rounded-xl border border-red-200 bg-white text-red-800 text-xs font-semibold hover:bg-red-100 cursor-pointer"
                     >
                       Dismiss
@@ -1715,6 +1981,122 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                 </div>
               </div>
 
+              {/* Manual Payment Verification Queue (Shows customer "I HAVE PAID" alerts & unpaid bills) */}
+              {paymentVerificationQueue.length > 0 && (
+                <section className="bg-white rounded-3xl border-2 border-amber-300 p-5 sm:p-6 space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-base font-extrabold text-neutral-900 inline-flex items-center gap-2">
+                        <CreditCard className="w-5 h-5 text-[#E5391B]" />
+                        Payment Verification ({paymentVerificationQueue.length})
+                      </h3>
+                      <p className="text-xs text-neutral-600 mt-0.5">
+                        Verify customer UPI / cash payments manually before marking Paid. Paid orders update revenue instantly.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setSection('bills')}
+                      className="text-xs font-bold text-[#E5391B] hover:underline cursor-pointer"
+                    >
+                      Open All Bills →
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                    {paymentVerificationQueue.slice(0, 6).map((ord) => {
+                      const isRequested = ord.payment_status === 'verification_requested';
+                      const isNotReceived = ord.payment_status === 'not_received';
+                      const isBusyPay = updatingPaymentId === ord.id;
+                      return (
+                        <div
+                          key={ord.id}
+                          className={`rounded-2xl border p-4 space-y-3 ${
+                            isRequested
+                              ? 'border-amber-400 bg-amber-50/70'
+                              : isNotReceived
+                                ? 'border-red-200 bg-red-50/40'
+                                : 'border-neutral-200 bg-neutral-50/60'
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-xs font-mono font-extrabold text-[#E5391B]">
+                                #{ord.order_code} · Table {ord.table_number}
+                              </p>
+                              <p className="text-sm font-extrabold text-neutral-900 truncate">
+                                {ord.customer_name}
+                              </p>
+                              <p className="text-xs font-mono text-neutral-600">
+                                {formatIndianMobileDisplay(ord.customer_mobile)}
+                              </p>
+                            </div>
+                            <div className="text-right shrink-0 tabular-nums">
+                              <p className="font-mono text-xl font-extrabold text-neutral-900">
+                                {formatRupees(ord.total)}
+                              </p>
+                              <span
+                                className={`inline-flex items-center gap-1 text-[11px] font-extrabold ${
+                                  isRequested
+                                    ? 'text-amber-800'
+                                    : isNotReceived
+                                      ? 'text-red-700'
+                                      : 'text-neutral-600'
+                                }`}
+                              >
+                                <span
+                                  className={`w-1.5 h-1.5 rounded-full ${
+                                    isRequested
+                                      ? 'bg-amber-500 animate-ping'
+                                      : isNotReceived
+                                        ? 'bg-red-600'
+                                        : 'bg-amber-500'
+                                  }`}
+                                />
+                                {isRequested
+                                  ? 'Customer Clicked I Have Paid'
+                                  : isNotReceived
+                                    ? 'Marked Not Received'
+                                    : 'Payment Pending'}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setPreviewBillOrder(ord)}
+                              className="min-h-[38px] px-3 py-1.5 rounded-xl bg-white border border-neutral-200 text-neutral-800 text-xs font-bold hover:bg-neutral-100 inline-flex items-center justify-center gap-1 cursor-pointer"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                              VIEW BILL
+                            </button>
+                            <button
+                              type="button"
+                              disabled={isBusyPay}
+                              onClick={() => handleMarkPaid(ord)}
+                              className="flex-1 min-h-[38px] px-3 py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 whitespace-nowrap"
+                            >
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              {isBusyPay ? 'Updating...' : 'PAYMENT RECEIVED'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={isBusyPay}
+                              onClick={() => handleMarkPaymentNotReceived(ord)}
+                              className="min-h-[38px] px-3 py-1.5 rounded-xl border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 whitespace-nowrap"
+                            >
+                              <XCircle className="w-3.5 h-3.5" />
+                              NOT RECEIVED
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </section>
+              )}
+
               {/* 5 Large Simple POS Queue Filter Cards */}
               <div ref={liveOrdersRef} className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 sm:gap-4">
                 {[
@@ -1829,8 +2211,10 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                     {filteredOrders.map((order) => {
                       const isBusy = busyOrderId === order.id;
                       const isSharing = sharingBillId === order.id;
-                      const isConfirmedStage = !['pending', 'rejected'].includes(order.status);
+                      const isCancelled = isCancelledOrderStatus(order.status);
+                      const isConfirmedStage = order.status !== 'pending' && !isCancelled;
                       const isBeingAnnounced = voiceQueueState.currentOrderId === order.id;
+                      const canCancelThis = canCancelOrderStatus(order.status);
 
                       return (
                         <motion.article
@@ -1845,9 +2229,11 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                               ? isBeingAnnounced
                                 ? 'border-[#E5391B] ring-4 ring-[#E5391B]/20 shadow-lg shadow-red-500/15'
                                 : 'border-red-300 ring-2 ring-red-500/15 shadow-md shadow-red-500/10'
-                              : order.status === 'bill_requested'
-                                ? 'border-amber-300 shadow-sm shadow-amber-500/10'
-                                : 'border-neutral-200'
+                              : isCancelled
+                                ? 'border-red-200 bg-red-50/20'
+                                : order.status === 'bill_requested'
+                                  ? 'border-amber-300 shadow-sm shadow-amber-500/10'
+                                  : 'border-neutral-200'
                           }`}
                         >
                           <div className="space-y-4">
@@ -1859,23 +2245,30 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                                     className={`text-xs font-extrabold tracking-wide inline-flex items-center gap-1.5 ${
                                       order.status === 'pending'
                                         ? 'text-red-700'
-                                        : order.status === 'bill_requested'
-                                          ? 'text-amber-800'
-                                          : order.status === 'preparing'
-                                            ? 'text-amber-700'
-                                            : order.status === 'rejected'
-                                              ? 'text-red-700'
+                                        : isCancelled
+                                          ? 'text-red-700'
+                                          : order.status === 'bill_requested'
+                                            ? 'text-amber-800'
+                                            : order.status === 'preparing'
+                                              ? 'text-amber-700'
                                               : 'text-emerald-700'
                                     }`}
                                   >
                                     {order.status === 'pending' && (
                                       <span className="w-2 h-2 rounded-full bg-red-600 animate-pulse" />
                                     )}
+                                    {isCancelled && (
+                                      <span className="w-2 h-2 rounded-full bg-red-600" />
+                                    )}
                                     {order.status === 'pending'
                                       ? 'NEW ORDER'
-                                      : order.status === 'bill_requested'
-                                        ? 'BILL REQUESTED'
-                                        : order.status.replace('_', ' ').toUpperCase()}
+                                      : isCancelled
+                                        ? 'CANCELLED'
+                                        : order.status === 'accepted' || order.status === 'confirmed'
+                                          ? 'CONFIRMED'
+                                          : order.status === 'bill_requested'
+                                            ? 'BILL REQUESTED'
+                                            : order.status.replace('_', ' ').toUpperCase()}
                                   </p>
                                   {order.status === 'pending' && (
                                     <button
@@ -1940,7 +2333,24 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                               )}
                             </div>
 
-                            {/* Website-Native Bill & Share Strip */}
+                            {/* Cancelled Order Audit Info */}
+                            {isCancelled && (
+                              <div className="rounded-2xl border border-red-200 bg-red-50 p-3.5 text-xs space-y-1">
+                                <p className="font-extrabold text-red-800">
+                                  Cancelled by Owner
+                                  {order.cancelled_at
+                                    ? ` · ${formatOrderDate(order.cancelled_at).time}`
+                                    : ''}
+                                </p>
+                                {order.payment_status === 'paid' && (
+                                  <p className="font-semibold text-red-700">
+                                    Note: Payment was previously marked Paid — handle refund manually at the counter if needed.
+                                  </p>
+                                )}
+                              </div>
+                            )}
+
+                            {/* Website-Native Bill, Share & Separate Manual Payment Strip */}
                             {isConfirmedStage && (() => {
                               const billMeta = getBillStatusMeta(order);
                               const cardBillErr = billErrors[order.id];
@@ -1950,17 +2360,22 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                                   <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                                     <span className="font-bold text-neutral-800 inline-flex items-center gap-1.5">
                                       <FileText className="w-3.5 h-3.5 text-[#E5391B]" />
-                                      BILL READY ·{' '}
                                       <span
                                         className={
                                           order.payment_status === 'paid'
                                             ? 'text-emerald-700'
-                                            : 'text-amber-700'
+                                            : order.payment_status === 'not_received'
+                                              ? 'text-red-700'
+                                              : 'text-amber-800'
                                         }
                                       >
                                         {order.payment_status === 'paid'
                                           ? 'Payment: Paid'
-                                          : 'Payment: Pending'}
+                                          : order.payment_status === 'verification_requested'
+                                            ? 'Payment: Verification Pending'
+                                            : order.payment_status === 'not_received'
+                                              ? 'Payment: Not Received'
+                                              : 'Payment: Pending'}
                                       </span>
                                     </span>
                                     <span
@@ -2020,24 +2435,33 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                                   </div>
 
                                   {order.payment_status !== 'paid' && (
-                                    <button
-                                      type="button"
-                                      disabled={updatingPaymentId === order.id}
-                                      onClick={() => handleMarkPaid(order)}
-                                      className="w-full min-h-[38px] px-3 py-1.5 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-bold hover:bg-emerald-100 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
-                                    >
-                                      <CheckCircle2 className="w-4 h-4" />
-                                      {updatingPaymentId === order.id
-                                        ? 'Updating Payment...'
-                                        : 'Mark Paid'}
-                                    </button>
+                                    <div className="grid grid-cols-2 gap-2">
+                                      <button
+                                        type="button"
+                                        disabled={updatingPaymentId === order.id}
+                                        onClick={() => handleMarkPaid(order)}
+                                        className="min-h-[38px] px-2.5 py-1.5 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-extrabold hover:bg-emerald-100 inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60"
+                                      >
+                                        <CheckCircle2 className="w-3.5 h-3.5" />
+                                        {updatingPaymentId === order.id ? 'Updating...' : 'Payment Received'}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        disabled={updatingPaymentId === order.id}
+                                        onClick={() => handleMarkPaymentNotReceived(order)}
+                                        className="min-h-[38px] px-2.5 py-1.5 rounded-xl border border-red-200 bg-red-50 text-red-700 text-xs font-bold hover:bg-red-100 inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60"
+                                      >
+                                        <XCircle className="w-3.5 h-3.5" />
+                                        Not Received
+                                      </button>
+                                    </div>
                                   )}
                                 </div>
                               );
                             })()}
                           </div>
 
-                          {/* Primary POS Lifecycle Buttons */}
+                          {/* Primary One-Way POS Lifecycle Buttons (Cancel allowed ONLY before READY) */}
                           <div className="flex flex-wrap gap-2.5 pt-1">
                             {order.status === 'pending' && (
                               <>
@@ -2048,57 +2472,73 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                                   className="flex-1 min-h-[50px] px-4 py-3 rounded-xl bg-emerald-700 text-white font-bold text-sm hover:bg-emerald-800 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
                                 >
                                   <CheckCircle2 className="w-5 h-5" />
-                                  {isBusy ? 'Confirming...' : 'Confirm Order'}
+                                  {isBusy ? 'Confirming...' : 'CONFIRM'}
                                 </button>
                                 <button
                                   type="button"
                                   disabled={isBusy}
-                                  onClick={() => handleStatusChange(order, 'rejected')}
+                                  onClick={() => setCancelModalOrder(order)}
                                   className="min-h-[50px] px-4 py-3 rounded-xl border border-red-200 bg-red-50 text-red-700 font-bold text-sm hover:bg-red-100 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
                                 >
                                   <XCircle className="w-5 h-5" />
-                                  Reject
+                                  CANCEL
                                 </button>
                               </>
                             )}
 
-                            {order.status === 'accepted' && (
-                              <button
-                                type="button"
-                                disabled={isBusy}
-                                onClick={() => handleStatusChange(order, 'preparing')}
-                                className="w-full min-h-[50px] px-4 py-3 rounded-xl bg-amber-600 text-white font-bold text-sm hover:bg-amber-700 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
-                              >
-                                <ChefHat className="w-5 h-5" />
-                                Preparing
-                              </button>
+                            {(order.status === 'accepted' || order.status === 'confirmed') && (
+                              <>
+                                <button
+                                  type="button"
+                                  disabled={isBusy}
+                                  onClick={() => handleStatusChange(order, 'preparing')}
+                                  className="flex-1 min-h-[50px] px-4 py-3 rounded-xl bg-amber-600 text-white font-bold text-sm hover:bg-amber-700 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+                                >
+                                  <ChefHat className="w-5 h-5" />
+                                  START PREPARING
+                                </button>
+                                {canCancelThis && (
+                                  <button
+                                    type="button"
+                                    disabled={isBusy}
+                                    onClick={() => setCancelModalOrder(order)}
+                                    className="min-h-[50px] px-4 py-3 rounded-xl border border-red-200 bg-red-50 text-red-700 font-bold text-sm hover:bg-red-100 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                                  >
+                                    <XCircle className="w-4 h-4" />
+                                    CANCEL
+                                  </button>
+                                )}
+                              </>
                             )}
 
                             {order.status === 'preparing' && (
-                              <button
-                                type="button"
-                                disabled={isBusy}
-                                onClick={() => handleStatusChange(order, 'ready')}
-                                className="w-full min-h-[50px] px-4 py-3 rounded-xl bg-emerald-700 text-white font-bold text-sm hover:bg-emerald-800 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
-                              >
-                                <Utensils className="w-5 h-5" />
-                                Mark Ready
-                              </button>
+                              <>
+                                <button
+                                  type="button"
+                                  disabled={isBusy}
+                                  onClick={() => handleStatusChange(order, 'ready')}
+                                  className="flex-1 min-h-[50px] px-4 py-3 rounded-xl bg-emerald-700 text-white font-bold text-sm hover:bg-emerald-800 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+                                >
+                                  <Utensils className="w-5 h-5" />
+                                  MARK READY
+                                </button>
+                                {canCancelThis && (
+                                  <button
+                                    type="button"
+                                    disabled={isBusy}
+                                    onClick={() => setCancelModalOrder(order)}
+                                    className="min-h-[50px] px-4 py-3 rounded-xl border border-red-200 bg-red-50 text-red-700 font-bold text-sm hover:bg-red-100 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                                  >
+                                    <XCircle className="w-4 h-4" />
+                                    CANCEL
+                                  </button>
+                                )}
+                              </>
                             )}
 
-                            {(order.status === 'ready' || order.status === 'bill_requested') && (
-                              <button
-                                type="button"
-                                disabled={isBusy}
-                                onClick={() => handleStatusChange(order, 'bill_ready')}
-                                className="w-full min-h-[50px] px-4 py-3 rounded-xl bg-[#E5391B] text-white font-bold text-sm hover:bg-[#C82E14] active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
-                              >
-                                <Receipt className="w-5 h-5" />
-                                Mark Bill Ready
-                              </button>
-                            )}
-
-                            {order.status === 'bill_ready' && (
+                            {(order.status === 'ready' ||
+                              order.status === 'bill_requested' ||
+                              order.status === 'bill_ready') && (
                               <button
                                 type="button"
                                 disabled={isBusy}
@@ -2106,15 +2546,15 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                                 className="w-full min-h-[50px] px-4 py-3 rounded-xl bg-emerald-700 text-white font-bold text-sm hover:bg-emerald-800 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
                               >
                                 <Check className="w-5 h-5" />
-                                Mark Completed
+                                COMPLETE ORDER
                               </button>
                             )}
 
-                            {(order.status === 'completed' || order.status === 'rejected') && (
+                            {(order.status === 'completed' || isCancelled) && (
                               <div className="w-full text-center text-xs font-semibold text-neutral-500 py-1.5">
                                 {order.status === 'completed'
                                   ? 'Completed & Table Available'
-                                  : 'Order Rejected'}
+                                  : 'Order Cancelled & Table Available'}
                               </div>
                             )}
                           </div>
@@ -2623,10 +3063,35 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                             }
                             className="min-h-[44px] px-5 py-2 rounded-xl bg-emerald-700 text-white text-sm font-bold cursor-pointer"
                           >
-                            Confirm Order
+                            CONFIRM
                           </button>
                         )}
-                        {selectedTableData.activeOrder.status === 'bill_ready' && (
+                        {(selectedTableData.activeOrder.status === 'accepted' ||
+                          selectedTableData.activeOrder.status === 'confirmed') && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleStatusChange(selectedTableData.activeOrder!, 'preparing')
+                            }
+                            className="min-h-[44px] px-5 py-2 rounded-xl bg-amber-600 text-white text-sm font-bold cursor-pointer"
+                          >
+                            START PREPARING
+                          </button>
+                        )}
+                        {selectedTableData.activeOrder.status === 'preparing' && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleStatusChange(selectedTableData.activeOrder!, 'ready')
+                            }
+                            className="min-h-[44px] px-5 py-2 rounded-xl bg-emerald-700 text-white text-sm font-bold cursor-pointer"
+                          >
+                            MARK READY
+                          </button>
+                        )}
+                        {['ready', 'bill_requested', 'bill_ready'].includes(
+                          selectedTableData.activeOrder.status,
+                        ) && (
                           <button
                             type="button"
                             onClick={() =>
@@ -2634,7 +3099,16 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                             }
                             className="min-h-[44px] px-5 py-2 rounded-xl bg-emerald-700 text-white text-sm font-bold cursor-pointer"
                           >
-                            Mark Completed
+                            COMPLETE ORDER
+                          </button>
+                        )}
+                        {canCancelOrderStatus(selectedTableData.activeOrder.status) && (
+                          <button
+                            type="button"
+                            onClick={() => setCancelModalOrder(selectedTableData.activeOrder)}
+                            className="min-h-[44px] px-4 py-2 rounded-xl border border-red-200 bg-red-50 text-red-700 text-sm font-bold cursor-pointer"
+                          >
+                            CANCEL
                           </button>
                         )}
                       </div>
@@ -2725,17 +3199,27 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                               className={`text-xs font-extrabold mt-0.5 inline-flex items-center gap-1 justify-end ${
                                 order.payment_status === 'paid'
                                   ? 'text-emerald-700'
-                                  : 'text-amber-700'
+                                  : order.payment_status === 'not_received'
+                                    ? 'text-red-700'
+                                    : 'text-amber-700'
                               }`}
                             >
                               <span
                                 className={`w-1.5 h-1.5 rounded-full ${
                                   order.payment_status === 'paid'
                                     ? 'bg-emerald-600'
-                                    : 'bg-amber-500 animate-pulse'
+                                    : order.payment_status === 'not_received'
+                                      ? 'bg-red-600'
+                                      : 'bg-amber-500 animate-pulse'
                                 }`}
                               />
-                              {order.payment_status === 'paid' ? 'Paid' : 'Payment Pending'}
+                              {order.payment_status === 'paid'
+                                ? 'Payment Received'
+                                : order.payment_status === 'verification_requested'
+                                  ? 'Verification Pending'
+                                  : order.payment_status === 'not_received'
+                                    ? 'Not Received'
+                                    : 'Payment Pending'}
                             </p>
                             <p
                               className={`text-[11px] font-bold mt-0.5 inline-flex items-center gap-1 justify-end ${billMeta.color}`}
@@ -2795,15 +3279,26 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                         </div>
 
                         {order.payment_status !== 'paid' && (
-                          <button
-                            type="button"
-                            disabled={updatingPaymentId === order.id}
-                            onClick={() => handleMarkPaid(order)}
-                            className="w-full min-h-[40px] px-3 py-2 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-bold hover:bg-emerald-100 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
-                          >
-                            <CheckCircle2 className="w-4 h-4" />
-                            {updatingPaymentId === order.id ? 'Marking Paid...' : 'Mark Paid'}
-                          </button>
+                          <div className="grid grid-cols-2 gap-2">
+                            <button
+                              type="button"
+                              disabled={updatingPaymentId === order.id}
+                              onClick={() => handleMarkPaid(order)}
+                              className="min-h-[40px] px-3 py-2 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-extrabold hover:bg-emerald-100 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                            >
+                              <CheckCircle2 className="w-4 h-4" />
+                              {updatingPaymentId === order.id ? 'Updating...' : 'Payment Received'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={updatingPaymentId === order.id}
+                              onClick={() => handleMarkPaymentNotReceived(order)}
+                              className="min-h-[40px] px-3 py-2 rounded-xl border border-red-200 bg-red-50 text-red-700 text-xs font-bold hover:bg-red-100 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                            >
+                              <XCircle className="w-4 h-4" />
+                              Not Received
+                            </button>
+                          </div>
                         )}
                       </div>
                     );
@@ -2823,6 +3318,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
               onDownloadBill={handleDownloadPdf}
               onShareBill={handleShareBill}
               onMarkPaid={handleMarkPaid}
+              onMarkNotReceived={handleMarkPaymentNotReceived}
               downloadingBillId={downloadingBillId}
               sharingBillId={sharingBillId}
               updatingPaymentId={updatingPaymentId}
@@ -3447,6 +3943,132 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                   })}
                 </div>
               </div>
+
+              {/* 3. Owner System Diagnostics & Auth Health Check */}
+              <div className="bg-white rounded-3xl border border-neutral-200 p-6 space-y-5">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <h2 className="text-lg font-extrabold text-neutral-900 inline-flex items-center gap-2">
+                      <ShieldCheck className="w-5 h-5 text-emerald-700" />
+                      System Diagnostics
+                    </h2>
+                    <p className="text-sm text-neutral-600 mt-0.5">
+                      Inspect live Firebase authentication, owner role authorization, Firestore read/write readiness, and order signing configuration.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={runningDiagnostics}
+                    onClick={handleRunSystemTest}
+                    className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 hover:bg-neutral-800 text-white text-xs font-extrabold inline-flex items-center gap-2 cursor-pointer disabled:opacity-60"
+                  >
+                    {runningDiagnostics ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-4 h-4 text-amber-300" />
+                    )}
+                    {runningDiagnostics ? 'Testing...' : 'RUN SYSTEM TEST'}
+                  </button>
+                </div>
+
+                {/* Internal Current Firebase User Summary */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 text-xs">
+                  <div className="rounded-2xl bg-neutral-50 border border-neutral-200 p-3">
+                    <span className="text-neutral-500 block font-semibold">Authenticated</span>
+                    <span className="font-extrabold text-emerald-700">
+                      {user ? 'YES' : 'NO'}
+                    </span>
+                  </div>
+                  <div className="rounded-2xl bg-neutral-50 border border-neutral-200 p-3">
+                    <span className="text-neutral-500 block font-semibold">UID</span>
+                    <span className="font-mono font-bold text-neutral-900 break-all">
+                      {user?.uid || '—'}
+                    </span>
+                  </div>
+                  <div className="rounded-2xl bg-neutral-50 border border-neutral-200 p-3">
+                    <span className="text-neutral-500 block font-semibold">Email</span>
+                    <span className="font-bold text-neutral-900 break-all">
+                      {user?.email || '—'}
+                    </span>
+                  </div>
+                  <div className="rounded-2xl bg-neutral-50 border border-neutral-200 p-3">
+                    <span className="text-neutral-500 block font-semibold">Admin / Owner</span>
+                    <span className="font-extrabold text-emerald-700">
+                      {isOwner ? `YES (${ownerAuthStatus?.source.replace(/_/g, ' ') || 'owner'})` : 'NO'}
+                    </span>
+                  </div>
+                  <div className="rounded-2xl bg-neutral-50 border border-neutral-200 p-3">
+                    <span className="text-neutral-500 block font-semibold">Firebase Project</span>
+                    <span className="font-mono font-bold text-neutral-900 break-all">
+                      {FIREBASE_PROJECT_ID}
+                    </span>
+                  </div>
+                </div>
+
+                {diagnosticsReport && (
+                  <div className="space-y-2 pt-2 border-t border-neutral-100">
+                    <p className="text-[11px] font-semibold text-neutral-500">
+                      Last checked: {formatOrderDate(diagnosticsReport.checkedAt).date} ·{' '}
+                      {formatOrderDate(diagnosticsReport.checkedAt).time} · DB{' '}
+                      <span className="font-mono">{FIREBASE_DATABASE_ID}</span>
+                    </p>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                      {diagnosticsReport.checks.map((chk) => (
+                        <div
+                          key={chk.id}
+                          className={`rounded-2xl border p-3.5 flex items-start gap-2.5 text-xs ${
+                            chk.status === 'pass'
+                              ? 'bg-emerald-50/60 border-emerald-200'
+                              : chk.status === 'warn'
+                                ? 'bg-amber-50/70 border-amber-200'
+                                : 'bg-red-50/70 border-red-200'
+                          }`}
+                        >
+                          {chk.status === 'pass' ? (
+                            <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+                          ) : chk.status === 'warn' ? (
+                            <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                          ) : (
+                            <XCircle className="w-4 h-4 text-red-700 shrink-0 mt-0.5" />
+                          )}
+                          <div className="min-w-0">
+                            <p className="font-extrabold text-neutral-900">{chk.label}</p>
+                            <p className="text-neutral-700 mt-0.5 break-words">{chk.detail}</p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* 4. Clear Order History (Safely deletes ONLY orders, never menu/offers/settings) */}
+              <div className="bg-white rounded-3xl border border-red-200 p-6 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <h2 className="text-lg font-extrabold text-red-800 inline-flex items-center gap-2">
+                      <Trash2 className="w-5 h-5" />
+                      Clear Order History
+                    </h2>
+                    <p className="text-sm text-neutral-600">
+                      Permanently remove all existing / old test orders from Order History &amp; Sales Reports ({orders.length}{' '}
+                      {orders.length === 1 ? 'record' : 'records'} currently stored). Future orders will continue saving normally.
+                    </p>
+                    <p className="text-xs text-neutral-500">
+                      Protected &amp; untouched: Menu items, prices, offers, tables, payment QR, admin account, and restaurant settings.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={clearingHistory || orders.length === 0}
+                    onClick={() => setClearHistoryModalOpen(true)}
+                    className="min-h-[46px] px-5 py-2.5 rounded-xl bg-red-700 hover:bg-red-800 text-white text-xs font-extrabold inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50 whitespace-nowrap shrink-0"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    CLEAR ORDER HISTORY
+                  </button>
+                </div>
+              </div>
             </div>
           )}
         </main>
@@ -3526,9 +4148,125 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
           isOwnerView={true}
           paymentSettings={paymentSettings}
           onMarkPaid={handleMarkPaid}
+          onMarkNotReceived={handleMarkPaymentNotReceived}
           onOpenSettings={() => setSection('settings')}
           isUpdatingPayment={updatingPaymentId === livePreviewOrder.id}
         />
+      )}
+
+      {/* Cancel Order Confirmation Modal */}
+      {cancelModalOrder && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Cancel order confirmation"
+        >
+          <div className="bg-white rounded-3xl border border-neutral-200 max-w-md w-full p-6 space-y-5 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="w-11 h-11 rounded-2xl bg-red-50 text-red-700 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-lg font-extrabold text-neutral-900">Cancel this order?</h3>
+                <p className="text-xs text-neutral-600 mt-0.5">
+                  Customer will be notified immediately on their screen and Table {cancelModalOrder.table_number} will become available.
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-2xl bg-neutral-50 border border-neutral-200 p-4 space-y-2 text-xs tabular-nums">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-neutral-900">{cancelModalOrder.customer_name}</span>
+                <span className="font-mono font-extrabold text-[#E5391B]">
+                  #{cancelModalOrder.order_code} · Table {cancelModalOrder.table_number}
+                </span>
+              </div>
+              <div className="border-t border-neutral-200 pt-2 space-y-1">
+                {cancelModalOrder.items.map((line) => (
+                  <div key={line.menu_item_id} className="flex items-center justify-between text-neutral-700">
+                    <span>
+                      {line.name} × {line.quantity}
+                    </span>
+                    <span className="font-mono">{formatRupees(line.line_total)}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="border-t border-neutral-200 pt-2 flex items-center justify-between font-extrabold text-sm text-neutral-900">
+                <span>Total</span>
+                <span className="font-mono">{formatRupees(cancelModalOrder.total)}</span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                disabled={cancellingOrder}
+                onClick={() => setCancelModalOrder(null)}
+                className="min-h-[46px] px-4 py-2.5 rounded-xl border border-neutral-200 bg-white text-neutral-800 text-sm font-bold hover:bg-neutral-50 cursor-pointer disabled:opacity-60"
+              >
+                KEEP ORDER
+              </button>
+              <button
+                type="button"
+                disabled={cancellingOrder}
+                onClick={handleConfirmCancelOrder}
+                className="min-h-[46px] px-4 py-2.5 rounded-xl bg-red-700 hover:bg-red-800 text-white text-sm font-extrabold inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+              >
+                <XCircle className="w-4 h-4" />
+                {cancellingOrder ? 'Cancelling...' : 'CANCEL ORDER'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Clear Order History Confirmation Modal */}
+      {clearHistoryModalOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Clear order history confirmation"
+        >
+          <div className="bg-white rounded-3xl border border-red-200 max-w-md w-full p-6 space-y-5 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="w-11 h-11 rounded-2xl bg-red-50 text-red-700 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-lg font-extrabold text-neutral-900">
+                  Delete all existing order history?
+                </h3>
+                <p className="text-xs text-neutral-600 mt-1 leading-relaxed">
+                  This permanently removes {orders.length} existing{' '}
+                  {orders.length === 1 ? 'order' : 'orders'} from Order History and Sales Reports.
+                  Menu items, prices, offers, tables, payment QR, and settings will NOT be affected.
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                disabled={clearingHistory}
+                onClick={() => setClearHistoryModalOpen(false)}
+                className="min-h-[46px] px-4 py-2.5 rounded-xl border border-neutral-200 bg-white text-neutral-800 text-sm font-bold hover:bg-neutral-50 cursor-pointer disabled:opacity-60"
+              >
+                CANCEL
+              </button>
+              <button
+                type="button"
+                disabled={clearingHistory}
+                onClick={handleConfirmClearOrderHistory}
+                className="min-h-[46px] px-4 py-2.5 rounded-xl bg-red-700 hover:bg-red-800 text-white text-sm font-extrabold inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+              >
+                <Trash2 className="w-4 h-4" />
+                {clearingHistory ? 'Deleting...' : 'DELETE HISTORY'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Test Payment QR Modal */}

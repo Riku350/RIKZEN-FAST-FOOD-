@@ -13,6 +13,7 @@ import {
   Eye,
   FileText,
   Info,
+  Loader2,
   Lock,
   Minus,
   Phone,
@@ -36,6 +37,7 @@ import { shareBillNative } from '../lib/billShare';
 import { downloadPaymentQrPng } from '../lib/paymentQrDownload';
 import {
   createConfirmedOrder,
+  customerRequestPaymentVerification,
   downloadOrderBillPdf,
   formatIndianMobileDisplay,
   formatRelativeTime,
@@ -44,6 +46,7 @@ import {
   getCachedOffers,
   getSavedCustomerDetails,
   getStoredOrderIdForTable,
+  isCancelledOrderStatus,
   isValidIndianMobileDigits,
   requestOrderBill,
   saveCustomerDetailsLocally,
@@ -57,6 +60,10 @@ import {
 } from '../lib/orderService';
 import { buildDynamicUpiUri, DEFAULT_PAYMENT_SETTINGS } from '../lib/upiPayment';
 import {
+  speakCustomerOrderCancelled,
+  unlockCustomerAudioOnGesture,
+} from '../lib/voiceOrderAlert';
+import {
   CartItem,
   CustomerDetails,
   getDiscountPercent,
@@ -65,6 +72,7 @@ import {
   MenuItem,
   OfferRecord,
   OrderRecord,
+  OrderStatus,
   PaymentSettings,
 } from '../types/restaurant';
 import { AmbientFoodBackdrop } from './AmbientFoodBackdrop';
@@ -128,8 +136,10 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
   const [showBillModal, setShowBillModal] = useState(false);
   const [downloadingPdf, setDownloadingPdf] = useState(false);
   const [downloadingQr, setDownloadingQr] = useState(false);
+  const [requestingPaymentVerify, setRequestingPaymentVerify] = useState(false);
   const [paymentSettings, setPaymentSettings] = useState<PaymentSettings>(DEFAULT_PAYMENT_SETTINGS);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const prevOrderStatusRef = useRef<OrderStatus | null>(null);
 
   useEffect(() => {
     const stored = getStoredOrderIdForTable(tableNumber);
@@ -137,7 +147,21 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     setActiveOrder(null);
     setJustPlacedOrder(null);
     setShowThankYouManual(false);
+    prevOrderStatusRef.current = null;
   }, [tableNumber]);
+
+  // Unlock browser audio on first customer touch/click so order-cancelled voice plays reliably
+  useEffect(() => {
+    const unlock = () => unlockCustomerAudioOnGesture();
+    window.addEventListener('pointerdown', unlock, { passive: true });
+    window.addEventListener('touchstart', unlock, { passive: true });
+    window.addEventListener('click', unlock, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('touchstart', unlock);
+      window.removeEventListener('click', unlock);
+    };
+  }, []);
 
   useEffect(() => {
     const interval = window.setInterval(() => setNowMs(Date.now()), 30000);
@@ -158,6 +182,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
   useEffect(() => {
     if (!activeOrderId) {
       setActiveOrder(null);
+      prevOrderStatusRef.current = null;
       return;
     }
     setOrderSyncError(null);
@@ -168,6 +193,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
         if (!order) {
           setStoredOrderIdForTable(tableNumber, null);
           setActiveOrderId(null);
+          prevOrderStatusRef.current = null;
         }
       },
       (err) => {
@@ -177,6 +203,17 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     );
     return () => unsub();
   }, [activeOrderId, tableNumber]);
+
+  // Real-time customer cancellation voice alert (speaks once per cancelled order)
+  useEffect(() => {
+    if (!activeOrder) return;
+    const prev = prevOrderStatusRef.current;
+    prevOrderStatusRef.current = activeOrder.status;
+    if (isCancelledOrderStatus(activeOrder.status) && prev !== activeOrder.status) {
+      setActiveTab('order');
+      void speakCustomerOrderCancelled(activeOrder.id);
+    }
+  }, [activeOrder?.id, activeOrder?.status]);
 
   const activeOffers = useMemo(() => offers.filter((o) => o.active), [offers]);
 
@@ -432,6 +469,32 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     }
   };
 
+  const handleCustomerIHavePaid = async () => {
+    if (!activeOrder || requestingPaymentVerify) return;
+    if (
+      activeOrder.payment_status === 'paid' ||
+      activeOrder.payment_status === 'verification_requested' ||
+      isCancelledOrderStatus(activeOrder.status)
+    ) {
+      return;
+    }
+    setRequestingPaymentVerify(true);
+    setOrderSyncError(null);
+    try {
+      await customerRequestPaymentVerification(activeOrder.id);
+      const msg = 'Payment verification requested. Please wait for owner confirmation.';
+      setShareFeedback(msg);
+      window.setTimeout(() => {
+        setShareFeedback((cur) => (cur === msg ? null : cur));
+      }, 4000);
+    } catch (err) {
+      console.error('[Customer Payment Verification Request Error]', err);
+      setOrderSyncError(toCustomerFriendlyError(err));
+    } finally {
+      setRequestingPaymentVerify(false);
+    }
+  };
+
   const handleStartNewOrder = () => {
     setStoredOrderIdForTable(tableNumber, null);
     setActiveOrderId(null);
@@ -449,7 +512,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
   };
 
   const hasLiveOrderBadge =
-    activeOrder && !['completed', 'rejected'].includes(activeOrder.status);
+    activeOrder && !['completed', 'rejected', 'cancelled'].includes(activeOrder.status);
 
   const activeOrderCode = activeOrder
     ? activeOrder.order_code || `RK${activeOrder.order_number}`
@@ -1379,7 +1442,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                     </div>
                   )}
 
-                  {activeOrder.status === 'accepted' && (
+                  {(activeOrder.status === 'accepted' || activeOrder.status === 'confirmed') && (
                     <div className="text-center space-y-2 py-1">
                       <motion.div
                         initial={prefersReducedMotion ? false : { scale: 0.6, opacity: 0 }}
@@ -1467,16 +1530,35 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                     </div>
                   )}
 
-                  {activeOrder.status === 'rejected' && (
-                    <div className="text-center space-y-2 py-1">
-                      <div className="w-14 h-14 rounded-2xl bg-red-50 text-red-700 flex items-center justify-center mx-auto mb-3">
-                        <XCircle className="w-7 h-7" />
-                      </div>
-                      <h2 className="text-2xl font-extrabold text-red-700">Order Declined</h2>
-                      <p className="text-sm text-neutral-600">
-                        Sorry, the kitchen could not accept this order right now.
+                  {isCancelledOrderStatus(activeOrder.status) && (
+                    <motion.div
+                      initial={prefersReducedMotion ? false : { opacity: 0, scale: 0.94, y: 10 }}
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      transition={{ duration: 0.35, ease: 'easeOut' }}
+                      className="rounded-3xl bg-red-50/90 border-2 border-red-200 p-6 sm:p-7 text-center space-y-3"
+                    >
+                      <motion.div
+                        initial={prefersReducedMotion ? false : { scale: 0.5, rotate: -10 }}
+                        animate={{ scale: [1, 1.06, 1], rotate: 0 }}
+                        transition={{ duration: 0.45 }}
+                        className="w-16 h-16 rounded-2xl bg-red-600 text-white flex items-center justify-center mx-auto shadow-md"
+                      >
+                        <XCircle className="w-9 h-9" />
+                      </motion.div>
+                      <h2 className="text-2xl sm:text-3xl font-extrabold text-red-700 tracking-tight">
+                        ORDER CANCELLED
+                      </h2>
+                      <p className="text-sm sm:text-base font-semibold text-neutral-800 max-w-md mx-auto">
+                        Sorry, your order has been cancelled by the restaurant.
                       </p>
-                    </div>
+                      <p className="text-xs font-medium text-neutral-600 max-w-md mx-auto bg-white/80 rounded-xl border border-red-200/70 px-3.5 py-2.5">
+                        {activeOrder.payment_status === 'paid'
+                          ? 'Your payment was recorded. Please contact the RikZen Fast Food counter for refund assistance.'
+                          : activeOrder.payment_status === 'verification_requested'
+                            ? 'If you completed a UPI payment, please show your payment receipt at the RikZen Fast Food counter.'
+                            : 'No online payment was verified for this cancelled order. Please contact RikZen Fast Food if you need assistance.'}
+                      </p>
+                    </motion.div>
                   )}
 
                   {/* Metadata Strip */}
@@ -1493,7 +1575,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                   </div>
 
                   {/* Confirmed Customer Bill & Honest 2-Mode Payment QR Card (Only after Owner Confirms!) */}
-                  {activeOrder.status !== 'pending' && activeOrder.status !== 'rejected' && (() => {
+                  {activeOrder.status !== 'pending' && !isCancelledOrderStatus(activeOrder.status) && (() => {
                     const snap = activeOrder.payment_qr_snapshot;
                     const activeMode = snap?.mode || paymentSettings.payment_mode || 'dynamic_upi';
                     const activeMerchant = snap?.merchant_name || paymentSettings.merchant_name || 'RikZen Fast Food';
@@ -1515,6 +1597,9 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                     const showUploadedQr = activeMode === 'uploaded_qr' && Boolean(activeQrImg);
                     const showDynamicUpi = activeMode === 'dynamic_upi' && Boolean(dynamicUpiUri);
                     const isPaid = activeOrder.payment_status === 'paid';
+                    const isVerificationPending =
+                      activeOrder.payment_status === 'verification_requested';
+                    const isNotReceived = activeOrder.payment_status === 'not_received';
                     const isFailedPay = activeOrder.payment_status === 'failed';
 
                     return (
@@ -1538,6 +1623,16 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                                   <span className="inline-flex items-center gap-1 text-[11px] font-extrabold text-emerald-700">
                                     <CheckCircle2 className="w-3.5 h-3.5" />
                                     Payment Received
+                                  </span>
+                                ) : isVerificationPending ? (
+                                  <span className="inline-flex items-center gap-1 text-[11px] font-extrabold text-amber-800">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                                    Payment Verification Pending
+                                  </span>
+                                ) : isNotReceived ? (
+                                  <span className="inline-flex items-center gap-1 text-[11px] font-extrabold text-red-700">
+                                    <XCircle className="w-3.5 h-3.5" />
+                                    Payment Not Received
                                   </span>
                                 ) : isFailedPay ? (
                                   <span className="inline-flex items-center gap-1 text-[11px] font-extrabold text-red-700">
@@ -1635,6 +1730,17 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                                 {formatRupees(activeOrder.total)}
                               </p>
                               <p className="text-xs font-bold text-neutral-900">{activeMerchant}</p>
+                              {isVerificationPending && (
+                                <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs font-bold text-amber-900">
+                                  Payment Verification Pending — Waiting for restaurant owner to
+                                  verify your payment.
+                                </div>
+                              )}
+                              {isNotReceived && (
+                                <div className="rounded-xl bg-red-50 border border-red-200 px-3 py-2 text-xs font-bold text-red-800">
+                                  Payment could not be verified. Please contact the restaurant.
+                                </div>
+                              )}
                               {showDynamicUpi ? (
                                 <>
                                   <p className="text-xs font-bold text-emerald-700">
@@ -1675,6 +1781,21 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                                       <Download className="w-4 h-4" />
                                       {downloadingQr ? 'Saving QR...' : 'Download QR'}
                                     </button>
+                                    {!isVerificationPending && (
+                                      <button
+                                        type="button"
+                                        disabled={requestingPaymentVerify}
+                                        onClick={handleCustomerIHavePaid}
+                                        className="min-h-[42px] px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold hover:bg-emerald-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                                      >
+                                        {requestingPaymentVerify ? (
+                                          <Loader2 className="w-4 h-4 animate-spin" />
+                                        ) : (
+                                          <CheckCircle2 className="w-4 h-4" />
+                                        )}
+                                        {requestingPaymentVerify ? 'Notifying...' : 'I Have Paid'}
+                                      </button>
+                                    )}
                                   </div>
                                 </>
                               ) : (
@@ -1706,6 +1827,21 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                                       <Download className="w-4 h-4" />
                                       {downloadingQr ? 'Saving QR...' : 'Download QR'}
                                     </button>
+                                    {!isVerificationPending && (
+                                      <button
+                                        type="button"
+                                        disabled={requestingPaymentVerify}
+                                        onClick={handleCustomerIHavePaid}
+                                        className="min-h-[42px] px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold hover:bg-emerald-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                                      >
+                                        {requestingPaymentVerify ? (
+                                          <Loader2 className="w-4 h-4 animate-spin" />
+                                        ) : (
+                                          <CheckCircle2 className="w-4 h-4" />
+                                        )}
+                                        {requestingPaymentVerify ? 'Notifying...' : 'I Have Paid'}
+                                      </button>
+                                    )}
                                   </div>
                                 </>
                               )}
@@ -1748,7 +1884,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                   </div>
 
                   {/* Primary Action */}
-                  {['accepted', 'preparing', 'ready'].includes(activeOrder.status) && (
+                  {['accepted', 'confirmed', 'preparing', 'ready'].includes(activeOrder.status) && (
                     <button
                       type="button"
                       disabled={isRequestingBill}
@@ -1771,13 +1907,14 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                     </button>
                   )}
 
-                  {activeOrder.status === 'rejected' && (
+                  {isCancelledOrderStatus(activeOrder.status) && (
                     <button
                       type="button"
                       onClick={handleStartNewOrder}
-                      className="w-full min-h-[52px] px-6 py-3.5 rounded-xl bg-[#E5391B] text-white font-bold text-base hover:bg-[#C82E14] transition-colors cursor-pointer"
+                      className="w-full min-h-[52px] px-6 py-3.5 rounded-xl bg-[#E5391B] text-white font-bold text-base hover:bg-[#C82E14] transition-colors inline-flex items-center justify-center gap-2 cursor-pointer"
                     >
-                      Place a New Order
+                      <ArrowLeft className="w-5 h-5" />
+                      Back to Menu
                     </button>
                   )}
                 </motion.div>

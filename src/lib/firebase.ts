@@ -1,5 +1,5 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider } from 'firebase/auth';
+import { browserLocalPersistence, getAuth, GoogleAuthProvider, setPersistence } from 'firebase/auth';
 import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
@@ -10,7 +10,15 @@ export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
 
+// Persist owner login session across page refresh, navigation, and dashboard tabs
+void setPersistence(auth, browserLocalPersistence).catch((err) => {
+  console.warn('[RikZen Auth Persistence Warning]', err);
+});
+
 export const BOOTSTRAPPED_OWNER_EMAIL = 'rikudatabackup@gmail.com';
+export const FIREBASE_PROJECT_ID = firebaseConfig.projectId;
+export const FIREBASE_DATABASE_ID = firebaseConfig.firestoreDatabaseId;
+export const FIREBASE_AUTH_DOMAIN = firebaseConfig.authDomain;
 
 async function testConnection() {
   try {

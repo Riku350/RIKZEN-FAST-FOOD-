@@ -17,12 +17,18 @@ export interface DateRangeBounds {
 }
 
 /**
- * STRICT REVENUE RULE:
- * Only verified completed/paid orders count as revenue.
- * Never counts rejected, cancelled, or pending orders.
+ * STRICT MANUAL PAYMENT REVENUE RULE:
+ * Only non-cancelled orders that the Owner manually verified as `payment_status === 'paid'`
+ * count as completed revenue. Never counts pending, verification_requested, not_received,
+ * failed, rejected, or cancelled orders as revenue.
  */
 export function isRevenueOrder(order: OrderRecord): boolean {
-  return order.status === 'completed';
+  if (order.status === 'rejected' || order.status === 'cancelled') return false;
+  return order.payment_status === 'paid';
+}
+
+export function isCancelledOrder(order: OrderRecord): boolean {
+  return order.status === 'rejected' || order.status === 'cancelled';
 }
 
 export function startOfDay(date: Date): Date {
@@ -146,6 +152,9 @@ export interface ChartBucket {
   label: string;
   sales: number;
   orders: number;
+  totalOrders?: number;
+  paidOrders?: number;
+  pendingPayments?: number;
 }
 
 export interface BestSellingItemStat {
@@ -176,13 +185,17 @@ export function computeBestSellingItem(orders: OrderRecord[]): BestSellingItemSt
 }
 
 /**
- * Hourly sales breakdown for a given day (real completed orders only).
+ * Hourly sales breakdown for a given day (strictly manually verified paid orders count as revenue).
  */
 export function buildHourlySalesSeries(orders: OrderRecord[], targetDay: Date = new Date()): {
   buckets: ChartBucket[];
   totalSales: number;
   totalOrders: number;
   allDayOrdersCount: number;
+  completedOrdersCount: number;
+  paidOrdersCount: number;
+  pendingPaymentsCount: number;
+  unpaidAmount: number;
   cancelledOrdersCount: number;
   avgOrderValue: number;
   bestSellingItem: BestSellingItemStat | null;
@@ -190,8 +203,12 @@ export function buildHourlySalesSeries(orders: OrderRecord[], targetDay: Date = 
 } {
   const bounds = { start: startOfDay(targetDay), end: endOfDay(targetDay), label: '' };
   const allDayOrders = filterOrdersInRange(orders, bounds);
-  const cancelledOrdersCount = allDayOrders.filter((o) => o.status === 'rejected').length;
-  const dayOrders = allDayOrders.filter(isRevenueOrder);
+  const cancelledOrdersCount = allDayOrders.filter(isCancelledOrder).length;
+  const activeDayOrders = allDayOrders.filter((o) => !isCancelledOrder(o));
+  const completedOrdersCount = activeDayOrders.filter((o) => o.status === 'completed').length;
+  const dayOrders = activeDayOrders.filter(isRevenueOrder);
+  const pendingPaymentOrders = activeDayOrders.filter((o) => o.payment_status !== 'paid');
+  const unpaidAmount = pendingPaymentOrders.reduce((sum, o) => sum + o.total, 0);
 
   const hourTotals = new Map<number, { sales: number; orders: number }>();
   let minHour = 10;
@@ -228,6 +245,10 @@ export function buildHourlySalesSeries(orders: OrderRecord[], targetDay: Date = 
     totalSales,
     totalOrders,
     allDayOrdersCount: allDayOrders.length,
+    completedOrdersCount,
+    paidOrdersCount: dayOrders.length,
+    pendingPaymentsCount: pendingPaymentOrders.length,
+    unpaidAmount,
     cancelledOrdersCount,
     avgOrderValue,
     bestSellingItem: computeBestSellingItem(dayOrders),
@@ -236,12 +257,16 @@ export function buildHourlySalesSeries(orders: OrderRecord[], targetDay: Date = 
 }
 
 /**
- * Weekly Monday-to-Sunday breakdown from real completed orders.
+ * Weekly Monday-to-Sunday breakdown from real orders (revenue strictly from paid orders).
  */
 export function buildWeeklySalesSeries(orders: OrderRecord[], refDate: Date = new Date()): {
   buckets: ChartBucket[];
   totalSales: number;
   totalOrders: number;
+  allWeekOrdersCount: number;
+  paidOrdersCount: number;
+  pendingPaymentsCount: number;
+  unpaidAmount: number;
   avgOrderValue: number;
   bestDay: ChartBucket | null;
   bestSellingItem: BestSellingItemStat | null;
@@ -251,16 +276,34 @@ export function buildWeeklySalesSeries(orders: OrderRecord[], refDate: Date = ne
   const start = startOfIsoWeek(refDate);
   const end = endOfIsoWeek(refDate);
   const fmt = (d: Date) => d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
-  const weekOrders = filterOrdersInRange(orders, { start, end, label: '' }).filter(isRevenueOrder);
+  const allWeekOrders = filterOrdersInRange(orders, { start, end, label: '' }).filter(
+    (o) => !isCancelledOrder(o),
+  );
+  const weekOrders = allWeekOrders.filter(isRevenueOrder);
+  const pendingWeekOrders = allWeekOrders.filter((o) => o.payment_status !== 'paid');
+  const unpaidAmount = pendingWeekOrders.reduce((sum, o) => sum + o.total, 0);
 
   const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-  const buckets: ChartBucket[] = dayNames.map((label) => ({ label, sales: 0, orders: 0 }));
+  const buckets: ChartBucket[] = dayNames.map((label) => ({
+    label,
+    sales: 0,
+    orders: 0,
+    totalOrders: 0,
+    paidOrders: 0,
+    pendingPayments: 0,
+  }));
 
-  for (const ord of weekOrders) {
+  for (const ord of allWeekOrders) {
     const d = timestampToDate(ord.created_at);
     const dayIdx = (d.getDay() + 6) % 7; // Mon=0 ... Sun=6
-    buckets[dayIdx].sales += ord.total;
-    buckets[dayIdx].orders += 1;
+    buckets[dayIdx].totalOrders = (buckets[dayIdx].totalOrders || 0) + 1;
+    if (isRevenueOrder(ord)) {
+      buckets[dayIdx].sales += ord.total;
+      buckets[dayIdx].orders += 1;
+      buckets[dayIdx].paidOrders = (buckets[dayIdx].paidOrders || 0) + 1;
+    } else {
+      buckets[dayIdx].pendingPayments = (buckets[dayIdx].pendingPayments || 0) + 1;
+    }
   }
 
   const totalSales = weekOrders.reduce((sum, o) => sum + o.total, 0);
@@ -278,6 +321,10 @@ export function buildWeeklySalesSeries(orders: OrderRecord[], refDate: Date = ne
     buckets,
     totalSales,
     totalOrders,
+    allWeekOrdersCount: allWeekOrders.length,
+    paidOrdersCount: weekOrders.length,
+    pendingPaymentsCount: pendingWeekOrders.length,
+    unpaidAmount,
     avgOrderValue,
     bestDay,
     bestSellingItem: computeBestSellingItem(weekOrders),
@@ -296,6 +343,10 @@ export function buildMonthlySalesSeries(orders: OrderRecord[], year: number = ne
   avgOrderValue: number;
   completedOrders: OrderRecord[];
   currentMonthOrders: OrderRecord[];
+  currentMonthAllCount: number;
+  currentMonthCompletedCount: number;
+  currentMonthPendingPaymentsCount: number;
+  currentMonthUnpaidAmount: number;
   currentMonthSales: number;
   currentMonthAvg: number;
   currentMonthDiscounts: number;
@@ -303,21 +354,48 @@ export function buildMonthlySalesSeries(orders: OrderRecord[], year: number = ne
   currentMonthBestDay: { dateLabel: string; sales: number } | null;
 } {
   const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  const buckets: ChartBucket[] = monthNames.map((label) => ({ label, sales: 0, orders: 0 }));
+  const buckets: ChartBucket[] = monthNames.map((label) => ({
+    label,
+    sales: 0,
+    orders: 0,
+    totalOrders: 0,
+    paidOrders: 0,
+    pendingPayments: 0,
+  }));
 
   const now = new Date();
   const currentMonthIdx = now.getMonth();
   const yearOrders: OrderRecord[] = [];
   const currentMonthOrders: OrderRecord[] = [];
+  let currentMonthAllCount = 0;
+  let currentMonthCompletedCount = 0;
+  let currentMonthPendingPaymentsCount = 0;
+  let currentMonthUnpaidAmount = 0;
   const monthDayTotals = new Map<string, { dateLabel: string; sales: number }>();
 
   for (const ord of orders) {
-    if (!isRevenueOrder(ord)) continue;
+    if (isCancelledOrder(ord)) continue;
     const d = timestampToDate(ord.created_at);
     if (d.getFullYear() !== year) continue;
     const m = d.getMonth();
+    buckets[m].totalOrders = (buckets[m].totalOrders || 0) + 1;
+    if (m === currentMonthIdx) {
+      currentMonthAllCount += 1;
+      if (ord.status === 'completed') currentMonthCompletedCount += 1;
+      if (ord.payment_status !== 'paid') {
+        currentMonthPendingPaymentsCount += 1;
+        currentMonthUnpaidAmount += ord.total;
+      }
+    }
+
+    if (!isRevenueOrder(ord)) {
+      buckets[m].pendingPayments = (buckets[m].pendingPayments || 0) + 1;
+      continue;
+    }
+
     buckets[m].sales += ord.total;
     buckets[m].orders += 1;
+    buckets[m].paidOrders = (buckets[m].paidOrders || 0) + 1;
     yearOrders.push(ord);
     if (m === currentMonthIdx) {
       currentMonthOrders.push(ord);
@@ -354,6 +432,10 @@ export function buildMonthlySalesSeries(orders: OrderRecord[], year: number = ne
     avgOrderValue,
     completedOrders: yearOrders,
     currentMonthOrders,
+    currentMonthAllCount,
+    currentMonthCompletedCount,
+    currentMonthPendingPaymentsCount,
+    currentMonthUnpaidAmount,
     currentMonthSales,
     currentMonthAvg,
     currentMonthDiscounts,

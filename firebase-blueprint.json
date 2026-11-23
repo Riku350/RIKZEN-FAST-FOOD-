@@ -273,25 +273,43 @@
           "enum": [
             "pending",
             "accepted",
+            "confirmed",
             "preparing",
             "ready",
             "bill_requested",
             "bill_ready",
             "completed",
-            "rejected"
+            "rejected",
+            "cancelled"
           ]
         },
         "payment_status": {
           "type": "string",
-          "enum": ["not_paid", "pending", "paid", "failed"]
+          "enum": ["not_paid", "pending", "verification_requested", "paid", "not_received", "failed"]
         },
         "paid_at": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "payment_verified_by": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "payment_verified_at": {
           "type": "string",
           "maxLength": 64
         },
         "confirmed_at": {
           "type": "string",
           "maxLength": 64
+        },
+        "cancelled_at": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "cancelled_by": {
+          "type": "string",
+          "maxLength": 128
         },
         "upi_uri": {
           "type": "string",

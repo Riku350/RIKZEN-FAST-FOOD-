@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -44,10 +45,58 @@ try {
   FIREBASE_PROJECT_ID = '';
 }
 
-const ORDER_SIGNING_SECRET =
-  process.env.ORDER_SIGNING_SECRET && process.env.ORDER_SIGNING_SECRET.trim().length >= 16
-    ? process.env.ORDER_SIGNING_SECRET.trim()
-    : crypto.randomBytes(32).toString('hex');
+// Server-only ORDER_SIGNING_SECRET management (supports zero-downtime key rotation via ORDER_SIGNING_SECRET_PREVIOUS)
+// NEVER hardcode secrets or expose them to browser bundles, Firestore, bills, or API responses.
+const DEV_EPHEMERAL_SIGNING_KEY =
+  process.env.NODE_ENV !== 'production' ? crypto.randomBytes(32).toString('hex') : '';
+
+if (!process.env.ORDER_SIGNING_SECRET || process.env.ORDER_SIGNING_SECRET.trim().length < 16) {
+  console.error('[RikZen Security] ORDER_SIGNING_SECRET is not configured');
+}
+
+class OrderSecurityConfigError extends Error {
+  constructor() {
+    super('Order security configuration error');
+    this.name = 'OrderSecurityConfigError';
+  }
+}
+
+function getSigningSecretConfig(): {
+  configured: boolean;
+  rotationConfigured: boolean;
+  primary: string;
+  verificationKeys: string[];
+} {
+  const envPrimary = process.env.ORDER_SIGNING_SECRET?.trim() || '';
+  const envPrevious = process.env.ORDER_SIGNING_SECRET_PREVIOUS?.trim() || '';
+  const strictRequired =
+    process.env.NODE_ENV === 'production' || process.env.REQUIRE_ORDER_SIGNING_SECRET === 'true';
+
+  if (envPrimary.length >= 16) {
+    const keys = [envPrimary];
+    if (envPrevious.length >= 16 && envPrevious !== envPrimary) {
+      keys.push(envPrevious);
+    }
+    return {
+      configured: true,
+      rotationConfigured: keys.length > 1,
+      primary: envPrimary,
+      verificationKeys: keys,
+    };
+  }
+
+  if (strictRequired || !DEV_EPHEMERAL_SIGNING_KEY) {
+    console.error('[RikZen Security] ORDER_SIGNING_SECRET is not configured');
+    throw new OrderSecurityConfigError();
+  }
+
+  return {
+    configured: false,
+    rotationConfigured: false,
+    primary: DEV_EPHEMERAL_SIGNING_KEY,
+    verificationKeys: [DEV_EPHEMERAL_SIGNING_KEY],
+  };
+}
 
 // Shared server-side Gemini client for Natural Indian Female Voice TTS
 let sharedGeminiClient: GoogleGenAI | null = null;
@@ -313,6 +362,8 @@ async function verifyOwnerIdToken(authHeader?: string): Promise<{ uid: string; e
       exp?: number;
       email?: string;
       email_verified?: boolean;
+      admin?: boolean;
+      role?: string;
     };
 
     if (header.alg !== 'RS256' || !header.kid) return null;
@@ -322,7 +373,11 @@ async function verifyOwnerIdToken(authHeader?: string): Promise<{ uid: string; e
       if (payload.iss !== `https://securetoken.google.com/${FIREBASE_PROJECT_ID}`) return null;
     }
     if (!payload.email_verified || !payload.email) return null;
-    if (payload.email.toLowerCase() !== BOOTSTRAPPED_OWNER_EMAIL.toLowerCase()) return null;
+    const isAuthorizedOwner =
+      payload.admin === true ||
+      payload.role === 'owner' ||
+      payload.email.toLowerCase() === BOOTSTRAPPED_OWNER_EMAIL.toLowerCase();
+    if (!isAuthorizedOwner) return null;
 
     const certs = await getFirebasePublicCerts();
     const certPem = certs[header.kid];
@@ -378,7 +433,7 @@ function normalizeIndianMobile(raw: unknown): string | null {
   return `+91${digitsOnly}`;
 }
 
-function computeOrderSignature(data: SignableOrderPayload): string {
+function computeOrderSignatureWithKey(data: SignableOrderPayload, secretKey: string): string {
   const canonical = JSON.stringify({
     id: data.id,
     order_number: data.order_number,
@@ -401,34 +456,87 @@ function computeOrderSignature(data: SignableOrderPayload): string {
     customer_session_id: data.customer_session_id,
   });
 
-  return crypto.createHmac('sha256', ORDER_SIGNING_SECRET).update(canonical).digest('hex');
+  return crypto.createHmac('sha256', secretKey).update(canonical).digest('hex');
+}
+
+function computeOrderSignature(data: SignableOrderPayload): string {
+  const { primary } = getSigningSecretConfig();
+  return computeOrderSignatureWithKey(data, primary);
 }
 
 function verifyOrderSignature(data: SignableOrderPayload, providedSignature?: string): boolean {
   if (!providedSignature || !/^[a-fA-F0-9]{64}$/.test(providedSignature)) {
     return false;
   }
-  const expected = computeOrderSignature(data);
-  const a = Buffer.from(expected, 'hex');
-  const b = Buffer.from(providedSignature, 'hex');
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+  const { verificationKeys } = getSigningSecretConfig();
+  const providedBuf = Buffer.from(providedSignature, 'hex');
+  for (const key of verificationKeys) {
+    const expected = computeOrderSignatureWithKey(data, key);
+    const expectedBuf = Buffer.from(expected, 'hex');
+    if (expectedBuf.length === providedBuf.length && crypto.timingSafeEqual(expectedBuf, providedBuf)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const ACTION_SIGNATURE_MAX_AGE_MS = 15 * 60 * 1000;
+
+function signOrderAction(orderId: string, customerSessionId: string, issuedAt: number): string {
+  const { primary } = getSigningSecretConfig();
+  return crypto
+    .createHmac('sha256', primary)
+    .update(`action:${orderId}:${customerSessionId}:${issuedAt}`)
+    .digest('hex');
+}
+
+function verifyOrderActionSignature(
+  orderId: string,
+  customerSessionId: string,
+  issuedAt: number,
+  providedSig: string,
+): boolean {
+  if (!Number.isFinite(issuedAt) || !/^[a-fA-F0-9]{64}$/.test(providedSig)) return false;
+  const ageMs = Date.now() - issuedAt;
+  if (ageMs < -60_000 || ageMs > ACTION_SIGNATURE_MAX_AGE_MS) return false;
+  const { verificationKeys } = getSigningSecretConfig();
+  const providedBuf = Buffer.from(providedSig, 'hex');
+  for (const key of verificationKeys) {
+    const expected = crypto
+      .createHmac('sha256', key)
+      .update(`action:${orderId}:${customerSessionId}:${issuedAt}`)
+      .digest('hex');
+    const expectedBuf = Buffer.from(expected, 'hex');
+    if (expectedBuf.length === providedBuf.length && crypto.timingSafeEqual(expectedBuf, providedBuf)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function computeBillFileToken(orderId: string, filename: string): string {
+  const { primary } = getSigningSecretConfig();
   return crypto
-    .createHmac('sha256', ORDER_SIGNING_SECRET)
+    .createHmac('sha256', primary)
     .update(`billfile:${orderId}:${filename}`)
     .digest('hex');
 }
 
 function verifyBillFileToken(orderId: string, filename: string, providedSig: string): boolean {
   if (!/^[a-fA-F0-9]{64}$/.test(providedSig)) return false;
-  const expected = computeBillFileToken(orderId, filename);
-  const a = Buffer.from(expected, 'hex');
-  const b = Buffer.from(providedSig, 'hex');
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+  const { verificationKeys } = getSigningSecretConfig();
+  const providedBuf = Buffer.from(providedSig, 'hex');
+  for (const key of verificationKeys) {
+    const expected = crypto
+      .createHmac('sha256', key)
+      .update(`billfile:${orderId}:${filename}`)
+      .digest('hex');
+    const expectedBuf = Buffer.from(expected, 'hex');
+    if (expectedBuf.length === providedBuf.length && crypto.timingSafeEqual(expectedBuf, providedBuf)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function buildBillStorageInfo(orderId: string, orderCode: string) {
@@ -1055,10 +1163,10 @@ app.post('/api/owner/voice-alert-tts', async (req, res) => {
 
   const paceInstruction =
     speed === 'slow'
-      ? 'Speak slowly and deliberately with clear gentle pauses between sentences.'
+      ? 'Speak slowly, loudly, and deliberately with clear polite pauses between sentences.'
       : speed === 'fast'
-        ? 'Speak clearly at a brisk, crisp, polite counter pace with short natural pauses.'
-        : 'Speak at a calm, comfortable medium pace with natural polite pauses between sentences.';
+        ? 'Speak clearly, loudly, and crisply at a brisk counter pace with short natural pauses.'
+        : 'Speak clearly, loudly, and slightly slower than normal with polite natural pauses between sentences.';
 
   try {
     const response = await ai.models.generateContent({
@@ -1070,7 +1178,7 @@ app.post('/api/owner/voice-alert-tts', async (req, res) => {
             {
               text: rawText,
               speechMetadata: {
-                style: `Warm, polite, natural Indian English female restaurant staff announcing a new order in a modern cafe. Authentic soft Indian English pronunciation, clear, welcoming, never robotic or rushed. ${paceInstruction}`,
+                style: `Warm, polite, natural Indian English female restaurant counter staff speaking clearly inside a lively fast food cafe. Pronounce every Indian cafe food item naturally and distinctly (especially "Fries" as "fryze", "French Fries", "Chicken Roll", "Burger Combo", "Lassi", "Momos", "Cold Drink"). Loud, clear, welcoming, never robotic or rushed. ${paceInstruction}`,
               },
             },
           ],
@@ -1106,6 +1214,155 @@ app.post('/api/owner/voice-alert-tts', async (req, res) => {
       success: false,
       error: err instanceof Error ? err.message : 'Unable to synthesize voice alert audio.',
     });
+  }
+});
+
+// Cached natural Indian female cancellation notice for customers (fixed script — zero injection surface)
+let cachedCancellationWav: Buffer | null = null;
+
+app.get('/api/public/cancellation-tts', async (_req, res) => {
+  try {
+    if (cachedCancellationWav && cachedCancellationWav.length > 100) {
+      res.setHeader('Content-Type', 'audio/wav');
+      res.setHeader('Content-Length', String(cachedCancellationWav.length));
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.status(200).send(cachedCancellationWav);
+      return;
+    }
+
+    const ai = getGeminiClient();
+    if (!ai) {
+      res.status(503).json({
+        success: false,
+        code: 'VOICE_TTS_NOT_CONFIGURED',
+        error: 'Server TTS unavailable; using browser Indian English voice.',
+      });
+      return;
+    }
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash-lite-tts',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: 'Your order has been cancelled. Please contact RikZen Fast Food for assistance.',
+              speechMetadata: {
+                style:
+                  'Polite, clear, calm natural Indian English female restaurant staff voice. Loud enough to hear clearly, normal pace, warm and helpful, never robotic.',
+              },
+            },
+          ],
+        },
+      ],
+      config: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: 'Kore' },
+          },
+        },
+      },
+    });
+
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!base64Audio) {
+      res.status(502).json({ success: false, error: 'Empty voice payload.' });
+      return;
+    }
+
+    cachedCancellationWav = Buffer.from(base64Audio, 'base64');
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Content-Length', String(cachedCancellationWav.length));
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.status(200).send(cachedCancellationWav);
+  } catch (err) {
+    console.error('[RikZen Cancellation TTS Error]', err);
+    res.status(502).json({ success: false, error: 'Unable to synthesize cancellation voice.' });
+  }
+});
+
+/**
+ * Owner-authenticated safe server diagnostics (never returns secrets or full signatures).
+ */
+app.get('/api/owner/diagnostics', async (req, res) => {
+  const owner = await verifyOwnerIdToken(req.headers.authorization);
+  if (!owner) {
+    res.status(401).json({ success: false, error: 'Owner authentication required.' });
+    return;
+  }
+
+  let signingConfigured = false;
+  let rotationConfigured = false;
+  try {
+    const cfg = getSigningSecretConfig();
+    signingConfigured = cfg.configured;
+    rotationConfigured = cfg.rotationConfigured;
+  } catch {
+    signingConfigured = false;
+  }
+
+  res.json({
+    success: true,
+    projectId: FIREBASE_PROJECT_ID || null,
+    nodeEnv: process.env.NODE_ENV || 'development',
+    owner: {
+      uid: owner.uid,
+      email: owner.email,
+      role: 'owner',
+    },
+    orderSigningSecretConfigured: signingConfigured,
+    secretRotationConfigured: rotationConfigured,
+    voiceTtsConfigured: Boolean(
+      process.env.GEMINI_API_KEY?.trim() && process.env.GEMINI_API_KEY.trim() !== 'MY_GEMINI_API_KEY',
+    ),
+    manualPaymentMode: true,
+  });
+});
+
+/**
+ * Owner-authenticated order action verification endpoint (replay-protected).
+ */
+app.post('/api/owner/orders/verify-action', async (req, res) => {
+  const owner = await verifyOwnerIdToken(req.headers.authorization);
+  if (!owner) {
+    res.status(401).json({ success: false, error: 'Owner authentication required.' });
+    return;
+  }
+  const body = req.body as {
+    orderId?: string;
+    customerSessionId?: string;
+    issuedAt?: number;
+    actionSignature?: string;
+  };
+  if (
+    !body.orderId ||
+    !body.customerSessionId ||
+    typeof body.issuedAt !== 'number' ||
+    !body.actionSignature
+  ) {
+    res.status(400).json({ success: false, error: 'Missing signed action parameters.' });
+    return;
+  }
+  try {
+    const valid = verifyOrderActionSignature(
+      body.orderId,
+      body.customerSessionId,
+      body.issuedAt,
+      body.actionSignature,
+    );
+    if (!valid) {
+      res.status(403).json({ success: false, error: 'Signature verification failed or expired.' });
+      return;
+    }
+    res.json({ success: true, verified: true });
+  } catch (err) {
+    if (err instanceof OrderSecurityConfigError) {
+      res.status(500).json({ success: false, error: 'Order security configuration error.' });
+      return;
+    }
+    res.status(500).json({ success: false, error: 'Order verification error.' });
   }
 });
 
@@ -1399,6 +1656,9 @@ app.post('/api/orders/verify', async (req, res) => {
     };
 
     const serverSignature = computeOrderSignature(signable);
+    const issuedAt = Date.now();
+    const actionSignature = signOrderAction(orderId, customerSessionId, issuedAt);
+    console.log(`[RikZen Order Signing] Order ID: ${orderCode} | Signature verification: SUCCESS`);
     const upiUri =
       livePaymentSettings.payment_mode === 'dynamic_upi'
         ? buildDynamicUpiUri({
@@ -1428,6 +1688,8 @@ app.post('/api/orders/verify', async (req, res) => {
       pdf_path: '',
       generated_at: '',
       server_signature: serverSignature,
+      issued_at: issuedAt,
+      action_signature: actionSignature,
       notes,
     };
 
@@ -1440,6 +1702,13 @@ app.post('/api/orders/verify', async (req, res) => {
 
     res.json(responsePayload);
   } catch (err) {
+    if (err instanceof OrderSecurityConfigError) {
+      res.status(500).json({
+        success: false,
+        error: 'Order security configuration error.',
+      });
+      return;
+    }
     console.error('[RikZen Order Verify Error]', err);
     res.status(500).json({
       success: false,

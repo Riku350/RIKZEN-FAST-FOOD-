@@ -8,7 +8,7 @@ service cloud.firestore {
     }
 
     // =========================================================================
-    // Hardened Global Helpers
+    // Hardened Global Helpers & Authoritative Owner Role
     // =========================================================================
 
     function incoming() {
@@ -64,14 +64,19 @@ service cloud.firestore {
       return request.auth != null && request.auth.token.email_verified == true;
     }
 
-    function isOwner(userId) {
+    function isSelf(userId) {
       return isSignedIn() && request.auth.uid == userId;
     }
 
-    function isAdmin() {
+    // Single authoritative owner/admin check verified independently by Firestore
+    function isOwner() {
       return isSignedIn() && (
+        request.auth.token.admin == true ||
+        request.auth.token.role == 'owner' ||
         (request.auth.token.email is string && request.auth.token.email.lower() == 'rikudatabackup@gmail.com') ||
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'owner')
       );
     }
 
@@ -180,6 +185,29 @@ service cloud.firestore {
         item.line_total is number && item.line_total == item.unit_price * item.quantity;
     }
 
+    function isValidOrderMutableFields(data) {
+      return data.status in [
+          'pending', 'accepted', 'confirmed', 'preparing', 'ready',
+          'bill_requested', 'bill_ready', 'completed', 'rejected', 'cancelled'
+        ] &&
+        (!('payment_status' in data) || data.payment_status in ['not_paid', 'pending', 'verification_requested', 'paid', 'not_received', 'failed']) &&
+        (!('paid_at' in data) || (data.paid_at is string && data.paid_at.size() <= 64)) &&
+        (!('payment_verified_by' in data) || (data.payment_verified_by is string && data.payment_verified_by.size() <= 128)) &&
+        (!('payment_verified_at' in data) || (data.payment_verified_at is string && data.payment_verified_at.size() <= 64)) &&
+        (!('confirmed_at' in data) || (data.confirmed_at is string && data.confirmed_at.size() <= 64)) &&
+        (!('cancelled_at' in data) || (data.cancelled_at is string && data.cancelled_at.size() <= 64)) &&
+        (!('cancelled_by' in data) || (data.cancelled_by is string && data.cancelled_by.size() <= 128)) &&
+        (!('upi_uri' in data) || isSafeUpiUri(data.upi_uri)) &&
+        (!('public_bill_id' in data) || (data.public_bill_id is string && data.public_bill_id.size() <= 64 && (data.public_bill_id == '' || data.public_bill_id.matches('^[a-zA-Z0-9_\\-]+$')))) &&
+        (!('payment_qr_snapshot' in data) || data.payment_qr_snapshot == null || isValidPaymentQrSnapshot(data.payment_qr_snapshot)) &&
+        (!('pdf_ready' in data) || data.pdf_ready is bool) &&
+        (!('bill_status' in data) || data.bill_status in ['not_generated', 'generating', 'generated', 'sending', 'sent', 'failed', 'retrying']) &&
+        (!('pdf_url' in data) || isSafeBillUrl(data.pdf_url)) &&
+        (!('pdf_path' in data) || isSafeBillPath(data.pdf_path)) &&
+        (!('generated_at' in data) || (data.generated_at is string && data.generated_at.size() <= 64)) &&
+        data.updated_at is timestamp;
+    }
+
     function isValidOrder(data, orderId) {
       return data.keys().hasAll([
           'id', 'order_number', 'order_code', 'table_id', 'table_number',
@@ -191,7 +219,8 @@ service cloud.firestore {
           'id', 'order_number', 'order_code', 'table_id', 'table_number',
           'customer_name', 'customer_mobile', 'items', 'item_count',
           'subtotal', 'discount', 'total', 'status',
-          'payment_status', 'paid_at', 'confirmed_at', 'upi_uri',
+          'payment_status', 'paid_at', 'payment_verified_by', 'payment_verified_at',
+          'confirmed_at', 'cancelled_at', 'cancelled_by', 'upi_uri',
           'public_bill_id', 'payment_qr_snapshot',
           'pdf_ready', 'bill_status', 'pdf_url', 'pdf_path', 'generated_at',
           'sent_at', 'send_status', 'whatsapp_status', 'whatsapp_error',
@@ -211,18 +240,7 @@ service cloud.firestore {
         data.subtotal is number && data.subtotal >= 1 && data.subtotal <= 50000 &&
         data.discount is number && data.discount >= 0 && data.discount < data.subtotal &&
         data.total is number && data.total == data.subtotal - data.discount &&
-        data.status in ['pending', 'accepted', 'preparing', 'ready', 'bill_requested', 'bill_ready', 'completed', 'rejected'] &&
-        (!('payment_status' in data) || data.payment_status in ['not_paid', 'pending', 'paid', 'failed']) &&
-        (!('paid_at' in data) || (data.paid_at is string && data.paid_at.size() <= 64)) &&
-        (!('confirmed_at' in data) || (data.confirmed_at is string && data.confirmed_at.size() <= 64)) &&
-        (!('upi_uri' in data) || isSafeUpiUri(data.upi_uri)) &&
-        (!('public_bill_id' in data) || (data.public_bill_id is string && data.public_bill_id.size() <= 64 && (data.public_bill_id == '' || data.public_bill_id.matches('^[a-zA-Z0-9_\\-]+$')))) &&
-        (!('payment_qr_snapshot' in data) || data.payment_qr_snapshot == null || isValidPaymentQrSnapshot(data.payment_qr_snapshot)) &&
-        data.pdf_ready is bool &&
-        (!('bill_status' in data) || data.bill_status in ['not_generated', 'generating', 'generated', 'sending', 'sent', 'failed', 'retrying']) &&
-        (!('pdf_url' in data) || isSafeBillUrl(data.pdf_url)) &&
-        (!('pdf_path' in data) || isSafeBillPath(data.pdf_path)) &&
-        (!('generated_at' in data) || (data.generated_at is string && data.generated_at.size() <= 64)) &&
+        isValidOrderMutableFields(data) &&
         (!('sent_at' in data) || (data.sent_at is string && data.sent_at.size() <= 64)) &&
         (!('send_status' in data) || data.send_status in ['not_sent', 'sending', 'retrying', 'sent', 'failed']) &&
         (!('whatsapp_status' in data) || data.whatsapp_status in ['not_sent', 'sending', 'retrying', 'sent', 'failed']) &&
@@ -236,39 +254,20 @@ service cloud.firestore {
         data.updated_at is timestamp;
     }
 
-    function orderImmutableFieldsUnchanged() {
-      return incoming().id == existing().id &&
-        incoming().order_number == existing().order_number &&
-        incoming().order_code == existing().order_code &&
-        incoming().table_id == existing().table_id &&
-        incoming().table_number == existing().table_number &&
-        incoming().customer_name == existing().customer_name &&
-        incoming().customer_mobile == existing().customer_mobile &&
-        incoming().items == existing().items &&
-        incoming().item_count == existing().item_count &&
-        incoming().subtotal == existing().subtotal &&
-        incoming().discount == existing().discount &&
-        incoming().total == existing().total &&
-        incoming().customer_session_id == existing().customer_session_id &&
-        incoming().server_signature == existing().server_signature &&
-        incoming().notes == existing().notes &&
-        incoming().created_at == existing().created_at;
-    }
-
     // =========================================================================
     // Collection Rules
     // =========================================================================
 
     // Users (Owner/Staff PII strictly isolated)
     match /users/{userId} {
-      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
-      allow list: if isAdmin();
-      allow create: if isValidId(userId) && isAdmin() && isValidUser(incoming(), userId) &&
+      allow get: if isValidId(userId) && (isSelf(userId) || isOwner());
+      allow list: if isOwner();
+      allow create: if isValidId(userId) && isOwner() && isValidUser(incoming(), userId) &&
         incoming().created_at == request.time &&
         incoming().updated_at == request.time;
       allow update: if isValidId(userId) && isValidUser(incoming(), userId) && (
-        (isAdmin() && incoming().uid == existing().uid && incoming().created_at == existing().created_at && incoming().updated_at == request.time) ||
-        (isOwner(userId) &&
+        (isOwner() && incoming().uid == existing().uid && incoming().created_at == existing().created_at && incoming().updated_at == request.time) ||
+        (isSelf(userId) &&
           incoming().diff(existing()).affectedKeys().hasOnly(['display_name', 'updated_at']) &&
           incoming().uid == existing().uid &&
           incoming().email == existing().email &&
@@ -276,79 +275,79 @@ service cloud.firestore {
           incoming().created_at == existing().created_at &&
           incoming().updated_at == request.time)
       );
-      allow delete: if isValidId(userId) && isAdmin();
+      allow delete: if isValidId(userId) && isOwner();
     }
 
     // Trusted Admin Registry
     match /admins/{adminId} {
-      allow get: if isValidId(adminId) && isAdmin();
-      allow list: if isAdmin();
-      allow create: if isValidId(adminId) && isAdmin() && isValidAdminDoc(incoming(), adminId) &&
+      allow get: if isValidId(adminId) && isOwner();
+      allow list: if isOwner();
+      allow create: if isValidId(adminId) && isOwner() && isValidAdminDoc(incoming(), adminId) &&
         incoming().created_at == request.time;
       allow update: if false;
-      allow delete: if isValidId(adminId) && isAdmin();
+      allow delete: if isValidId(adminId) && isOwner();
     }
 
     // Public Menu Catalog (Customer READ ONLY; Owner CRUD only)
     match /menu_items/{itemId} {
       allow get: if isValidId(itemId);
       allow list: if true;
-      allow create: if isValidId(itemId) && isAdmin() && isValidMenuItem(incoming(), itemId) &&
+      allow create: if isValidId(itemId) && isOwner() && isValidMenuItem(incoming(), itemId) &&
         incoming().created_at == request.time &&
         incoming().updated_at == request.time;
-      allow update: if isValidId(itemId) && isAdmin() && isValidMenuItem(incoming(), itemId) &&
+      allow update: if isValidId(itemId) && isOwner() && isValidMenuItem(incoming(), itemId) &&
         incoming().id == existing().id &&
         (!('created_at' in existing()) || incoming().created_at == existing().created_at) &&
         incoming().updated_at == request.time;
-      allow delete: if isValidId(itemId) && isAdmin();
+      allow delete: if isValidId(itemId) && isOwner();
     }
 
     // Promotional Combo Offers (Customer READ ONLY; Owner CRUD only)
     match /offers/{offerId} {
       allow get: if isValidId(offerId);
       allow list: if true;
-      allow create: if isValidId(offerId) && isAdmin() && isValidOffer(incoming(), offerId) &&
+      allow create: if isValidId(offerId) && isOwner() && isValidOffer(incoming(), offerId) &&
         incoming().created_at == request.time &&
         incoming().updated_at == request.time;
-      allow update: if isValidId(offerId) && isAdmin() && isValidOffer(incoming(), offerId) &&
+      allow update: if isValidId(offerId) && isOwner() && isValidOffer(incoming(), offerId) &&
         incoming().id == existing().id &&
         (!('created_at' in existing()) || incoming().created_at == existing().created_at) &&
         incoming().updated_at == request.time;
-      allow delete: if isValidId(offerId) && isAdmin();
+      allow delete: if isValidId(offerId) && isOwner();
     }
 
     // Physical Restaurant Tables (6 tables)
     match /tables/{tableId} {
       allow get: if isValidId(tableId) && tableId in ['table_1', 'table_2', 'table_3', 'table_4', 'table_5', 'table_6'];
-      allow list: if isAdmin();
-      allow create: if isValidId(tableId) && isAdmin() && isValidTable(incoming(), tableId) &&
+      allow list: if isOwner();
+      allow create: if isValidId(tableId) && isOwner() && isValidTable(incoming(), tableId) &&
         incoming().updated_at == request.time;
-      allow update: if isValidId(tableId) && isAdmin() && isValidTable(incoming(), tableId) &&
+      allow update: if isValidId(tableId) && isOwner() && isValidTable(incoming(), tableId) &&
         incoming().id == existing().id &&
         incoming().table_number == existing().table_number &&
         incoming().updated_at == request.time;
-      allow delete: if isValidId(tableId) && isAdmin();
+      allow delete: if isValidId(tableId) && isOwner();
     }
 
     // Public Restaurant Payment Settings (Uploaded QR or Dynamic UPI QR — zero secrets)
     match /shop_settings/{settingId} {
       allow get: if isValidId(settingId) && settingId == 'payment';
-      allow list: if isAdmin();
-      allow create: if isValidId(settingId) && isAdmin() && isValidPaymentSettings(incoming(), settingId) &&
+      allow list: if isOwner();
+      allow create: if isValidId(settingId) && isOwner() && isValidPaymentSettings(incoming(), settingId) &&
         incoming().updated_at == request.time;
-      allow update: if isValidId(settingId) && isAdmin() && isValidPaymentSettings(incoming(), settingId) &&
+      allow update: if isValidId(settingId) && isOwner() && isValidPaymentSettings(incoming(), settingId) &&
         incoming().id == existing().id &&
         incoming().updated_at == request.time;
       allow delete: if false;
     }
 
-    // Real-time Dine-In Orders (Strict Customer Isolation + Server-Verified Totals + Public Bill Snapshot)
+    // Real-time Dine-In Orders (Strict Customer Isolation + Verified Totals + Owner Partial Updates)
     match /orders/{orderId} {
       // Only verified shop owner can list all orders. Customers can only read their own order via unguessable ID.
-      allow get: if isAdmin() || isValidOrderDocId(orderId);
-      allow list: if isAdmin();
+      allow get: if isOwner() || isValidOrderDocId(orderId);
+      allow list: if isOwner();
 
-      // Customers create server-verified pending orders (never pre-marked as paid or confirmed).
+      // Customers create verified pending orders (never pre-marked as paid or confirmed).
       allow create: if isValidOrderDocId(orderId) &&
         isValidOrder(incoming(), orderId) &&
         incoming().status == 'pending' &&
@@ -358,26 +357,32 @@ service cloud.firestore {
         incoming().created_at == request.time &&
         incoming().updated_at == request.time;
 
-      // Action-based update with Terminal State Locking and Owner Tier 1 vs Customer Tier 2
+      // Partial-update rule: strictly locks all immutable order fields via affectedKeys().hasOnly(...)
+      // while validating every mutable field written by Owner (Tier 1) or Customer Actions (Tier 2).
       allow update: if isValidOrderDocId(orderId) &&
-        isValidOrder(incoming(), orderId) &&
-        orderImmutableFieldsUnchanged() &&
+        isValidOrderMutableFields(incoming()) &&
         incoming().updated_at == request.time && (
-          // Tier 1: Verified Owner manages lifecycle, confirmation, payment verification, and bill snapshot
-          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly([
-            'status', 'confirmed_at', 'payment_status', 'paid_at', 'upi_uri',
-            'public_bill_id', 'payment_qr_snapshot',
+          // Tier 1: Verified Owner manages lifecycle, confirmation, cancellation, manual payment verification, and bill snapshot
+          (isOwner() && incoming().diff(existing()).affectedKeys().hasOnly([
+            'status', 'confirmed_at', 'cancelled_at', 'cancelled_by',
+            'payment_status', 'paid_at', 'payment_verified_by', 'payment_verified_at',
+            'upi_uri', 'public_bill_id', 'payment_qr_snapshot',
             'pdf_ready', 'bill_status', 'pdf_url', 'pdf_path',
             'generated_at', 'updated_at'
           ])) ||
-          // Tier 2: Dine-in customer can ONLY request bill on an active confirmed/preparing/ready order
-          (!(existing().status in ['completed', 'rejected']) &&
-            existing().status in ['accepted', 'preparing', 'ready'] &&
+          // Tier 2a: Dine-in customer can ONLY request bill on an active confirmed/preparing/ready order
+          (!(existing().status in ['completed', 'rejected', 'cancelled']) &&
+            existing().status in ['accepted', 'confirmed', 'preparing', 'ready'] &&
             incoming().status == 'bill_requested' &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updated_at']))
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updated_at'])) ||
+          // Tier 2b: Dine-in customer can ONLY request manual payment verification ("I HAVE PAID") — NEVER mark paid!
+          (!(existing().status in ['rejected', 'cancelled']) &&
+            (!('payment_status' in existing()) || existing().payment_status != 'paid') &&
+            incoming().payment_status == 'verification_requested' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['payment_status', 'updated_at']))
         );
 
-      allow delete: if isValidOrderDocId(orderId) && isAdmin();
+      allow delete: if isValidOrderDocId(orderId) && isOwner();
     }
 
     // Connection test probe

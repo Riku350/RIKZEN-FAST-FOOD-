@@ -48,10 +48,10 @@ export const DEFAULT_VOICE_SETTINGS: VoiceAlertSettings = {
 };
 
 export const TEST_ANNOUNCEMENT_SEGMENTS = [
-  'Test announcement.',
-  'New order received from Table number 3.',
-  'Customer Riku Kumar has ordered two Chicken Rolls.',
-  'Total amount is one hundred and sixty rupees.',
+  'Attention please. Test announcement.',
+  'New order received. Table three.',
+  'Customer Riku Kumar has ordered two Chicken Rolls and one French Fries.',
+  'Total amount is two hundred and twenty rupees.',
   'Please confirm the order.',
 ];
 
@@ -242,7 +242,11 @@ const INVARIANT_PLURAL_ENDINGS = [
 function cleanSpokenItemName(name: string): string {
   return name
     .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '')
+    .replace(/[_]+/g, ' ')
     .replace(/\s+/g, ' ')
+    .replace(/\b(french\s+)?fries\b/gi, (match) =>
+      match.toLowerCase().startsWith('french') ? 'French Fries' : 'Fries',
+    )
     .trim();
 }
 
@@ -277,13 +281,14 @@ function sanitizeCustomerNameForSpeech(rawName: string | undefined | null): stri
 /**
  * Builds the clear, natural restaurant announcement segments for an order.
  * Always announces Table first, Customer Name (never phone), EVERY item & quantity,
- * the backend-verified final total in rupees, and "Please confirm the order."
+ * the verified final total in rupees, and "Please confirm the order."
  */
 export function buildOrderAnnouncement(order: OrderRecord): {
   segments: string[];
   fullScript: string;
 } {
   const safeTable = Number.isInteger(order.table_number) ? order.table_number : 1;
+  const tableWord = numberToIndianEnglishWords(safeTable);
   const safeName = sanitizeCustomerNameForSpeech(order.customer_name);
 
   const itemPhrases = (order.items || []).map((line) => {
@@ -293,26 +298,29 @@ export function buildOrderAnnouncement(order: OrderRecord): {
     return `${qtyWord} ${itemName}`;
   });
 
-  let itemsSentence: string;
-  if (itemPhrases.length === 0) {
-    itemsSentence = 'Ordered items are listed on your dashboard.';
-  } else if (itemPhrases.length === 1) {
-    itemsSentence = `Ordered items are: ${itemPhrases[0]}.`;
+  let itemsJoined = '';
+  if (itemPhrases.length === 1) {
+    itemsJoined = itemPhrases[0];
   } else if (itemPhrases.length === 2) {
-    itemsSentence = `Ordered items are: ${itemPhrases[0]}, and ${itemPhrases[1]}.`;
-  } else {
-    const leading = itemPhrases.slice(0, -1).join(', ');
-    const last = itemPhrases[itemPhrases.length - 1];
-    itemsSentence = `Ordered items are: ${leading}, and ${last}.`;
+    itemsJoined = `${itemPhrases[0]} and ${itemPhrases[1]}`;
+  } else if (itemPhrases.length > 2) {
+    itemsJoined = `${itemPhrases.slice(0, -1).join(', ')}, and ${itemPhrases[itemPhrases.length - 1]}`;
   }
+
+  const orderSentence = itemsJoined
+    ? safeName
+      ? `Customer ${safeName} has ordered ${itemsJoined}.`
+      : `Ordered items are ${itemsJoined}.`
+    : safeName
+      ? `Customer ${safeName} has placed an order.`
+      : 'Ordered items are listed on your dashboard.';
 
   const totalInWords = formatRupeesInWords(order.total);
 
   const segments = [
     'Attention please. New order received.',
-    `Table number ${safeTable}.`,
-    safeName ? `Customer name is ${safeName}.` : 'Customer name was not provided.',
-    itemsSentence,
+    `Table ${tableWord}.`,
+    orderSentence,
     `Total amount is ${totalInWords}.`,
     'Please confirm the order.',
   ];
@@ -421,12 +429,12 @@ export async function playOrderNotificationBell(volumePercent: number): Promise<
 function getSpeedRate(speed: VoiceSpeed): { audioRate: number; speechRate: number } {
   switch (speed) {
     case 'slow':
-      return { audioRate: 0.88, speechRate: 0.85 };
+      return { audioRate: 0.88, speechRate: 0.86 };
     case 'fast':
-      return { audioRate: 1.1, speechRate: 1.06 };
+      return { audioRate: 1.04, speechRate: 1.0 };
     case 'normal':
     default:
-      return { audioRate: 0.96, speechRate: 0.95 };
+      return { audioRate: 0.94, speechRate: 0.92 };
   }
 }
 
@@ -435,13 +443,12 @@ function scoreIndianFemaleVoice(voice: SpeechSynthesisVoice): number {
   const lang = voice.lang.toLowerCase();
   let score = 0;
 
-  // Strongly prefer Indian English (en-IN) so English order scripts sound clear and natural
-  if (lang === 'en-in' || lang.startsWith('en-in')) score += 140;
-  else if (name.includes('india') && lang.startsWith('en')) score += 110;
-  else if (lang.startsWith('en-gb') || lang.startsWith('en-au')) score += 35;
-  else if (lang.startsWith('en')) score += 20;
-  else if (lang.startsWith('hi-in') && name.includes('english')) score += 60;
-  else score -= 120; // Avoid non-English voices that mumble or fail on English text
+  // Strongly prefer Indian English (en-IN) so English food names like "Fries" sound clear and natural
+  if (lang === 'en-in' || lang.startsWith('en-in')) score += 160;
+  else if (name.includes('india') && lang.startsWith('en')) score += 120;
+  else if (lang.startsWith('en-gb') || lang.startsWith('en-au')) score += 45;
+  else if (lang.startsWith('en')) score += 25;
+  else score -= 180; // Never use Hindi-only (hi-IN) or non-English voices that mispronounce "Fries" as "frees"
 
   // Strongly prefer well-known natural Indian female voices
   const preferredFemaleKeywords = [
@@ -1091,3 +1098,135 @@ class VoiceOrderAnnouncementManager {
 }
 
 export const voiceOrderAlertManager = new VoiceOrderAnnouncementManager();
+
+// ============================================================================
+// CUSTOMER-FACING ORDER CANCELLATION VOICE ALERT (NATURAL INDIAN FEMALE)
+// ============================================================================
+
+const CUSTOMER_CANCELLED_ANNOUNCED_KEY = 'rikzen_customer_cancelled_voice_v1';
+const CUSTOMER_CANCEL_TEXT =
+  'Your order has been cancelled. Please contact RikZen Fast Food for assistance.';
+let customerCancelSpeaking = false;
+let customerCancelServerTtsFailed = false;
+let customerActiveUtterance: SpeechSynthesisUtterance | null = null;
+
+function hasCustomerCancelBeenSpoken(orderId: string): boolean {
+  if (typeof window === 'undefined' || !orderId) return true;
+  try {
+    const raw = window.sessionStorage.getItem(CUSTOMER_CANCELLED_ANNOUNCED_KEY);
+    if (!raw) return false;
+    const arr = JSON.parse(raw) as unknown;
+    return Array.isArray(arr) && arr.includes(orderId);
+  } catch {
+    return false;
+  }
+}
+
+function markCustomerCancelSpoken(orderId: string): void {
+  if (typeof window === 'undefined' || !orderId) return;
+  try {
+    const raw = window.sessionStorage.getItem(CUSTOMER_CANCELLED_ANNOUNCED_KEY);
+    const list: string[] = raw ? (JSON.parse(raw) as string[]) : [];
+    if (!list.includes(orderId)) {
+      list.push(orderId);
+      window.sessionStorage.setItem(
+        CUSTOMER_CANCELLED_ANNOUNCED_KEY,
+        JSON.stringify(list.slice(-50)),
+      );
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export async function unlockCustomerAudioOnGesture(): Promise<void> {
+  await unlockOwnerAudioContext();
+}
+
+/**
+ * Announces order cancellation once per order in a clear, loud, polite Indian female voice.
+ * Uses cached server Gemini Indian female TTS when available, with en-IN browser speech fallback.
+ */
+export async function speakCustomerOrderCancelled(orderId: string): Promise<void> {
+  if (!orderId || customerCancelSpeaking || hasCustomerCancelBeenSpoken(orderId)) return;
+  markCustomerCancelSpoken(orderId);
+  customerCancelSpeaking = true;
+
+  try {
+    // 1. Try cached natural Indian female TTS from server
+    if (!customerCancelServerTtsFailed) {
+      try {
+        const resp = await fetch('/api/public/cancellation-tts', { method: 'GET' });
+        const ct = (resp.headers.get('content-type') || '').toLowerCase();
+        if (resp.ok && ct.includes('audio/')) {
+          const blob = await resp.blob();
+          if (blob.size > 100) {
+            const url = URL.createObjectURL(blob);
+            try {
+              const audio = new Audio(url);
+              audio.volume = 1.0;
+              audio.playbackRate = 0.96;
+              const played = await new Promise<boolean>((resolve) => {
+                audio.onended = () => resolve(true);
+                audio.onerror = () => resolve(false);
+                const p = audio.play();
+                if (p) p.catch(() => resolve(false));
+              });
+              if (played) return;
+            } finally {
+              URL.revokeObjectURL(url);
+            }
+          }
+        } else if (resp.status === 404 || resp.status === 405 || resp.status === 503 || ct.includes('text/html')) {
+          customerCancelServerTtsFailed = true;
+        }
+      } catch {
+        customerCancelServerTtsFailed = true;
+      }
+    }
+
+    // 2. Clean browser Indian English female speech fallback (volume 1.0, rate 0.93)
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      const synth = window.speechSynthesis;
+      const voice = await resolveBestIndianFemaleBrowserVoice();
+      if (synth.speaking || synth.pending) {
+        synth.cancel();
+        await new Promise((r) => window.setTimeout(r, 70));
+      }
+      if (synth.paused) synth.resume();
+
+      await new Promise<void>((resolve) => {
+        const utterance = new SpeechSynthesisUtterance(CUSTOMER_CANCEL_TEXT);
+        utterance.lang = voice?.lang || 'en-IN';
+        if (voice) utterance.voice = voice;
+        utterance.volume = 1.0;
+        utterance.rate = 0.93;
+        utterance.pitch = 1.02;
+        customerActiveUtterance = utterance;
+        const timer = window.setTimeout(() => {
+          customerActiveUtterance = null;
+          resolve();
+        }, 12000);
+        utterance.onend = () => {
+          window.clearTimeout(timer);
+          customerActiveUtterance = null;
+          resolve();
+        };
+        utterance.onerror = () => {
+          window.clearTimeout(timer);
+          customerActiveUtterance = null;
+          resolve();
+        };
+        try {
+          synth.speak(utterance);
+        } catch {
+          window.clearTimeout(timer);
+          customerActiveUtterance = null;
+          resolve();
+        }
+      });
+    }
+  } finally {
+    customerCancelSpeaking = false;
+  }
+}

@@ -17,6 +17,7 @@ import {
   Share2,
   Smartphone,
   Sparkles,
+  XCircle,
 } from 'lucide-react';
 import {
   copyBillLinkToClipboard,
@@ -27,11 +28,14 @@ import {
 import { generateClientBillPdfBlob } from '../lib/clientPdfBill';
 import { downloadPaymentQrPng } from '../lib/paymentQrDownload';
 import {
+  customerRequestPaymentVerification,
   fetchPublicBillById,
   formatIndianMobileDisplay,
   formatOrderDate,
   formatRupees,
+  isCancelledOrderStatus,
   PublicBillPayload,
+  subscribeToOrder,
 } from '../lib/orderService';
 import { FoodArtIcon } from './FoodArtIcons';
 
@@ -49,6 +53,7 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
   const [downloadingQr, setDownloadingQr] = useState(false);
   const [sharingPdf, setSharingPdf] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [requestingVerify, setRequestingVerify] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -70,6 +75,28 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
       active = false;
     };
   }, [billId]);
+
+  const liveOrderId =
+    bill?.order_id || (/^ord_[a-zA-Z0-9_-]{20,124}$/.test(billId.trim()) ? billId.trim() : '');
+
+  // Keep payment & order status updated in real time from Firestore
+  useEffect(() => {
+    if (!liveOrderId) return;
+    const unsub = subscribeToOrder(liveOrderId, (ord) => {
+      if (!ord) return;
+      setBill((prev) =>
+        prev
+          ? {
+              ...prev,
+              order_id: ord.id,
+              status: ord.status,
+              payment_status: ord.payment_status,
+            }
+          : prev,
+      );
+    });
+    return () => unsub();
+  }, [liveOrderId]);
 
   const showToast = (msg: string) => {
     setActionFeedback(msg);
@@ -203,6 +230,20 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
     window.print();
   };
 
+  const handleCustomerIHavePaid = async () => {
+    if (!liveOrderId || requestingVerify) return;
+    setRequestingVerify(true);
+    try {
+      await customerRequestPaymentVerification(liveOrderId);
+      setBill((prev) => (prev ? { ...prev, payment_status: 'verification_requested' } : prev));
+      showToast('Payment verification requested. Please wait for restaurant confirmation.');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Unable to request payment verification.');
+    } finally {
+      setRequestingVerify(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen bg-[#FAF8F5] flex flex-col items-center justify-center p-6 text-center gap-3">
@@ -242,6 +283,9 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
 
   const { date, time } = formatOrderDate(bill.created_at_iso);
   const isPaid = bill.payment_status === 'paid';
+  const isVerificationPending = bill.payment_status === 'verification_requested';
+  const isNotReceived = bill.payment_status === 'not_received';
+  const isCancelled = isCancelledOrderStatus(bill.status);
   const qrSnap = bill.payment_qr_snapshot;
   const isUploadedQr = qrSnap?.mode === 'uploaded_qr' && Boolean(qrSnap.qr_image_url);
   const isDynamicUpi = qrSnap?.mode === 'dynamic_upi' && Boolean(qrSnap.upi_uri);
@@ -330,6 +374,21 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
                   <CheckCircle2 className="w-4 h-4" />
                   Payment Received
                 </span>
+              ) : isVerificationPending ? (
+                <span className="inline-flex items-center gap-1 font-extrabold text-amber-800">
+                  <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                  Payment Verification Pending
+                </span>
+              ) : isNotReceived ? (
+                <span className="inline-flex items-center gap-1 font-extrabold text-red-700">
+                  <XCircle className="w-4 h-4" />
+                  Payment Not Received
+                </span>
+              ) : bill.payment_status === 'failed' ? (
+                <span className="inline-flex items-center gap-1 font-extrabold text-red-700">
+                  <XCircle className="w-4 h-4" />
+                  Payment Failed
+                </span>
               ) : (
                 <span className="inline-flex items-center gap-1 font-extrabold text-amber-800">
                   <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
@@ -337,10 +396,17 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
                 </span>
               )}
             </div>
-            <span className="text-xs font-bold text-emerald-700 inline-flex items-center gap-1">
-              <CheckCircle2 className="w-3.5 h-3.5" />
-              Order Confirmed
-            </span>
+            {isCancelled ? (
+              <span className="text-xs font-extrabold text-red-700 inline-flex items-center gap-1">
+                <XCircle className="w-3.5 h-3.5" />
+                Order Cancelled
+              </span>
+            ) : (
+              <span className="text-xs font-bold text-emerald-700 inline-flex items-center gap-1">
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                Order Confirmed
+              </span>
+            )}
           </div>
 
           <div className="p-5 sm:p-6 space-y-5">
@@ -434,7 +500,7 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
             </div>
 
             {/* Honest 2-Mode Payment QR Card (Immutable Snapshot — ZERO animations or cropping on QR) */}
-            {(isUploadedQr || isDynamicUpi) && (
+            {!isCancelled && (isUploadedQr || isDynamicUpi) && (
               <div className="rounded-2xl border-2 border-neutral-900 bg-white p-4 sm:p-5 flex flex-col sm:flex-row items-center gap-5">
                 {isUploadedQr && qrSnap?.qr_image_url ? (
                   <div className="bg-white p-2 rounded-xl border border-neutral-200 shrink-0">
@@ -468,6 +534,17 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
                   <p className="text-xs font-bold text-neutral-900">
                     {qrSnap?.merchant_name || 'RikZen Fast Food'}
                   </p>
+                  {isVerificationPending && (
+                    <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs font-bold text-amber-900">
+                      Payment Verification Pending — Waiting for restaurant owner to verify your
+                      payment.
+                    </div>
+                  )}
+                  {isNotReceived && (
+                    <div className="rounded-xl bg-red-50 border border-red-200 px-3 py-2 text-xs font-bold text-red-800">
+                      Payment could not be verified. Please contact the restaurant.
+                    </div>
+                  )}
                   {isDynamicUpi ? (
                     <>
                       <p className="text-xs font-bold text-emerald-700">
@@ -501,6 +578,21 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
                           )}
                           {downloadingQr ? 'Saving QR...' : 'Download QR'}
                         </button>
+                        {liveOrderId && !isPaid && !isVerificationPending && (
+                          <button
+                            type="button"
+                            disabled={requestingVerify}
+                            onClick={handleCustomerIHavePaid}
+                            className="min-h-[42px] px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold hover:bg-emerald-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                          >
+                            {requestingVerify ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                              <CheckCircle2 className="w-4 h-4" />
+                            )}
+                            {requestingVerify ? 'Sending...' : 'I Have Paid'}
+                          </button>
+                        )}
                       </div>
                     </>
                   ) : (
@@ -526,6 +618,21 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
                           )}
                           {downloadingQr ? 'Saving QR...' : 'Download QR'}
                         </button>
+                        {liveOrderId && !isPaid && !isVerificationPending && (
+                          <button
+                            type="button"
+                            disabled={requestingVerify}
+                            onClick={handleCustomerIHavePaid}
+                            className="min-h-[42px] px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold hover:bg-emerald-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                          >
+                            {requestingVerify ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                              <CheckCircle2 className="w-4 h-4" />
+                            )}
+                            {requestingVerify ? 'Sending...' : 'I Have Paid'}
+                          </button>
+                        )}
                       </div>
                     </>
                   )}

@@ -31,6 +31,7 @@ import {
 import { generateClientBillPdfBlob } from '../lib/clientPdfBill';
 import { downloadPaymentQrPng } from '../lib/paymentQrDownload';
 import {
+  customerRequestPaymentVerification,
   downloadOrderBillPdf,
   ensureOrderPdfGenerated,
   formatIndianMobileDisplay,
@@ -46,7 +47,8 @@ interface BillPreviewModalProps {
   onClose: () => void;
   isOwnerView?: boolean;
   paymentSettings?: PaymentSettings;
-  onMarkPaid?: (order: OrderRecord) => Promise<void>;
+  onMarkPaid?: (order: OrderRecord) => Promise<void> | void;
+  onMarkNotReceived?: (order: OrderRecord) => Promise<void> | void;
   onOpenSettings?: () => void;
   isUpdatingPayment?: boolean;
 }
@@ -57,6 +59,7 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
   isOwnerView = false,
   paymentSettings = DEFAULT_PAYMENT_SETTINGS,
   onMarkPaid,
+  onMarkNotReceived,
   onOpenSettings,
   isUpdatingPayment = false,
 }) => {
@@ -70,6 +73,7 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [shareToast, setShareToast] = useState<string | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [requestingPaymentVerify, setRequestingPaymentVerify] = useState(false);
 
   const [clientPdfBlobUrl, setClientPdfBlobUrl] = useState<string>('');
 
@@ -188,8 +192,27 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
   const showUploadedQr = activeMode === 'uploaded_qr' && Boolean(activeQrImageUrl);
   const showDynamicUpiQr = activeMode === 'dynamic_upi' && Boolean(dynamicUpiUri);
 
-  const paymentStatus = order.payment_status || (order.status === 'completed' ? 'paid' : 'pending');
+  const paymentStatus = order.payment_status || 'pending';
   const isPaid = paymentStatus === 'paid';
+  const isVerificationPending = paymentStatus === 'verification_requested';
+  const isNotReceived = paymentStatus === 'not_received';
+  const isCancelled = order.status === 'rejected' || order.status === 'cancelled';
+
+  const handleCustomerIHavePaid = async () => {
+    if (requestingPaymentVerify || isPaid || isVerificationPending || isCancelled) return;
+    setRequestingPaymentVerify(true);
+    setDownloadError(null);
+    try {
+      await customerRequestPaymentVerification(order.id);
+      showToast('Payment verification requested. Please wait for owner confirmation.');
+    } catch (err) {
+      setDownloadError(
+        err instanceof Error ? err.message : 'Unable to send payment verification request.',
+      );
+    } finally {
+      setRequestingPaymentVerify(false);
+    }
+  };
 
   const handleDownload = async () => {
     setDownloading(true);
@@ -405,7 +428,7 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
               </div>
             )}
 
-            {/* Real-Time Payment Status Strip */}
+            {/* Real-Time Manual Payment Status Strip */}
             <div className="rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-2.5 text-xs">
                 <CreditCard className="w-4 h-4 text-neutral-500 shrink-0" />
@@ -414,6 +437,16 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
                   <span className="inline-flex items-center gap-1.5 font-extrabold text-emerald-700">
                     <CheckCircle2 className="w-4 h-4" />
                     Payment Received
+                  </span>
+                ) : isVerificationPending ? (
+                  <span className="inline-flex items-center gap-1.5 font-extrabold text-amber-800">
+                    <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                    Payment Verification Pending
+                  </span>
+                ) : isNotReceived ? (
+                  <span className="inline-flex items-center gap-1.5 font-extrabold text-red-700">
+                    <XCircle className="w-4 h-4" />
+                    Payment Not Received
                   </span>
                 ) : paymentStatus === 'failed' ? (
                   <span className="inline-flex items-center gap-1.5 font-extrabold text-red-700">
@@ -428,19 +461,50 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
                 )}
               </div>
 
-              {isOwnerView && onMarkPaid && !isPaid && order.status !== 'rejected' && (
+              {isOwnerView && !isPaid && !isCancelled && (onMarkPaid || onMarkNotReceived) && (
+                <div className="flex flex-wrap items-center gap-2">
+                  {onMarkPaid && (
+                    <button
+                      type="button"
+                      disabled={isUpdatingPayment}
+                      onClick={() => onMarkPaid(order)}
+                      className="min-h-[36px] px-3.5 py-1.5 rounded-xl bg-emerald-700 text-white text-xs font-bold hover:bg-emerald-800 active:scale-[0.98] transition-all inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                    >
+                      {isUpdatingPayment ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                      )}
+                      Payment Received
+                    </button>
+                  )}
+                  {onMarkNotReceived && (
+                    <button
+                      type="button"
+                      disabled={isUpdatingPayment}
+                      onClick={() => onMarkNotReceived(order)}
+                      className="min-h-[36px] px-3 py-1.5 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs font-bold hover:bg-red-100 active:scale-[0.98] transition-all inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                    >
+                      <XCircle className="w-3.5 h-3.5" />
+                      Not Received
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {!isOwnerView && !isPaid && !isVerificationPending && !isCancelled && (
                 <button
                   type="button"
-                  disabled={isUpdatingPayment}
-                  onClick={() => onMarkPaid(order)}
+                  disabled={requestingPaymentVerify}
+                  onClick={handleCustomerIHavePaid}
                   className="min-h-[36px] px-3.5 py-1.5 rounded-xl bg-emerald-700 text-white text-xs font-bold hover:bg-emerald-800 active:scale-[0.98] transition-all inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
                 >
-                  {isUpdatingPayment ? (
+                  {requestingPaymentVerify ? (
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
                   ) : (
                     <CheckCircle2 className="w-3.5 h-3.5" />
                   )}
-                  Mark Paid
+                  {requestingPaymentVerify ? 'Notifying...' : 'I Have Paid'}
                 </button>
               )}
             </div>
@@ -630,7 +694,7 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
             )}
 
             {/* Honest 2-Mode Payment QR Card (ZERO cropping/distortion/animation over QR) */}
-            {order.status !== 'rejected' &&
+            {!isCancelled &&
               (showUploadedQr || showDynamicUpiQr ? (
                 <div className="rounded-2xl border-2 border-neutral-900 bg-white p-4 sm:p-5 flex flex-col sm:flex-row items-center gap-5">
                   {showUploadedQr ? (
@@ -663,6 +727,17 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
                       {formatRupees(order.total)}
                     </p>
                     <p className="text-xs font-bold text-neutral-900">{activeMerchantName}</p>
+                    {isVerificationPending && (
+                      <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs font-bold text-amber-900">
+                        Payment Verification Pending — Waiting for restaurant owner to verify your
+                        payment.
+                      </div>
+                    )}
+                    {isNotReceived && (
+                      <div className="rounded-xl bg-red-50 border border-red-200 px-3 py-2 text-xs font-bold text-red-800">
+                        Payment could not be verified. Please contact the restaurant.
+                      </div>
+                    )}
                     {showDynamicUpiQr ? (
                       <>
                         <p className="text-xs font-bold text-emerald-700">
@@ -696,6 +771,21 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
                             )}
                             {downloadingQr ? 'Saving QR...' : 'Download QR'}
                           </button>
+                          {!isOwnerView && !isPaid && !isVerificationPending && (
+                            <button
+                              type="button"
+                              disabled={requestingPaymentVerify}
+                              onClick={handleCustomerIHavePaid}
+                              className="min-h-[40px] px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold hover:bg-emerald-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                            >
+                              {requestingPaymentVerify ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : (
+                                <CheckCircle2 className="w-4 h-4" />
+                              )}
+                              {requestingPaymentVerify ? 'Sending...' : 'I Have Paid'}
+                            </button>
+                          )}
                         </div>
                       </>
                     ) : (
@@ -721,6 +811,21 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
                             )}
                             {downloadingQr ? 'Saving QR...' : 'Download QR'}
                           </button>
+                          {!isOwnerView && !isPaid && !isVerificationPending && (
+                            <button
+                              type="button"
+                              disabled={requestingPaymentVerify}
+                              onClick={handleCustomerIHavePaid}
+                              className="min-h-[40px] px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold hover:bg-emerald-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                            >
+                              {requestingPaymentVerify ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : (
+                                <CheckCircle2 className="w-4 h-4" />
+                              )}
+                              {requestingPaymentVerify ? 'Sending...' : 'I Have Paid'}
+                            </button>
+                          )}
                         </div>
                       </>
                     )}

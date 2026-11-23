@@ -195,6 +195,7 @@ interface OwnerAnalyticsSectionProps {
   onDownloadBill: (order: OrderRecord) => void;
   onShareBill: (order: OrderRecord) => void;
   onMarkPaid?: (order: OrderRecord) => void;
+  onMarkNotReceived?: (order: OrderRecord) => void;
   downloadingBillId: string | null;
   sharingBillId: string | null;
   updatingPaymentId?: string | null;
@@ -217,6 +218,7 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
   onDownloadBill,
   onShareBill,
   onMarkPaid,
+  onMarkNotReceived,
   downloadingBillId,
   sharingBillId,
   updatingPaymentId = null,
@@ -272,9 +274,13 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
       .sort((a, b) => b.revenue - a.revenue)
       .slice(0, 5);
 
-    const nonRejectedInRange = ordersInRange.filter((o) => o.status !== 'rejected');
-    const paidCount = nonRejectedInRange.filter((o) => o.payment_status === 'paid').length;
-    const pendingPayCount = nonRejectedInRange.filter((o) => o.payment_status !== 'paid').length;
+    const nonCancelledInRange = ordersInRange.filter(
+      (o) => o.status !== 'rejected' && o.status !== 'cancelled',
+    );
+    const paidCount = nonCancelledInRange.filter((o) => o.payment_status === 'paid').length;
+    const pendingPayOrders = nonCancelledInRange.filter((o) => o.payment_status !== 'paid');
+    const pendingPayCount = pendingPayOrders.length;
+    const unpaidAmount = pendingPayOrders.reduce((sum, o) => sum + o.total, 0);
 
     return {
       totalSales,
@@ -282,6 +288,7 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
       allPeriodOrders: ordersInRange.length,
       paidCount,
       pendingPayCount,
+      unpaidAmount,
       avgOrder,
       discounts,
       topDishes,
@@ -407,12 +414,12 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
           <div>
             <h2 className="text-lg font-extrabold text-neutral-900">Sales Analytics &amp; Reports</h2>
             <p className="text-xs text-neutral-500 mt-0.5">
-              Showing verified completed sales for <span className="font-bold text-neutral-800">{activeRange.label}</span>
+              Showing manually verified paid sales for <span className="font-bold text-neutral-800">{activeRange.label}</span>
             </p>
           </div>
           <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-700">
             <CheckCircle2 className="w-4 h-4 shrink-0" />
-            <span>Completed orders only</span>
+            <span>Verified paid orders only</span>
           </div>
         </div>
 
@@ -482,31 +489,33 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
       {/* Period Summary KPI Row */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
         <div className="bg-white rounded-2xl border border-neutral-200 p-4 sm:p-5">
-          <p className="text-xs font-semibold text-neutral-500">Completed Sales</p>
+          <p className="text-xs font-semibold text-neutral-500">Total Paid Revenue</p>
           <p className="font-mono text-2xl sm:text-3xl font-extrabold text-[#E5391B] mt-1">
             <AnimatedNumber value={rangeMetrics.totalSales} prefix="₹" />
           </p>
         </div>
         <div className="bg-white rounded-2xl border border-neutral-200 p-4 sm:p-5">
-          <p className="text-xs font-semibold text-neutral-500">Completed Orders</p>
+          <p className="text-xs font-semibold text-neutral-500">Paid Orders</p>
           <p className="font-mono text-2xl sm:text-3xl font-extrabold text-neutral-900 mt-1">
-            <AnimatedNumber value={rangeMetrics.totalOrders} />
+            <AnimatedNumber value={rangeMetrics.paidCount} />
           </p>
           <p className="text-[11px] text-neutral-500 mt-0.5 tabular-nums">
             of {rangeMetrics.allPeriodOrders} total in period
           </p>
         </div>
         <div className="bg-white rounded-2xl border border-neutral-200 p-4 sm:p-5">
-          <p className="text-xs font-semibold text-neutral-500">Average Order Value</p>
-          <p className="font-mono text-2xl sm:text-3xl font-extrabold text-emerald-700 mt-1">
-            <AnimatedNumber value={rangeMetrics.avgOrder} prefix="₹" />
+          <p className="text-xs font-semibold text-neutral-500">Unpaid Amount</p>
+          <p className="font-mono text-2xl sm:text-3xl font-extrabold text-amber-700 mt-1">
+            <AnimatedNumber value={rangeMetrics.unpaidAmount} prefix="₹" />
+          </p>
+          <p className="text-[11px] text-neutral-500 mt-0.5 tabular-nums">
+            {rangeMetrics.pendingPayCount} pending payments
           </p>
         </div>
         <div className="bg-white rounded-2xl border border-neutral-200 p-4 sm:p-5">
-          <p className="text-xs font-semibold text-neutral-500">Payment Summary</p>
-          <p className="font-mono text-xl sm:text-2xl font-extrabold text-emerald-700 mt-1 tabular-nums">
-            {rangeMetrics.paidCount} Paid ·{' '}
-            <span className="text-amber-700">{rangeMetrics.pendingPayCount} Pending</span>
+          <p className="text-xs font-semibold text-neutral-500">Average Paid Order</p>
+          <p className="font-mono text-2xl sm:text-3xl font-extrabold text-emerald-700 mt-1">
+            <AnimatedNumber value={rangeMetrics.avgOrder} prefix="₹" />
           </p>
           <p className="text-[11px] text-neutral-500 mt-0.5 tabular-nums">
             Discounts: {formatRupees(rangeMetrics.discounts)}
@@ -691,21 +700,27 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
               </div>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 text-xs tabular-nums">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 text-xs tabular-nums">
               <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
-                <span className="text-neutral-500 block">Total Sales</span>
+                <span className="text-neutral-500 block">Total Collected</span>
                 <span className="font-mono font-extrabold text-[#E5391B] text-sm">
                   {formatRupees(weeklySeries.totalSales)}
                 </span>
               </div>
               <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
-                <span className="text-neutral-500 block">Total Orders</span>
-                <span className="font-mono font-extrabold text-neutral-900 text-sm">
-                  {weeklySeries.totalOrders}
+                <span className="text-neutral-500 block">Paid Orders</span>
+                <span className="font-mono font-extrabold text-emerald-700 text-sm">
+                  {weeklySeries.paidOrdersCount} / {weeklySeries.allWeekOrdersCount}
                 </span>
               </div>
               <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
-                <span className="text-neutral-500 block">Avg Order Value</span>
+                <span className="text-neutral-500 block">Pending Payments</span>
+                <span className="font-mono font-extrabold text-amber-700 text-sm">
+                  {weeklySeries.pendingPaymentsCount} ({formatRupees(weeklySeries.unpaidAmount)})
+                </span>
+              </div>
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
+                <span className="text-neutral-500 block">Avg Paid Order</span>
                 <span className="font-mono font-extrabold text-neutral-900 text-sm">
                   {formatRupees(weeklySeries.avgOrderValue)}
                 </span>
@@ -718,7 +733,7 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                     : '—'}
                 </span>
               </div>
-              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3 col-span-2 sm:col-span-1">
+              <div className="rounded-xl bg-neutral-50 border border-neutral-200/70 p-3">
                 <span className="text-neutral-500 block">Best-Selling Food</span>
                 <span className="font-bold text-neutral-900 text-sm truncate block" title={weeklySeries.bestSellingItem?.name || ''}>
                   {weeklySeries.bestSellingItem
@@ -731,8 +746,36 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
             <AnimatedSalesBarChart
               buckets={weeklySeries.buckets}
               highlightLabel={weeklySeries.bestDay?.label ?? null}
-              emptyMessage="No completed orders recorded this week yet."
+              emptyMessage="No verified paid orders recorded this week yet."
             />
+
+            {/* Mon-Sun Breakdown Table */}
+            <div className="overflow-x-auto pt-2">
+              <table className="w-full text-left border-collapse text-xs tabular-nums">
+                <thead>
+                  <tr className="border-b border-neutral-200 text-neutral-500">
+                    <th className="py-2 pr-3 font-semibold">Day</th>
+                    <th className="py-2 pr-3 font-semibold">Total Orders</th>
+                    <th className="py-2 pr-3 font-semibold">Paid</th>
+                    <th className="py-2 pr-3 font-semibold">Pending</th>
+                    <th className="py-2 text-right font-semibold">Paid Revenue</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-neutral-100">
+                  {weeklySeries.buckets.map((b) => (
+                    <tr key={b.label}>
+                      <td className="py-2 pr-3 font-bold text-neutral-900">{b.label}</td>
+                      <td className="py-2 pr-3 font-mono text-neutral-700">{b.totalOrders || 0}</td>
+                      <td className="py-2 pr-3 font-mono text-emerald-700 font-bold">{b.paidOrders || 0}</td>
+                      <td className="py-2 pr-3 font-mono text-amber-700">{b.pendingPayments || 0}</td>
+                      <td className="py-2 text-right font-mono font-bold text-neutral-900">
+                        {formatRupees(b.sales)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         )}
 
@@ -915,31 +958,44 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                         <td className="py-3 pr-3 text-xs font-bold whitespace-nowrap">
                           <div className="space-y-0.5">
                             <span
-                              className={`block capitalize ${
+                              className={`block uppercase ${
                                 ord.status === 'completed'
                                   ? 'text-emerald-700'
-                                  : ord.status === 'rejected'
+                                  : ord.status === 'rejected' || ord.status === 'cancelled'
                                     ? 'text-red-700'
                                     : 'text-amber-700'
                               }`}
                             >
-                              {ord.status.replace('_', ' ')}
+                              {ord.status === 'cancelled' || ord.status === 'rejected'
+                                ? 'CANCELLED'
+                                : ord.status.replace('_', ' ')}
                             </span>
-                            {ord.status !== 'rejected' && (
+                            {(ord.status === 'cancelled' || ord.status === 'rejected') ? (
+                              <span className="block text-[11px] font-medium text-red-700">
+                                {ord.cancelled_at
+                                  ? `At ${formatOrderDate(ord.cancelled_at).time} · Owner`
+                                  : 'Cancelled by Owner'}
+                              </span>
+                            ) : (
                               <span
                                 className={`block text-[11px] ${
                                   ord.payment_status === 'paid'
                                     ? 'text-emerald-700'
-                                    : ord.payment_status === 'failed'
+                                    : ord.payment_status === 'not_received' ||
+                                        ord.payment_status === 'failed'
                                       ? 'text-red-700'
                                       : 'text-amber-700'
                                 }`}
                               >
                                 {ord.payment_status === 'paid'
                                   ? 'Payment: Paid'
-                                  : ord.payment_status === 'failed'
-                                    ? 'Payment: Failed'
-                                    : 'Payment: Pending'}
+                                  : ord.payment_status === 'verification_requested'
+                                    ? 'Payment: Verify Now'
+                                    : ord.payment_status === 'not_received'
+                                      ? 'Payment: Not Received'
+                                      : ord.payment_status === 'failed'
+                                        ? 'Payment: Failed'
+                                        : 'Payment: Pending'}
                               </span>
                             )}
                           </div>
@@ -992,17 +1048,33 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                                 </button>
                               </>
                             )}
-                            {onMarkPaid && ord.payment_status !== 'paid' && ord.status !== 'rejected' && (
-                              <button
-                                type="button"
-                                disabled={updatingPaymentId === ord.id}
-                                onClick={() => onMarkPaid(ord)}
-                                className="min-h-[34px] px-2.5 py-1 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-bold hover:bg-emerald-100 inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
-                              >
-                                <CheckCircle2 className="w-3.5 h-3.5" />
-                                {updatingPaymentId === ord.id ? '...' : 'Mark Paid'}
-                              </button>
-                            )}
+                            {onMarkPaid &&
+                              ord.payment_status !== 'paid' &&
+                              ord.status !== 'rejected' &&
+                              ord.status !== 'cancelled' && (
+                                <button
+                                  type="button"
+                                  disabled={updatingPaymentId === ord.id}
+                                  onClick={() => onMarkPaid(ord)}
+                                  className="min-h-[34px] px-2.5 py-1 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-bold hover:bg-emerald-100 inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
+                                >
+                                  <CheckCircle2 className="w-3.5 h-3.5" />
+                                  {updatingPaymentId === ord.id ? '...' : 'Mark Paid'}
+                                </button>
+                              )}
+                            {onMarkNotReceived &&
+                              ord.payment_status === 'verification_requested' &&
+                              ord.status !== 'rejected' &&
+                              ord.status !== 'cancelled' && (
+                                <button
+                                  type="button"
+                                  disabled={updatingPaymentId === ord.id}
+                                  onClick={() => onMarkNotReceived(ord)}
+                                  className="min-h-[34px] px-2.5 py-1 rounded-lg border border-red-200 bg-red-50 text-red-700 text-xs font-bold hover:bg-red-100 inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
+                                >
+                                  Not Received
+                                </button>
+                              )}
                           </div>
                         </td>
                       </tr>
@@ -1039,31 +1111,38 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                           {formatRupees(ord.total)}
                         </p>
                         <p
-                          className={`text-[11px] font-bold capitalize ${
+                          className={`text-[11px] font-bold uppercase ${
                             ord.status === 'completed'
                               ? 'text-emerald-700'
-                              : ord.status === 'rejected'
+                              : ord.status === 'rejected' || ord.status === 'cancelled'
                                 ? 'text-red-700'
                                 : 'text-amber-700'
                           }`}
                         >
-                          {ord.status.replace('_', ' ')}
+                          {ord.status === 'cancelled' || ord.status === 'rejected'
+                            ? 'CANCELLED'
+                            : ord.status.replace('_', ' ')}
                         </p>
-                        {ord.status !== 'rejected' && (
+                        {ord.status !== 'rejected' && ord.status !== 'cancelled' && (
                           <p
                             className={`text-[11px] font-bold ${
                               ord.payment_status === 'paid'
                                 ? 'text-emerald-700'
-                                : ord.payment_status === 'failed'
+                                : ord.payment_status === 'not_received' ||
+                                    ord.payment_status === 'failed'
                                   ? 'text-red-700'
                                   : 'text-amber-700'
                             }`}
                           >
                             {ord.payment_status === 'paid'
                               ? 'Paid'
-                              : ord.payment_status === 'failed'
-                                ? 'Pay Failed'
-                                : 'Pay Pending'}
+                              : ord.payment_status === 'verification_requested'
+                                ? 'Verify Payment'
+                                : ord.payment_status === 'not_received'
+                                  ? 'Not Received'
+                                  : ord.payment_status === 'failed'
+                                    ? 'Pay Failed'
+                                    : 'Pay Pending'}
                           </p>
                         )}
                       </div>
@@ -1112,17 +1191,20 @@ export const OwnerAnalyticsSection: React.FC<OwnerAnalyticsSectionProps> = ({
                           </button>
                         </>
                       )}
-                      {onMarkPaid && ord.payment_status !== 'paid' && ord.status !== 'rejected' && (
-                        <button
-                          type="button"
-                          disabled={updatingPaymentId === ord.id}
-                          onClick={() => onMarkPaid(ord)}
-                          className="w-full min-h-[38px] px-3 py-1.5 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60"
-                        >
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          {updatingPaymentId === ord.id ? 'Updating...' : 'Mark Paid'}
-                        </button>
-                      )}
+                      {onMarkPaid &&
+                        ord.payment_status !== 'paid' &&
+                        ord.status !== 'rejected' &&
+                        ord.status !== 'cancelled' && (
+                          <button
+                            type="button"
+                            disabled={updatingPaymentId === ord.id}
+                            onClick={() => onMarkPaid(ord)}
+                            className="w-full min-h-[38px] px-3 py-1.5 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-bold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60"
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            {updatingPaymentId === ord.id ? 'Updating...' : 'Payment Received'}
+                          </button>
+                        )}
                     </div>
                   </div>
                 );

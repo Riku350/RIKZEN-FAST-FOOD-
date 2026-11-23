@@ -56,12 +56,14 @@ export interface TableRecord {
 export type OrderStatus =
   | 'pending'
   | 'accepted'
+  | 'confirmed'
   | 'preparing'
   | 'ready'
   | 'bill_requested'
   | 'bill_ready'
   | 'completed'
-  | 'rejected';
+  | 'rejected'
+  | 'cancelled';
 
 export type BillStatus =
   | 'not_generated'
@@ -69,7 +71,13 @@ export type BillStatus =
   | 'generated'
   | 'failed';
 
-export type PaymentStatus = 'not_paid' | 'pending' | 'paid' | 'failed';
+export type PaymentStatus =
+  | 'not_paid'
+  | 'pending'
+  | 'verification_requested'
+  | 'paid'
+  | 'not_received'
+  | 'failed';
 
 export type PaymentMode = 'uploaded_qr' | 'dynamic_upi';
 
@@ -122,7 +130,11 @@ export interface OrderRecord {
   status: OrderStatus;
   payment_status: PaymentStatus;
   paid_at: string;
+  payment_verified_by?: string;
+  payment_verified_at?: string;
   confirmed_at: string;
+  cancelled_at?: string;
+  cancelled_by?: string;
   upi_uri: string;
   public_bill_id: string;
   payment_qr_snapshot?: PaymentQrSnapshot | null;
