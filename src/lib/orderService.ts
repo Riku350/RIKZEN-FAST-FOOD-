@@ -1870,6 +1870,95 @@ function mapOrderStatusToTableStatus(status: OrderStatus): TableStatus {
   }
 }
 
+function isFirestoreSafeImageUrl(url: string): boolean {
+  if (!url || url.length > 500) return false;
+  return (
+    url.startsWith('/src/assets/') ||
+    url.startsWith('/assets/') ||
+    url.startsWith('/uploads/') ||
+    url.startsWith('https://')
+  );
+}
+
+function isFirestoreSafeUpiUri(uri: string): boolean {
+  return uri === '' || (uri.length <= 500 && uri.startsWith('upi://pay?'));
+}
+
+function isFirestoreSafeBillUrl(url: string): boolean {
+  return (
+    url === '' ||
+    (url.length <= 400 &&
+      /^\/api\/bills\/file\/ord_[a-zA-Z0-9_-]+\/RikZen-Fast-Food-Bill-RK[0-9]{4,8}\.pdf\?sig=[a-fA-F0-9]{64}$/.test(
+        url,
+      ))
+  );
+}
+
+function isFirestoreSafeBillPath(p: string): boolean {
+  return (
+    p === '' ||
+    (p.length <= 240 &&
+      /^\/bills\/ord_[a-zA-Z0-9_-]+\/RikZen-Fast-Food-Bill-RK[0-9]{4,8}\.pdf$/.test(p))
+  );
+}
+
+function sanitizePaymentQrSnapshotForFirestore(
+  snap: PaymentQrSnapshot | null | undefined,
+): PaymentQrSnapshot | null {
+  if (!snap || typeof snap !== 'object') return null;
+  const rawQr = typeof snap.qr_image_url === 'string' ? snap.qr_image_url.trim() : '';
+  const rawUpi = typeof snap.upi_uri === 'string' ? snap.upi_uri.trim() : '';
+  return {
+    mode: snap.mode === 'uploaded_qr' ? 'uploaded_qr' : 'dynamic_upi',
+    merchant_name: String(snap.merchant_name || 'RikZen Fast Food').trim().slice(0, 80),
+    upi_id: String(snap.upi_id || '').trim().slice(0, 120),
+    qr_image_url: isFirestoreSafeImageUrl(rawQr) ? rawQr : '',
+    upi_uri: isFirestoreSafeUpiUri(rawUpi) ? rawUpi : '',
+    captured_at: String(snap.captured_at || new Date().toISOString()).trim().slice(0, 64),
+  };
+}
+
+function sanitizePublicBillIdForFirestore(rawId: string | undefined, fallbackId: string): string {
+  const candidate = (rawId || fallbackId || '').trim();
+  if (candidate.length <= 64 && /^[a-zA-Z0-9_-]+$/.test(candidate)) {
+    return candidate;
+  }
+  return fallbackId.slice(0, 64);
+}
+
+async function buildFirestoreFallbackBillResult(order: OrderRecord): Promise<GeneratedBillResult> {
+  const existingSnapshot = order.payment_qr_snapshot || null;
+  const settings = existingSnapshot ? null : await fetchLivePaymentSettingsFromFirestore();
+  const rawSnapshot =
+    existingSnapshot ||
+    createPaymentQrSnapshot({
+      settings: settings || DEFAULT_PAYMENT_SETTINGS,
+      amount: order.total,
+      orderCode: (order.order_code || `RK${order.order_number}`).toUpperCase(),
+      tableNumber: order.table_number,
+    });
+  const snapshot = sanitizePaymentQrSnapshotForFirestore(rawSnapshot);
+  const generatedAt = order.generated_at || new Date().toISOString();
+  const publicBillId = sanitizePublicBillIdForFirestore(order.public_bill_id, order.id);
+
+  return {
+    ok: true,
+    order_id: order.id,
+    order_code: (order.order_code || `RK${order.order_number}`).toUpperCase(),
+    public_bill_id: publicBillId,
+    bill_page_url: `/bill/${publicBillId}`,
+    filename: getOrderBillFilename(order),
+    bill_status: 'generated',
+    pdf_url: '',
+    pdf_path: '',
+    generated_at: generatedAt,
+    size_bytes: 0,
+    upi_uri: snapshot?.upi_uri || '',
+    upi_id: snapshot?.upi_id || '',
+    payment_qr_snapshot: snapshot,
+  };
+}
+
 export async function ownerUpdateOrderStatus(
   order: OrderRecord,
   nextStatus: OrderStatus,
@@ -1879,20 +1968,29 @@ export async function ownerUpdateOrderStatus(
   const nowIso = new Date().toISOString();
   const confirmedAt = order.confirmed_at || (nextStatus === 'accepted' ? nowIso : '');
 
-  // On confirm (accepted) or bill_ready, guarantee the real stored PDF + immutable QR snapshot exist
+  // On confirm (accepted), bill_ready, or completed: generate stored PDF + immutable QR snapshot.
+  // NEVER block order acceptance if the Express PDF server is unreachable/static-hosted; fall back
+  // cleanly to Firestore PaymentSettings snapshot so customer gets bill + QR immediately.
   if (nextStatus === 'accepted' || nextStatus === 'bill_ready' || nextStatus === 'completed') {
-    generatedBill = await ensureOrderPdfGenerated(
-      {
-        ...order,
-        status: nextStatus,
-        confirmed_at: confirmedAt || nowIso,
-      },
-      { persistIfOwner: false },
-    );
+    try {
+      generatedBill = await ensureOrderPdfGenerated(
+        {
+          ...order,
+          status: nextStatus,
+          confirmed_at: confirmedAt || nowIso,
+        },
+        { persistIfOwner: false },
+      );
+    } catch (billErr) {
+      console.warn(
+        '[RikZen Owner Confirm] Server bill endpoint unavailable, using Firestore QR snapshot fallback:',
+        billErr,
+      );
+      generatedBill = await buildFirestoreFallbackBillResult(order);
+    }
   }
 
   try {
-    const batch = writeBatch(db);
     const updatePayload: Record<string, unknown> = {
       status: nextStatus,
       pdf_ready: nextStatus !== 'rejected' && Boolean(generatedBill || order.pdf_ready),
@@ -1900,32 +1998,52 @@ export async function ownerUpdateOrderStatus(
     };
 
     if (confirmedAt) {
-      updatePayload.confirmed_at = confirmedAt;
+      updatePayload.confirmed_at = confirmedAt.slice(0, 64);
     }
 
     if (generatedBill) {
-      updatePayload.pdf_url = generatedBill.pdf_url;
-      updatePayload.pdf_path = generatedBill.pdf_path;
-      updatePayload.generated_at = generatedBill.generated_at;
+      const safePdfUrl = isFirestoreSafeBillUrl(generatedBill.pdf_url || '')
+        ? generatedBill.pdf_url || ''
+        : '';
+      const safePdfPath = isFirestoreSafeBillPath(generatedBill.pdf_path || '')
+        ? generatedBill.pdf_path || ''
+        : '';
+      const safePublicBillId = sanitizePublicBillIdForFirestore(
+        generatedBill.public_bill_id,
+        order.id,
+      );
+      const safeSnapshot = sanitizePaymentQrSnapshotForFirestore(generatedBill.payment_qr_snapshot);
+      const safeUpiUri = isFirestoreSafeUpiUri(generatedBill.upi_uri || '')
+        ? generatedBill.upi_uri || ''
+        : '';
+
+      updatePayload.pdf_url = safePdfUrl;
+      updatePayload.pdf_path = safePdfPath;
+      updatePayload.generated_at = (generatedBill.generated_at || nowIso).slice(0, 64);
       updatePayload.bill_status = 'generated';
-      if (generatedBill.public_bill_id) {
-        updatePayload.public_bill_id = generatedBill.public_bill_id;
+      if (safePublicBillId) {
+        updatePayload.public_bill_id = safePublicBillId;
       }
-      if (generatedBill.payment_qr_snapshot) {
-        updatePayload.payment_qr_snapshot = generatedBill.payment_qr_snapshot;
+      if (safeSnapshot) {
+        updatePayload.payment_qr_snapshot = safeSnapshot;
       }
-      if (generatedBill.upi_uri) {
-        updatePayload.upi_uri = generatedBill.upi_uri;
+      if (safeUpiUri) {
+        updatePayload.upi_uri = safeUpiUri;
       }
     }
 
-    batch.update(doc(db, 'orders', order.id), updatePayload);
+    // Primary authoritative order update (decoupled from table status doc so order confirmation never fails)
+    await updateDoc(doc(db, 'orders', order.id), updatePayload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, orderPath);
+  }
 
+  // Secondary table status sync (non-blocking — never reverts an accepted order)
+  try {
     const tableId = `table_${order.table_number}`;
     const nextTableStatus = mapOrderStatusToTableStatus(nextStatus);
     const isTerminal = nextStatus === 'completed' || nextStatus === 'rejected';
-
-    batch.set(doc(db, 'tables', tableId), {
+    await setDoc(doc(db, 'tables', tableId), {
       id: tableId,
       table_number: order.table_number,
       qr_code: getTableQrUrl(order.table_number).slice(0, 300),
@@ -1933,12 +2051,11 @@ export async function ownerUpdateOrderStatus(
       active_order_id: isTerminal ? '' : order.id,
       updated_at: serverTimestamp(),
     });
-
-    await batch.commit();
-    return generatedBill;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, orderPath);
+  } catch (tableErr) {
+    console.warn('[RikZen Table Status Sync Warning]', tableErr);
   }
+
+  return generatedBill;
 }
 
 /**

@@ -25,6 +25,7 @@ import {
   shareBillPdfNative,
 } from '../lib/billShare';
 import { generateClientBillPdfBlob } from '../lib/clientPdfBill';
+import { downloadPaymentQrPng } from '../lib/paymentQrDownload';
 import {
   fetchPublicBillById,
   formatIndianMobileDisplay,
@@ -45,6 +46,7 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
   const [error, setError] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
+  const [downloadingQr, setDownloadingQr] = useState(false);
   const [sharingPdf, setSharingPdf] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
 
@@ -130,6 +132,31 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
       showToast(err instanceof Error ? err.message : 'Unable to download bill.');
     } finally {
       setDownloading(false);
+    }
+  };
+
+  const handleDownloadQr = async () => {
+    if (!bill || downloadingQr) return;
+    const snap = bill.payment_qr_snapshot;
+    if (!snap) return;
+    const mode = snap.mode === 'uploaded_qr' && snap.qr_image_url ? 'uploaded_qr' : 'dynamic_upi';
+    setDownloadingQr(true);
+    try {
+      await downloadPaymentQrPng({
+        mode,
+        upiUri: snap.upi_uri,
+        qrImageUrl: snap.qr_image_url,
+        merchantName: snap.merchant_name || 'RikZen Fast Food',
+        upiId: snap.upi_id,
+        amount: bill.total,
+        orderCode: bill.order_code,
+        tableNumber: bill.table_number,
+      });
+      showToast('Payment QR downloaded.');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Unable to download Payment QR.');
+    } finally {
+      setDownloadingQr(false);
     }
   };
 
@@ -451,8 +478,8 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
                           UPI ID: <span className="font-bold text-neutral-900">{qrSnap.upi_id}</span>
                         </p>
                       )}
-                      {!isPaid && qrSnap?.upi_uri && (
-                        <div className="pt-1 print:hidden">
+                      <div className="pt-1 flex flex-wrap items-center justify-center sm:justify-start gap-2 print:hidden">
+                        {!isPaid && qrSnap?.upi_uri && (
                           <a
                             href={qrSnap.upi_uri}
                             className="min-h-[42px] px-4 py-2 rounded-xl bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] inline-flex items-center gap-1.5"
@@ -460,17 +487,47 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
                             <Smartphone className="w-4 h-4" />
                             Pay Now · {formatRupees(bill.total)}
                           </a>
-                        </div>
-                      )}
+                        )}
+                        <button
+                          type="button"
+                          disabled={downloadingQr}
+                          onClick={handleDownloadQr}
+                          className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                        >
+                          {downloadingQr ? (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <Download className="w-4 h-4" />
+                          )}
+                          {downloadingQr ? 'Saving QR...' : 'Download QR'}
+                        </button>
+                      </div>
                     </>
                   ) : (
-                    <p className="text-xs font-medium text-neutral-700">
-                      Scan this QR using PhonePe, Google Pay, Paytm, or BHIM and pay{' '}
-                      <span className="font-bold text-neutral-900">
-                        {formatRupees(bill.total)}
-                      </span>
-                      .
-                    </p>
+                    <>
+                      <p className="text-xs font-medium text-neutral-700">
+                        Scan this QR using PhonePe, Google Pay, Paytm, or BHIM and pay{' '}
+                        <span className="font-bold text-neutral-900">
+                          {formatRupees(bill.total)}
+                        </span>
+                        .
+                      </p>
+                      <div className="pt-1 flex flex-wrap items-center justify-center sm:justify-start gap-2 print:hidden">
+                        <button
+                          type="button"
+                          disabled={downloadingQr}
+                          onClick={handleDownloadQr}
+                          className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                        >
+                          {downloadingQr ? (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <Download className="w-4 h-4" />
+                          )}
+                          {downloadingQr ? 'Saving QR...' : 'Download QR'}
+                        </button>
+                      </div>
+                    </>
                   )}
                   <p className="text-[11px] text-neutral-500">
                     PhonePe · Google Pay · Paytm · BHIM

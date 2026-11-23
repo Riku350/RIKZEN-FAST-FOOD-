@@ -345,10 +345,13 @@ export async function unlockOwnerAudioContext(): Promise<boolean> {
   try {
     const ctx = getOrCreateAudioContext();
     if (ctx && ctx.state === 'suspended') {
-      await ctx.resume();
+      await Promise.race([
+        ctx.resume(),
+        new Promise<void>((resolve) => window.setTimeout(resolve, 400)),
+      ]);
     }
     if (ctx && ctx.state === 'running') {
-      // Play an inaudible 1-sample buffer to confirm autoplay unlock on Safari/Chrome
+      // Play an inaudible 1-sample buffer to confirm autoplay unlock on Safari/Chrome/Android
       const buffer = ctx.createBuffer(1, 1, 22050);
       const source = ctx.createBufferSource();
       source.buffer = buffer;
@@ -356,7 +359,14 @@ export async function unlockOwnerAudioContext(): Promise<boolean> {
       source.start(0);
     }
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.getVoices();
+      try {
+        window.speechSynthesis.getVoices();
+        if (window.speechSynthesis.paused) {
+          window.speechSynthesis.resume();
+        }
+      } catch {
+        // Ignore speechSynthesis warmup errors
+      }
     }
     return true;
   } catch {
@@ -365,7 +375,8 @@ export async function unlockOwnerAudioContext(): Promise<boolean> {
 }
 
 /**
- * Plays a crisp, pleasant restaurant service bell chime (🔔) scaled by volume (0–100).
+ * Plays a crisp, pleasant restaurant service bell chime scaled by volume (0–100).
+ * Never hangs if browser AudioContext is suspended.
  */
 export async function playOrderNotificationBell(volumePercent: number): Promise<void> {
   const vol = Math.max(0, Math.min(1, volumePercent / 100));
@@ -375,10 +386,15 @@ export async function playOrderNotificationBell(volumePercent: number): Promise<
     const ctx = getOrCreateAudioContext();
     if (!ctx) return;
     if (ctx.state === 'suspended') {
-      await ctx.resume();
+      await Promise.race([
+        ctx.resume(),
+        new Promise<void>((resolve) => window.setTimeout(resolve, 300)),
+      ]);
     }
+    if (ctx.state !== 'running') return;
+
     const now = ctx.currentTime;
-    // Gentle two-note warm chime (E5 -> B5) like a modern hospitality counter bell
+    // Gentle two-note warm chime (E5 -> B5) like a hospitality counter bell
     const notes = [
       { freq: 659.25, start: 0, dur: 0.24, gain: 0.22 * vol },
       { freq: 987.77, start: 0.14, dur: 0.36, gain: 0.24 * vol },
@@ -405,12 +421,12 @@ export async function playOrderNotificationBell(volumePercent: number): Promise<
 function getSpeedRate(speed: VoiceSpeed): { audioRate: number; speechRate: number } {
   switch (speed) {
     case 'slow':
-      return { audioRate: 0.88, speechRate: 0.84 };
+      return { audioRate: 0.88, speechRate: 0.85 };
     case 'fast':
-      return { audioRate: 1.1, speechRate: 1.05 };
+      return { audioRate: 1.1, speechRate: 1.06 };
     case 'normal':
     default:
-      return { audioRate: 0.96, speechRate: 0.94 };
+      return { audioRate: 0.96, speechRate: 0.95 };
   }
 }
 
@@ -419,12 +435,13 @@ function scoreIndianFemaleVoice(voice: SpeechSynthesisVoice): number {
   const lang = voice.lang.toLowerCase();
   let score = 0;
 
-  // Strongly prefer Indian English (en-IN)
-  if (lang === 'en-in' || lang.startsWith('en-in')) score += 120;
-  else if (lang.startsWith('hi-in') && name.includes('english')) score += 70;
-  else if (name.includes('india') || name.includes('indian')) score += 95;
-  else if (lang.startsWith('en-gb') || lang.startsWith('en-au')) score += 20;
-  else if (lang.startsWith('en')) score += 5;
+  // Strongly prefer Indian English (en-IN) so English order scripts sound clear and natural
+  if (lang === 'en-in' || lang.startsWith('en-in')) score += 140;
+  else if (name.includes('india') && lang.startsWith('en')) score += 110;
+  else if (lang.startsWith('en-gb') || lang.startsWith('en-au')) score += 35;
+  else if (lang.startsWith('en')) score += 20;
+  else if (lang.startsWith('hi-in') && name.includes('english')) score += 60;
+  else score -= 120; // Avoid non-English voices that mumble or fail on English text
 
   // Strongly prefer well-known natural Indian female voices
   const preferredFemaleKeywords = [
@@ -441,7 +458,6 @@ function scoreIndianFemaleVoice(voice: SpeechSynthesisVoice): number {
     'kavya',
     'sangeeta',
     'lekha',
-    'google हिन्दी',
     'female',
     'natural',
     'neural',
@@ -471,7 +487,7 @@ function scoreIndianFemaleVoice(voice: SpeechSynthesisVoice): number {
     if (name.includes(kw) || lang === kw) score -= 50;
   }
 
-  if (voice.localService === false) score += 10; // Cloud neural voices usually sound much cleaner
+  if (voice.localService === false) score += 10;
   return score;
 }
 
@@ -480,7 +496,7 @@ async function resolveBestIndianFemaleBrowserVoice(): Promise<SpeechSynthesisVoi
   let voices = window.speechSynthesis.getVoices();
   if (voices.length === 0) {
     await new Promise<void>((resolve) => {
-      const timeout = window.setTimeout(resolve, 650);
+      const timeout = window.setTimeout(resolve, 750);
       const handler = () => {
         window.clearTimeout(timeout);
         window.speechSynthesis.removeEventListener('voiceschanged', handler);
@@ -493,7 +509,10 @@ async function resolveBestIndianFemaleBrowserVoice(): Promise<SpeechSynthesisVoi
   if (voices.length === 0) return null;
 
   const sorted = [...voices].sort((a, b) => scoreIndianFemaleVoice(b) - scoreIndianFemaleVoice(a));
-  return sorted[0] ?? null;
+  const best = sorted[0] ?? null;
+  // Never force a strongly negative-scored non-English voice; let browser default en-IN handle it
+  if (best && scoreIndianFemaleVoice(best) < -20) return null;
+  return best;
 }
 
 class VoiceOrderAnnouncementManager {
@@ -505,7 +524,11 @@ class VoiceOrderAnnouncementManager {
   private listeners = new Set<(next: VoiceQueueState) => void>();
   private currentAudio: HTMLAudioElement | null = null;
   private currentAbortController: AbortController | null = null;
+  private activeUtterance: SpeechSynthesisUtterance | null = null;
+  private keepAliveTimer: number | null = null;
   private cancelledCurrent = false;
+  private serverTtsUnavailable = false;
+  private pendingBlockedItem: VoiceQueueItem | null = null;
 
   constructor() {
     this.settings = loadVoiceAlertSettings();
@@ -570,10 +593,38 @@ class VoiceOrderAnnouncementManager {
     }
   }
 
+  /**
+   * Silently unlocks browser audio & speech on ANY user interaction (tap/click/key) in Owner Dashboard.
+   * If an order arrived while autoplay was blocked, immediately speaks it once unlocked.
+   */
+  public async unlockOnUserGesture(): Promise<boolean> {
+    if (this.state.audioUnlocked && !this.pendingBlockedItem) return true;
+    const ok = await unlockOwnerAudioContext();
+    if (ok) {
+      this.emitState({ audioUnlocked: true, lastError: null });
+      if (this.pendingBlockedItem) {
+        const retryItem = this.pendingBlockedItem;
+        this.pendingBlockedItem = null;
+        this.queue.unshift(retryItem);
+        this.emitState({ queueLength: this.queue.length });
+      }
+      if (this.queue.length > 0 && !this.state.isSpeaking) {
+        void this.processNext();
+      }
+    }
+    return ok;
+  }
+
   public async enableSound(): Promise<boolean> {
     const ok = await unlockOwnerAudioContext();
     this.updateSettings({ soundActivated: true, enabled: true });
     this.emitState({ audioUnlocked: ok, lastError: null });
+    if (this.pendingBlockedItem) {
+      const retryItem = this.pendingBlockedItem;
+      this.pendingBlockedItem = null;
+      this.queue.unshift(retryItem);
+      this.emitState({ queueLength: this.queue.length });
+    }
     if (this.queue.length > 0 && !this.state.isSpeaking) {
       void this.processNext();
     }
@@ -635,7 +686,6 @@ class VoiceOrderAnnouncementManager {
     this.updateSettings({ soundActivated: true });
     this.emitState({ audioUnlocked: true, lastError: null });
 
-    // Avoid piling up multiple test items
     this.queue = this.queue.filter((q) => !q.isTest);
     const testItem: VoiceQueueItem = {
       id: `test-${Date.now()}`,
@@ -687,6 +737,7 @@ class VoiceOrderAnnouncementManager {
   public stopAndClearQueue(): void {
     this.cancelledCurrent = true;
     this.queue = [];
+    this.pendingBlockedItem = null;
     this.stopActivePlaybackOnly();
     this.emitState({
       isSpeaking: false,
@@ -697,7 +748,16 @@ class VoiceOrderAnnouncementManager {
     });
   }
 
+  private clearKeepAlive(): void {
+    if (this.keepAliveTimer !== null) {
+      window.clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+    }
+  }
+
   private stopActivePlaybackOnly(): void {
+    this.clearKeepAlive();
+    this.activeUtterance = null;
     if (this.currentAbortController) {
       this.currentAbortController.abort();
       this.currentAbortController = null;
@@ -756,38 +816,39 @@ class VoiceOrderAnnouncementManager {
       if (this.cancelledCurrent) return;
 
       // Step 2: Primary high-quality Natural Indian Female Voice via server-side Gemini TTS
-      const naturalResult = await this.trySpeakViaServerTts(next.fullScript);
+      const naturalResult = this.serverTtsUnavailable
+        ? 'fallback'
+        : await this.trySpeakViaServerTts(next.fullScript);
       if (this.cancelledCurrent) return;
 
       if (naturalResult === 'played') {
         this.emitState({ activeEngine: 'natural_indian_female', audioUnlocked: true });
-      } else if (naturalResult === 'autoplay_blocked') {
-        this.emitState({
-          audioUnlocked: false,
-          lastError:
-            'Browser blocked automatic audio. Click "ENABLE SOUND" above to activate voice order alerts.',
-        });
       } else {
-        // Step 3: Clean fallback to Browser SpeechSynthesis with Indian English female voice
+        // Step 3: Even if HTMLAudio autoplay was blocked OR server TTS is unavailable (e.g. Netlify),
+        // ALWAYS try Browser SpeechSynthesis (Indian Female voice) before declaring autoplay blocked!
         const fallbackRes = await this.trySpeakViaBrowserSynthesis(next.segments);
         if (this.cancelledCurrent) return;
         if (fallbackRes === 'played') {
-          this.emitState({ activeEngine: 'browser_indian_female' });
-        } else if (fallbackRes === 'autoplay_blocked') {
+          this.emitState({ activeEngine: 'browser_indian_female', audioUnlocked: true });
+        } else if (fallbackRes === 'autoplay_blocked' || naturalResult === 'autoplay_blocked') {
+          // Hold this order so the VERY NEXT tap anywhere on dashboard speaks it automatically!
+          this.pendingBlockedItem = next;
           this.emitState({
             audioUnlocked: false,
             lastError:
-              'Browser blocked automatic speech. Click "ENABLE SOUND" above to activate voice order alerts.',
+              'Tap anywhere or click "ENABLE SOUND" to unlock speaker for voice order alerts.',
           });
         } else {
           this.emitState({
             activeEngine: 'unavailable',
             lastError:
-              'Voice speech synthesis is unavailable in this browser. Visual order alerts and bell chimes remain active.',
+              'Browser speaker voice is unavailable on this device. Visual order alerts and bell chimes remain active.',
           });
         }
       }
     } finally {
+      this.clearKeepAlive();
+      this.activeUtterance = null;
       this.enqueuedOrderIds.delete(next.orderId);
       const hasMore = this.queue.length > 0;
       this.emitState({
@@ -799,7 +860,6 @@ class VoiceOrderAnnouncementManager {
       });
 
       if (hasMore && (this.settings.enabled || this.queue[0]?.isTest)) {
-        // Brief polite pause between consecutive queued order announcements
         window.setTimeout(() => {
           void this.processNext();
         }, 650);
@@ -818,7 +878,7 @@ class VoiceOrderAnnouncementManager {
 
       const controller = new AbortController();
       this.currentAbortController = controller;
-      const timeoutId = window.setTimeout(() => controller.abort(), 14000);
+      const timeoutId = window.setTimeout(() => controller.abort(), 8000);
 
       let resp: Response;
       try {
@@ -842,7 +902,20 @@ class VoiceOrderAnnouncementManager {
       }
 
       if (this.cancelledCurrent) return 'played';
-      const contentType = resp.headers.get('content-type') || '';
+      const contentType = (resp.headers.get('content-type') || '').toLowerCase();
+
+      // If static-hosted (404/405/HTML) or TTS not configured (503), cache for this session so
+      // future orders speak INSTANTLY via browser voice with zero network delay!
+      if (
+        resp.status === 404 ||
+        resp.status === 405 ||
+        resp.status === 503 ||
+        contentType.includes('text/html')
+      ) {
+        this.serverTtsUnavailable = true;
+        return 'fallback';
+      }
+
       if (!resp.ok || !contentType.includes('audio/')) {
         return 'fallback';
       }
@@ -892,6 +965,61 @@ class VoiceOrderAnnouncementManager {
     }
   }
 
+  private speakSingleSegment(
+    synth: SpeechSynthesis,
+    segmentText: string,
+    preferredVoice: SpeechSynthesisVoice | null,
+    speechRate: number,
+    vol: number,
+  ): Promise<'ok' | 'blocked' | 'error'> {
+    return new Promise<'ok' | 'blocked' | 'error'>((resolve) => {
+      let settled = false;
+      const finish = (status: 'ok' | 'blocked' | 'error') => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(safetyTimer);
+        if (this.activeUtterance === utterance) {
+          this.activeUtterance = null;
+        }
+        resolve(status);
+      };
+
+      const utterance = new SpeechSynthesisUtterance(segmentText);
+      utterance.lang = preferredVoice?.lang || 'en-IN';
+      if (preferredVoice) {
+        utterance.voice = preferredVoice;
+      }
+      utterance.rate = speechRate;
+      utterance.pitch = 1.03;
+      utterance.volume = vol;
+
+      // Hold strong reference to prevent Chrome/Safari garbage collection cutting off speech!
+      this.activeUtterance = utterance;
+
+      const safetyTimer = window.setTimeout(() => finish('ok'), 16000);
+      utterance.onend = () => finish('ok');
+      utterance.onerror = (event) => {
+        const errCode = (event as SpeechSynthesisErrorEvent).error;
+        if (errCode === 'not-allowed') {
+          finish('blocked');
+        } else if (errCode === 'canceled' || errCode === 'interrupted') {
+          finish('ok');
+        } else {
+          finish('error');
+        }
+      };
+
+      try {
+        if (synth.paused) {
+          synth.resume();
+        }
+        synth.speak(utterance);
+      } catch {
+        finish('error');
+      }
+    });
+  }
+
   private async trySpeakViaBrowserSynthesis(
     segments: string[],
   ): Promise<'played' | 'autoplay_blocked' | 'unavailable'> {
@@ -899,58 +1027,66 @@ class VoiceOrderAnnouncementManager {
       return 'unavailable';
     }
     const synth = window.speechSynthesis;
-    const preferredVoice = await resolveBestIndianFemaleBrowserVoice();
+    let preferredVoice = await resolveBestIndianFemaleBrowserVoice();
     const { speechRate } = getSpeedRate(this.settings.speed);
     const vol = Math.max(0, Math.min(1, this.settings.volume / 100));
 
+    // Only cancel if already busy, and wait 70ms so Chrome/Android never swallows the next speak()
     try {
-      synth.cancel();
+      if (synth.speaking || synth.pending) {
+        synth.cancel();
+        await new Promise((r) => window.setTimeout(r, 70));
+      }
+      if (synth.paused) {
+        synth.resume();
+      }
     } catch {
       // Ignore
     }
 
-    for (let i = 0; i < segments.length; i++) {
-      if (this.cancelledCurrent) return 'played';
-      const segmentText = segments[i];
-      const result = await new Promise<'ok' | 'blocked' | 'error'>((resolve) => {
-        const utterance = new SpeechSynthesisUtterance(segmentText);
-        utterance.lang = preferredVoice?.lang || 'en-IN';
-        if (preferredVoice) {
-          utterance.voice = preferredVoice;
+    // Chrome desktop/Android anti-pause heartbeat while speaking
+    this.clearKeepAlive();
+    this.keepAliveTimer = window.setInterval(() => {
+      try {
+        if (synth.speaking && synth.paused) {
+          synth.resume();
         }
-        utterance.rate = speechRate;
-        utterance.pitch = 1.02;
-        utterance.volume = vol;
-
-        const safetyTimer = window.setTimeout(() => resolve('ok'), 18000);
-        utterance.onend = () => {
-          window.clearTimeout(safetyTimer);
-          resolve('ok');
-        };
-        utterance.onerror = (event) => {
-          window.clearTimeout(safetyTimer);
-          const errCode = (event as SpeechSynthesisErrorEvent).error;
-          if (errCode === 'not-allowed') {
-            resolve('blocked');
-          } else if (errCode === 'canceled' || errCode === 'interrupted') {
-            resolve('ok');
-          } else {
-            resolve('error');
-          }
-        };
-        synth.speak(utterance);
-      });
-
-      if (result === 'blocked') return 'autoplay_blocked';
-      if (result === 'error') return 'unavailable';
-
-      // Natural staff pause between announcement sections
-      if (i < segments.length - 1 && !this.cancelledCurrent) {
-        await new Promise((r) => window.setTimeout(r, 260));
+      } catch {
+        // Ignore
       }
-    }
+    }, 3000);
 
-    return 'played';
+    try {
+      for (let i = 0; i < segments.length; i++) {
+        if (this.cancelledCurrent) return 'played';
+        const segmentText = segments[i];
+
+        let result = await this.speakSingleSegment(
+          synth,
+          segmentText,
+          preferredVoice,
+          speechRate,
+          vol,
+        );
+
+        // If a specific selected voice errored on this device, retry once with default system voice
+        if (result === 'error' && preferredVoice) {
+          preferredVoice = null;
+          result = await this.speakSingleSegment(synth, segmentText, null, speechRate, vol);
+        }
+
+        if (result === 'blocked') return 'autoplay_blocked';
+        if (result === 'error') return 'unavailable';
+
+        // Natural polite pause between announcement sections
+        if (i < segments.length - 1 && !this.cancelledCurrent) {
+          await new Promise((r) => window.setTimeout(r, 220));
+        }
+      }
+      return 'played';
+    } finally {
+      this.clearKeepAlive();
+    }
   }
 }
 

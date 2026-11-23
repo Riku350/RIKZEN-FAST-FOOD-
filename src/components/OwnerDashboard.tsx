@@ -291,6 +291,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   useEffect(() => {
     const unsubVoice = voiceOrderAlertManager.subscribe((next) => {
       setVoiceQueueState(next);
+      setVoiceSettings(voiceOrderAlertManager.getSettings());
       if (next.lastError && next.lastError !== dismissedVoiceError) {
         setDismissedVoiceError(null);
       }
@@ -299,6 +300,27 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
       unsubVoice();
     };
   }, [dismissedVoiceError]);
+
+  // Automatically unlock browser AudioContext & SpeechSynthesis on ANY interaction
+  // inside the Owner Dashboard so new order voice announcements speak without extra clicks.
+  useEffect(() => {
+    if (!isOwner) return;
+    const handleGesture = () => {
+      void voiceOrderAlertManager.unlockOnUserGesture().then(() => {
+        setVoiceSettings(voiceOrderAlertManager.getSettings());
+      });
+    };
+    window.addEventListener('pointerdown', handleGesture, { passive: true });
+    window.addEventListener('touchstart', handleGesture, { passive: true });
+    window.addEventListener('click', handleGesture, { passive: true });
+    window.addEventListener('keydown', handleGesture, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', handleGesture);
+      window.removeEventListener('touchstart', handleGesture);
+      window.removeEventListener('click', handleGesture);
+      window.removeEventListener('keydown', handleGesture);
+    };
+  }, [isOwner]);
 
   const showToast = (msg: string) => {
     setToastMsg(msg);
@@ -551,8 +573,12 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     }
   };
 
-  const handleStatusChange = async (order: OrderRecord, nextStatus: OrderStatus) => {
-    if (busyOrderId) return;
+  const handleStatusChange = async (
+    order: OrderRecord,
+    nextStatus: OrderStatus,
+  ): Promise<boolean> => {
+    if (busyOrderId) return false;
+    void voiceOrderAlertManager.unlockOnUserGesture();
     setBusyOrderId(order.id);
     setDataError(null);
     try {
@@ -566,8 +592,13 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
       } else if (nextStatus === 'rejected') {
         showToast(`Order #${order.order_code} rejected & table freed.`);
       }
+      return true;
     } catch (err) {
-      setDataError(err instanceof Error ? err.message : 'Could not update order status.');
+      const msg = err instanceof Error ? err.message : 'Could not update order status.';
+      console.error('[OwnerDashboard Status Update Error]', { orderId: order.id, nextStatus, err });
+      setDataError(msg);
+      showToast(`Order update failed: ${msg}`);
+      return false;
     } finally {
       setBusyOrderId(null);
     }
@@ -1342,8 +1373,10 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                     type="button"
                     disabled={isAlertBusy}
                     onClick={async () => {
-                      await handleStatusChange(activeAlert, 'accepted');
-                      setLiveAlertOrders((prev) => prev.filter((o) => o.id !== activeAlert.id));
+                      const ok = await handleStatusChange(activeAlert, 'accepted');
+                      if (ok) {
+                        setLiveAlertOrders((prev) => prev.filter((o) => o.id !== activeAlert.id));
+                      }
                     }}
                     className="min-h-[46px] px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-extrabold inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
                   >
@@ -1354,8 +1387,10 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                     type="button"
                     disabled={isAlertBusy}
                     onClick={async () => {
-                      await handleStatusChange(activeAlert, 'rejected');
-                      setLiveAlertOrders((prev) => prev.filter((o) => o.id !== activeAlert.id));
+                      const ok = await handleStatusChange(activeAlert, 'rejected');
+                      if (ok) {
+                        setLiveAlertOrders((prev) => prev.filter((o) => o.id !== activeAlert.id));
+                      }
                     }}
                     className="min-h-[46px] px-4 py-2.5 rounded-xl bg-red-600/20 hover:bg-red-600/35 border border-red-500/40 text-red-200 text-sm font-extrabold inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
                   >

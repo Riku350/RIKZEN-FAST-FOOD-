@@ -33,6 +33,7 @@ import {
   MENU_CATEGORIES,
 } from '../data/menuCatalog';
 import { shareBillNative } from '../lib/billShare';
+import { downloadPaymentQrPng } from '../lib/paymentQrDownload';
 import {
   createConfirmedOrder,
   downloadOrderBillPdf,
@@ -126,6 +127,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
   const [showThankYouManual, setShowThankYouManual] = useState(false);
   const [showBillModal, setShowBillModal] = useState(false);
   const [downloadingPdf, setDownloadingPdf] = useState(false);
+  const [downloadingQr, setDownloadingQr] = useState(false);
   const [paymentSettings, setPaymentSettings] = useState<PaymentSettings>(DEFAULT_PAYMENT_SETTINGS);
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -397,6 +399,36 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
       window.setTimeout(() => {
         setShareFeedback((cur) => (cur === outcome.message ? null : cur));
       }, 3000);
+    }
+  };
+
+  const handleDownloadPaymentQr = async (params: {
+    mode: 'uploaded_qr' | 'dynamic_upi';
+    upiUri?: string;
+    qrImageUrl?: string;
+    merchantName: string;
+    upiId?: string;
+    amount: number;
+    orderCode: string;
+    tableNumber: number;
+  }) => {
+    if (downloadingQr) return;
+    setDownloadingQr(true);
+    setOrderSyncError(null);
+    try {
+      await downloadPaymentQrPng(params);
+      const msg = 'Payment QR downloaded.';
+      setShareFeedback(msg);
+      window.setTimeout(() => {
+        setShareFeedback((cur) => (cur === msg ? null : cur));
+      }, 3000);
+    } catch (err) {
+      console.error('[Customer Payment QR Download Error]', err);
+      setOrderSyncError(
+        err instanceof Error ? err.message : 'Unable to download Payment QR right now.',
+      );
+    } finally {
+      setDownloadingQr(false);
     }
   };
 
@@ -1616,7 +1648,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                                       </span>
                                     </p>
                                   )}
-                                  <div className="pt-1">
+                                  <div className="pt-1 flex flex-wrap items-center justify-center sm:justify-start gap-2">
                                     <a
                                       href={dynamicUpiUri}
                                       className="min-h-[42px] px-4 py-2 rounded-xl bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] inline-flex items-center justify-center gap-1.5"
@@ -1624,16 +1656,58 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                                       <Smartphone className="w-4 h-4" />
                                       Pay Now · {formatRupees(activeOrder.total)}
                                     </a>
+                                    <button
+                                      type="button"
+                                      disabled={downloadingQr}
+                                      onClick={() =>
+                                        handleDownloadPaymentQr({
+                                          mode: 'dynamic_upi',
+                                          upiUri: dynamicUpiUri,
+                                          merchantName: activeMerchant,
+                                          upiId: activeUpiId,
+                                          amount: activeOrder.total,
+                                          orderCode: activeOrderCode,
+                                          tableNumber: activeOrder.table_number,
+                                        })
+                                      }
+                                      className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                                    >
+                                      <Download className="w-4 h-4" />
+                                      {downloadingQr ? 'Saving QR...' : 'Download QR'}
+                                    </button>
                                   </div>
                                 </>
                               ) : (
-                                <p className="text-xs font-medium text-neutral-700">
-                                  Scan this QR using any UPI app and pay{' '}
-                                  <span className="font-bold text-neutral-900">
-                                    {formatRupees(activeOrder.total)}
-                                  </span>
-                                  .
-                                </p>
+                                <>
+                                  <p className="text-xs font-medium text-neutral-700">
+                                    Scan this QR using any UPI app and pay{' '}
+                                    <span className="font-bold text-neutral-900">
+                                      {formatRupees(activeOrder.total)}
+                                    </span>
+                                    .
+                                  </p>
+                                  <div className="pt-1 flex flex-wrap items-center justify-center sm:justify-start gap-2">
+                                    <button
+                                      type="button"
+                                      disabled={downloadingQr}
+                                      onClick={() =>
+                                        handleDownloadPaymentQr({
+                                          mode: 'uploaded_qr',
+                                          qrImageUrl: activeQrImg,
+                                          merchantName: activeMerchant,
+                                          upiId: activeUpiId,
+                                          amount: activeOrder.total,
+                                          orderCode: activeOrderCode,
+                                          tableNumber: activeOrder.table_number,
+                                        })
+                                      }
+                                      className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                                    >
+                                      <Download className="w-4 h-4" />
+                                      {downloadingQr ? 'Saving QR...' : 'Download QR'}
+                                    </button>
+                                  </div>
+                                </>
                               )}
                               <p className="text-[11px] text-neutral-500">
                                 PhonePe · Google Pay · Paytm · BHIM
