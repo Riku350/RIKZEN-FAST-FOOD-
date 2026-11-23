@@ -195,6 +195,7 @@ service cloud.firestore {
         (!('payment_verified_by' in data) || (data.payment_verified_by is string && data.payment_verified_by.size() <= 128)) &&
         (!('payment_verified_at' in data) || (data.payment_verified_at is string && data.payment_verified_at.size() <= 64)) &&
         (!('confirmed_at' in data) || (data.confirmed_at is string && data.confirmed_at.size() <= 64)) &&
+        (!('completed_at' in data) || (data.completed_at is string && data.completed_at.size() <= 64)) &&
         (!('cancelled_at' in data) || (data.cancelled_at is string && data.cancelled_at.size() <= 64)) &&
         (!('cancelled_by' in data) || (data.cancelled_by is string && data.cancelled_by.size() <= 128)) &&
         (!('upi_uri' in data) || isSafeUpiUri(data.upi_uri)) &&
@@ -217,10 +218,10 @@ service cloud.firestore {
         ]) &&
         data.keys().hasOnly([
           'id', 'order_number', 'order_code', 'table_id', 'table_number',
-          'customer_name', 'customer_mobile', 'items', 'item_count',
+          'customer_name', 'customer_mobile', 'customer_phone_normalized', 'items', 'item_count',
           'subtotal', 'discount', 'total', 'status',
           'payment_status', 'paid_at', 'payment_verified_by', 'payment_verified_at',
-          'confirmed_at', 'cancelled_at', 'cancelled_by', 'upi_uri',
+          'confirmed_at', 'completed_at', 'cancelled_at', 'cancelled_by', 'upi_uri',
           'public_bill_id', 'payment_qr_snapshot',
           'pdf_ready', 'bill_status', 'pdf_url', 'pdf_path', 'generated_at',
           'sent_at', 'send_status', 'whatsapp_status', 'whatsapp_error',
@@ -234,6 +235,7 @@ service cloud.firestore {
         data.table_id == 'table_' + string(data.table_number) &&
         data.customer_name is string && data.customer_name.size() >= 2 && data.customer_name.size() <= 80 &&
         data.customer_mobile is string && data.customer_mobile.size() <= 16 && data.customer_mobile.matches('^\\+91[6-9][0-9]{9}$') &&
+        (!('customer_phone_normalized' in data) || (data.customer_phone_normalized is string && data.customer_phone_normalized.size() == 10 && data.customer_phone_normalized.matches('^[6-9][0-9]{9}$') && '+91' + data.customer_phone_normalized == data.customer_mobile)) &&
         data.items is list && data.items.size() >= 1 && data.items.size() <= 20 &&
         isValidOrderLineItem(data.items[0]) &&
         data.item_count is int && data.item_count >= 1 && data.item_count <= 100 &&
@@ -364,7 +366,7 @@ service cloud.firestore {
         incoming().updated_at == request.time && (
           // Tier 1: Verified Owner manages lifecycle, confirmation, cancellation, manual payment verification, and bill snapshot
           (isOwner() && incoming().diff(existing()).affectedKeys().hasOnly([
-            'status', 'confirmed_at', 'cancelled_at', 'cancelled_by',
+            'status', 'confirmed_at', 'completed_at', 'cancelled_at', 'cancelled_by',
             'payment_status', 'paid_at', 'payment_verified_by', 'payment_verified_at',
             'upi_uri', 'public_bill_id', 'payment_qr_snapshot',
             'pdf_ready', 'bill_status', 'pdf_url', 'pdf_path',

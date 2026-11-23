@@ -1,6 +1,6 @@
 import React from 'react';
 import { QRCodeSVG } from 'qrcode.react';
-import { ArrowRight, Lock, QrCode } from 'lucide-react';
+import { ArrowRight, Lock, QrCode, Search } from 'lucide-react';
 import { HERO_FEAST_IMAGE, TABLE_NUMBERS } from '../data/menuCatalog';
 import { getTableQrUrl } from '../lib/orderService';
 import { AmbientFoodBackdrop } from './AmbientFoodBackdrop';
@@ -38,6 +38,14 @@ export const ShopEntrance: React.FC<ShopEntranceProps> = ({ onNavigate }) => {
               className="hover:text-neutral-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               Sample Table 3
+            </button>
+            <button
+              type="button"
+              onClick={() => onNavigate('/find-order')}
+              className="hover:text-[#E5391B] transition-colors whitespace-nowrap shrink-0 cursor-pointer inline-flex items-center gap-1.5 font-semibold text-neutral-800"
+            >
+              <Search className="w-3.5 h-3.5 text-[#E5391B]" />
+              Find My Order
             </button>
             <a href="#how-it-works" className="hover:text-neutral-900 transition-colors whitespace-nowrap shrink-0">
               How It Works
@@ -96,6 +104,36 @@ export const ShopEntrance: React.FC<ShopEntranceProps> = ({ onNavigate }) => {
               priority
             />
           </div>
+        </section>
+
+        {/* Find My Order Quick Recovery Card */}
+        <section
+          aria-label="Find My Order"
+          className="bg-[#151110] text-white rounded-3xl border border-neutral-800 p-6 sm:p-8 flex flex-col md:flex-row items-start md:items-center justify-between gap-5 shadow-sm"
+        >
+          <div className="flex items-start gap-4">
+            <div className="w-12 h-12 rounded-2xl bg-[#E5391B] text-white flex items-center justify-center shrink-0">
+              <Search className="w-6 h-6" />
+            </div>
+            <div className="space-y-1">
+              <h2 className="font-display text-xl sm:text-2xl font-extrabold tracking-tight">
+                Find My Order
+              </h2>
+              <p className="text-sm text-neutral-300 leading-relaxed">
+                Already placed an order? Check your order status here.
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => onNavigate('/find-order')}
+            className="w-full md:w-auto min-h-[50px] px-6 py-3 rounded-2xl bg-[#E5391B] hover:bg-[#C82E14] text-white font-extrabold text-sm tracking-wide active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer whitespace-nowrap shrink-0"
+          >
+            <Search className="w-4 h-4" />
+            VIEW MY ORDER
+            <ArrowRight className="w-4 h-4" />
+          </button>
         </section>
 
         {/* 6 Table QR Launchpad */}

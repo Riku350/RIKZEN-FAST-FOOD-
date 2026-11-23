@@ -95,6 +95,7 @@ import {
   subscribeToPaymentSettings,
   subscribeToTables,
   syncCatalogToServer,
+  syncOwnerOrderRecoveryIndex,
   syncPaymentSettingsToServer,
   timestampToDate,
   verifyOwnerAuthorization,
@@ -240,6 +241,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   const [dataError, setDataError] = useState<string | null>(null);
   const [retryingDiagnostic, setRetryingDiagnostic] = useState(false);
   const lastFailedActionRef = useRef<(() => Promise<void>) | null>(null);
+  const lastRecoverySyncRef = useRef<number>(0);
 
   // Action busy states
   const [busyOrderId, setBusyOrderId] = useState<string | null>(null);
@@ -512,6 +514,13 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
         knownOrderStatusesRef.current = nextMap;
         initialOrdersLoadedRef.current = true;
         setOrders(incomingOrders);
+
+        // Keep server-side Find My Order index synced with latest Firestore statuses/payments
+        const nowMs = Date.now();
+        if (nowMs - lastRecoverySyncRef.current >= 2500) {
+          lastRecoverySyncRef.current = nowMs;
+          void syncOwnerOrderRecoveryIndex(incomingOrders);
+        }
       },
       (err) => setDataError(err.message),
     );

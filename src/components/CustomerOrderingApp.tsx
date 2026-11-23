@@ -566,6 +566,14 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
             </button>
             <button
               type="button"
+              onClick={() => onNavigate('/find-order')}
+              className="py-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer hover:text-[#E5391B] inline-flex items-center gap-1.5 font-semibold text-neutral-700"
+            >
+              <Search className="w-3.5 h-3.5 text-[#E5391B]" />
+              Find My Order
+            </button>
+            <button
+              type="button"
               onClick={() => setActiveTab('info')}
               className={`py-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                 activeTab === 'info' ? 'text-[#E5391B] font-semibold' : 'hover:text-neutral-900'
@@ -647,6 +655,32 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                   />
                 </div>
               </div>
+            </section>
+
+            {/* Find My Order Quick Banner */}
+            <section
+              aria-label="Find My Order"
+              className="bg-white rounded-2xl border border-neutral-200 p-4 sm:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-xs"
+            >
+              <div className="flex items-center gap-3.5 min-w-0">
+                <div className="w-11 h-11 rounded-xl bg-[#FEF2F0] border border-[#E5391B]/20 text-[#E5391B] flex items-center justify-center shrink-0">
+                  <Search className="w-5 h-5" />
+                </div>
+                <div className="min-w-0">
+                  <h2 className="text-base font-extrabold text-neutral-900">Find My Order</h2>
+                  <p className="text-xs sm:text-sm text-neutral-600">
+                    Already placed an order? Check your order status here.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => onNavigate('/find-order')}
+                className="w-full sm:w-auto min-h-[44px] px-5 py-2.5 rounded-xl bg-neutral-900 hover:bg-[#E5391B] text-white text-xs sm:text-sm font-extrabold tracking-wide transition-colors inline-flex items-center justify-center gap-2 cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <Search className="w-4 h-4" />
+                VIEW MY ORDER
+              </button>
             </section>
 
             {/* Active Combo Offers Strip */}
@@ -1372,13 +1406,23 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                     Once you confirm an order for Table {tableNumber}, its live status and PDF bill
                     will appear here automatically.
                   </p>
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('menu')}
-                    className="min-h-[48px] px-6 py-3 rounded-xl bg-[#E5391B] text-white font-semibold text-sm hover:bg-[#C82E14] transition-colors cursor-pointer"
-                  >
-                    Open Menu
-                  </button>
+                  <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('menu')}
+                      className="w-full sm:w-auto min-h-[48px] px-6 py-3 rounded-xl bg-[#E5391B] text-white font-semibold text-sm hover:bg-[#C82E14] transition-colors cursor-pointer"
+                    >
+                      Open Menu
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onNavigate('/find-order')}
+                      className="w-full sm:w-auto min-h-[48px] px-6 py-3 rounded-xl bg-neutral-900 text-white font-semibold text-sm hover:bg-neutral-800 transition-colors inline-flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      <Search className="w-4 h-4" />
+                      Find My Order
+                    </button>
+                  </div>
                 </div>
               )
             ) : activeOrder.status === 'completed' || showThankYouManual ? (

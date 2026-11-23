@@ -133,6 +133,8 @@ const BILLS_DIR = path.resolve(__dirname, 'bills');
 const DATA_DIR = path.resolve(__dirname, 'data');
 const PUBLIC_BILLS_DIR = path.resolve(DATA_DIR, 'public-bills');
 const PAYMENT_SETTINGS_FILE = path.resolve(DATA_DIR, 'payment-settings.json');
+const ORDER_RECOVERY_INDEX_FILE = path.resolve(DATA_DIR, 'order-recovery-index.json');
+const RECOVERY_TOKENS_FILE = path.resolve(DATA_DIR, 'recovery-tokens.json');
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(BILLS_DIR, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -141,6 +143,189 @@ fs.mkdirSync(PUBLIC_BILLS_DIR, { recursive: true });
 // 15-minute idempotency cache preventing duplicate orders on rapid double-clicks / retries
 const ORDER_IDEMPOTENCY_TTL_MS = 15 * 60 * 1000;
 const orderIdempotencyCache = new Map<string, { expiresAt: number; payload: Record<string, unknown> }>();
+
+// =========================================================================
+// Secure Server-Side Order Recovery Index & Opaque Temporary Access Tokens
+// =========================================================================
+interface IndexedOrderEntry {
+  order_id: string;
+  order_code: string;
+  table_number: number;
+  customer_name: string;
+  customer_phone_normalized: string;
+  total: number;
+  status: string;
+  payment_status: string;
+  created_at_iso: string;
+  updated_at_iso: string;
+}
+
+interface RecoveryTokenRecord {
+  token: string;
+  order_id: string;
+  order_code: string;
+  table_number: number;
+  customer_name: string;
+  customer_phone_normalized: string;
+  status: string;
+  payment_status: string;
+  created_at_iso: string;
+  expires_at_ms: number;
+}
+
+const ACTIVE_ORDER_RETENTION_MS = 48 * 60 * 60 * 1000; // 48 hours for active orders
+const RECENT_TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours for completed/cancelled
+const RECOVERY_TOKEN_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours per issued token
+const LOOKUP_RATE_WINDOW_MS = 5 * 60 * 1000; // 5-minute rate-limit window
+const LOOKUP_RATE_MAX_ATTEMPTS = 15;
+
+const orderRecoveryIndex = new Map<string, IndexedOrderEntry>();
+const recoveryTokenStore = new Map<string, RecoveryTokenRecord>();
+const lookupRateLimiter = new Map<string, number[]>();
+
+function isTerminalRecoveryStatus(status: string): boolean {
+  return status === 'completed' || status === 'cancelled' || status === 'rejected';
+}
+
+function isEligibleRecentOrder(entry: IndexedOrderEntry, nowMs: number = Date.now()): boolean {
+  const createdMs = Date.parse(entry.created_at_iso || entry.updated_at_iso);
+  if (!Number.isFinite(createdMs)) return true;
+  const ageMs = Math.max(0, nowMs - createdMs);
+  if (isTerminalRecoveryStatus(entry.status)) {
+    return ageMs <= RECENT_TERMINAL_RETENTION_MS;
+  }
+  return ageMs <= ACTIVE_ORDER_RETENTION_MS;
+}
+
+function persistJsonFileAtomically(filePath: string, payload: unknown): void {
+  const resolved = path.resolve(filePath);
+  if (!resolved.startsWith(DATA_DIR + path.sep)) {
+    throw new Error('Invalid server data file destination.');
+  }
+  const tmpPath = path.resolve(
+    DATA_DIR,
+    `.tmp_${path.basename(resolved)}_${crypto.randomBytes(6).toString('hex')}.json`,
+  );
+  fs.writeFileSync(tmpPath, JSON.stringify(payload), 'utf8');
+  fs.renameSync(tmpPath, resolved);
+}
+
+function loadOrderRecoveryStores(): void {
+  try {
+    if (fs.existsSync(ORDER_RECOVERY_INDEX_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(ORDER_RECOVERY_INDEX_FILE, 'utf8')) as IndexedOrderEntry[];
+      if (Array.isArray(parsed)) {
+        const nowMs = Date.now();
+        for (const item of parsed) {
+          if (
+            item &&
+            typeof item.order_id === 'string' &&
+            /^ord_[a-zA-Z0-9_-]{20,124}$/.test(item.order_id) &&
+            typeof item.customer_phone_normalized === 'string' &&
+            /^[6-9][0-9]{9}$/.test(item.customer_phone_normalized) &&
+            isEligibleRecentOrder(item, nowMs)
+          ) {
+            orderRecoveryIndex.set(item.order_id, item);
+          }
+        }
+      }
+    }
+  } catch {
+    // Start fresh if index file is corrupt
+  }
+
+  try {
+    if (fs.existsSync(RECOVERY_TOKENS_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(RECOVERY_TOKENS_FILE, 'utf8')) as RecoveryTokenRecord[];
+      if (Array.isArray(parsed)) {
+        const nowMs = Date.now();
+        for (const rec of parsed) {
+          if (
+            rec &&
+            typeof rec.token === 'string' &&
+            /^rec_[A-Za-z0-9_-]{24,64}$/.test(rec.token) &&
+            typeof rec.order_id === 'string' &&
+            typeof rec.expires_at_ms === 'number' &&
+            rec.expires_at_ms > nowMs
+          ) {
+            recoveryTokenStore.set(rec.token, rec);
+          }
+        }
+      }
+    }
+  } catch {
+    // Start fresh if token file is corrupt
+  }
+}
+
+function saveOrderRecoveryIndex(): void {
+  const nowMs = Date.now();
+  for (const [id, entry] of orderRecoveryIndex.entries()) {
+    if (!isEligibleRecentOrder(entry, nowMs)) {
+      orderRecoveryIndex.delete(id);
+    }
+  }
+  persistJsonFileAtomically(ORDER_RECOVERY_INDEX_FILE, Array.from(orderRecoveryIndex.values()));
+}
+
+function saveRecoveryTokenStore(): void {
+  const nowMs = Date.now();
+  for (const [tok, rec] of recoveryTokenStore.entries()) {
+    if (rec.expires_at_ms <= nowMs) {
+      recoveryTokenStore.delete(tok);
+    }
+  }
+  persistJsonFileAtomically(RECOVERY_TOKENS_FILE, Array.from(recoveryTokenStore.values()));
+}
+
+function upsertOrderRecoveryEntry(entry: IndexedOrderEntry): void {
+  if (!/^ord_[a-zA-Z0-9_-]{20,124}$/.test(entry.order_id)) return;
+  if (!/^[6-9][0-9]{9}$/.test(entry.customer_phone_normalized)) return;
+  orderRecoveryIndex.set(entry.order_id, entry);
+  saveOrderRecoveryIndex();
+}
+
+function clearOrderRecoveryStores(): void {
+  orderRecoveryIndex.clear();
+  recoveryTokenStore.clear();
+  saveOrderRecoveryIndex();
+  saveRecoveryTokenStore();
+}
+
+function issueRecoveryToken(entry: IndexedOrderEntry): string {
+  const token = `rec_${crypto.randomBytes(24).toString('base64url')}`;
+  const record: RecoveryTokenRecord = {
+    token,
+    order_id: entry.order_id,
+    order_code: entry.order_code,
+    table_number: entry.table_number,
+    customer_name: entry.customer_name,
+    customer_phone_normalized: entry.customer_phone_normalized,
+    status: entry.status,
+    payment_status: entry.payment_status,
+    created_at_iso: entry.created_at_iso,
+    expires_at_ms: Date.now() + RECOVERY_TOKEN_TTL_MS,
+  };
+  recoveryTokenStore.set(token, record);
+  saveRecoveryTokenStore();
+  return token;
+}
+
+function checkLookupRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const key = ip || 'unknown';
+  const prev = lookupRateLimiter.get(key) || [];
+  const recent = prev.filter((ts) => now - ts < LOOKUP_RATE_WINDOW_MS);
+  if (recent.length >= LOOKUP_RATE_MAX_ATTEMPTS) {
+    lookupRateLimiter.set(key, recent);
+    return false;
+  }
+  recent.push(now);
+  lookupRateLimiter.set(key, recent);
+  return true;
+}
+
+loadOrderRecoveryStores();
 
 function pruneOrderIdempotencyCache(): void {
   const now = Date.now();
@@ -423,14 +608,25 @@ interface BillOrderRequest extends SignableOrderPayload {
   payment_qr_snapshot?: PaymentQrSnapshot | null;
 }
 
-function normalizeIndianMobile(raw: unknown): string | null {
+function normalizeIndianPhoneDigits(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
-  const cleaned = raw.replace(/\s+/g, '');
-  const digitsOnly = cleaned.replace(/^\+91/, '').replace(/\D/g, '');
-  if (!/^[6-9][0-9]{9}$/.test(digitsOnly)) {
+  const digits = raw.replace(/\D/g, '');
+  let tenDigits = digits;
+  if (tenDigits.length === 12 && tenDigits.startsWith('91')) {
+    tenDigits = tenDigits.slice(2);
+  } else if (tenDigits.length === 11 && tenDigits.startsWith('0')) {
+    tenDigits = tenDigits.slice(1);
+  }
+  if (!/^[6-9][0-9]{9}$/.test(tenDigits)) {
     return null;
   }
-  return `+91${digitsOnly}`;
+  return tenDigits;
+}
+
+function normalizeIndianMobile(raw: unknown): string | null {
+  const tenDigits = normalizeIndianPhoneDigits(raw);
+  if (!tenDigits) return null;
+  return `+91${tenDigits}`;
 }
 
 function computeOrderSignatureWithKey(data: SignableOrderPayload, secretKey: string): string {
@@ -1670,9 +1866,13 @@ app.post('/api/orders/verify', async (req, res) => {
           })
         : '';
 
+    const normalizedPhoneDigits = normalizeIndianPhoneDigits(normalizedMobile) || '';
+    const createdAtIso = new Date().toISOString();
+
     const responsePayload: Record<string, unknown> = {
       success: true,
       ...signable,
+      customer_phone_normalized: normalizedPhoneDigits,
       item_count: itemCount,
       status: 'pending',
       payment_status: 'pending',
@@ -1692,6 +1892,22 @@ app.post('/api/orders/verify', async (req, res) => {
       action_signature: actionSignature,
       notes,
     };
+
+    // Index this newly verified order server-side for secure Find My Order recovery
+    if (normalizedPhoneDigits) {
+      upsertOrderRecoveryEntry({
+        order_id: orderId,
+        order_code: orderCode,
+        table_number: tableNumber,
+        customer_name: customerName,
+        customer_phone_normalized: normalizedPhoneDigits,
+        total,
+        status: 'pending',
+        payment_status: 'pending',
+        created_at_iso: createdAtIso,
+        updated_at_iso: createdAtIso,
+      });
+    }
 
     if (clientRequestId) {
       orderIdempotencyCache.set(`${customerSessionId}:${clientRequestId}`, {
@@ -1715,6 +1931,234 @@ app.post('/api/orders/verify', async (req, res) => {
       error: 'Unable to place your order right now. Please try again.',
     });
   }
+});
+
+/**
+ * Secure Customer Order Recovery Lookup (POST /api/orders/lookup).
+ * - Never exposes raw phone numbers in URLs or other customers' orders.
+ * - Normalizes Indian mobile numbers (+91 / spaces / 10-digit) server-side.
+ * - Rate-limited per IP to prevent phone-number enumeration.
+ * - Returns ONLY active/recent orders with cryptographically random temporary access tokens.
+ */
+app.get('/api/orders/lookup', (_req, res) => {
+  res.status(405).json({
+    success: false,
+    error: 'Use POST /api/orders/lookup with your mobile number.',
+  });
+});
+
+app.post('/api/orders/lookup', (req, res) => {
+  try {
+    const clientIp =
+      (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim() ||
+      req.socket.remoteAddress ||
+      'unknown';
+
+    if (!checkLookupRateLimit(clientIp)) {
+      res.status(429).json({
+        success: false,
+        error: 'Too many lookup attempts. Please wait a couple of minutes and try again.',
+      });
+      return;
+    }
+
+    const body = req.body as { mobile?: unknown };
+    const normalizedDigits = normalizeIndianPhoneDigits(body?.mobile);
+    if (!normalizedDigits) {
+      res.status(400).json({
+        success: false,
+        error: 'Please enter a valid 10-digit Indian mobile number.',
+      });
+      return;
+    }
+
+    const nowMs = Date.now();
+    const matches: IndexedOrderEntry[] = [];
+    for (const [id, entry] of orderRecoveryIndex.entries()) {
+      if (!isEligibleRecentOrder(entry, nowMs)) {
+        orderRecoveryIndex.delete(id);
+        continue;
+      }
+      if (entry.customer_phone_normalized === normalizedDigits) {
+        matches.push(entry);
+      }
+    }
+
+    // Prioritize active orders first, then most recent created timestamp
+    matches.sort((a, b) => {
+      const aTerminal = isTerminalRecoveryStatus(a.status) ? 1 : 0;
+      const bTerminal = isTerminalRecoveryStatus(b.status) ? 1 : 0;
+      if (aTerminal !== bTerminal) return aTerminal - bTerminal;
+      return Date.parse(b.created_at_iso || '0') - Date.parse(a.created_at_iso || '0');
+    });
+
+    const eligible = matches.slice(0, 8);
+    if (eligible.length === 0) {
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        success: true,
+        found: false,
+        count: 0,
+        orders: [],
+      });
+      return;
+    }
+
+    const summaries = eligible.map((entry) => ({
+      token: issueRecoveryToken(entry),
+      order_code: entry.order_code,
+      table_number: entry.table_number,
+      total: entry.total,
+      status: entry.status,
+      payment_status: entry.payment_status,
+      created_at_iso: entry.created_at_iso,
+    }));
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      success: true,
+      found: true,
+      count: summaries.length,
+      orders: summaries,
+    });
+  } catch (err) {
+    console.error('[RikZen Order Lookup Error]', err);
+    res.status(500).json({
+      success: false,
+      error: 'Unable to search for your order right now. Please try again.',
+    });
+  }
+});
+
+/**
+ * Redeem opaque temporary recovery token (`GET /api/orders/recovery/:token`).
+ * Returns ONLY the single authorized order reference so the client can attach
+ * a live Firestore listener without exposing phone numbers or other orders.
+ */
+app.get('/api/orders/recovery/:token', (req, res) => {
+  try {
+    const token = String(req.params.token || '').trim();
+    if (!/^rec_[A-Za-z0-9_-]{24,64}$/.test(token)) {
+      res.status(404).json({
+        success: false,
+        error: 'This order link is invalid or has expired. Please use Find My Order again.',
+      });
+      return;
+    }
+
+    const record = recoveryTokenStore.get(token);
+    if (!record || record.expires_at_ms <= Date.now()) {
+      if (record) {
+        recoveryTokenStore.delete(token);
+        saveRecoveryTokenStore();
+      }
+      res.status(410).json({
+        success: false,
+        error: 'This temporary order link has expired. Please enter your mobile number again.',
+      });
+      return;
+    }
+
+    // Refresh latest status from index if updated since token issuance
+    const latest = orderRecoveryIndex.get(record.order_id);
+    if (!latest) {
+      res.status(404).json({
+        success: false,
+        error: 'This order is no longer available.',
+      });
+      return;
+    }
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      success: true,
+      order: {
+        order_id: latest.order_id,
+        order_code: latest.order_code,
+        table_number: latest.table_number,
+        customer_name: latest.customer_name,
+        status: latest.status,
+        payment_status: latest.payment_status,
+        created_at_iso: latest.created_at_iso,
+      },
+    });
+  } catch (err) {
+    console.error('[RikZen Recovery Token Redeem Error]', err);
+    res.status(500).json({
+      success: false,
+      error: 'Unable to open your order right now. Please try again.',
+    });
+  }
+});
+
+/**
+ * Owner-authenticated recovery index synchronization.
+ * Keeps active/recent Firestore order statuses & payment statuses fresh on the server
+ * for accurate Find My Order recovery without requiring Firebase Admin IAM.
+ */
+app.post('/api/owner/orders/sync-index', async (req, res) => {
+  const owner = await verifyOwnerIdToken(req.headers.authorization);
+  if (!owner) {
+    res.status(401).json({ success: false, error: 'Owner authentication required.' });
+    return;
+  }
+
+  const body = req.body as { orders?: unknown };
+  if (!Array.isArray(body?.orders)) {
+    res.status(400).json({ success: false, error: 'Orders array required.' });
+    return;
+  }
+
+  const nowMs = Date.now();
+  let syncedCount = 0;
+  for (const raw of body.orders.slice(0, 200)) {
+    if (!raw || typeof raw !== 'object') continue;
+    const o = raw as Record<string, unknown>;
+    const orderId = typeof o.id === 'string' ? o.id.trim() : '';
+    const phoneDigits = normalizeIndianPhoneDigits(
+      typeof o.customer_phone_normalized === 'string' && o.customer_phone_normalized
+        ? o.customer_phone_normalized
+        : o.customer_mobile,
+    );
+    if (!/^ord_[a-zA-Z0-9_-]{20,124}$/.test(orderId) || !phoneDigits) continue;
+
+    const entry: IndexedOrderEntry = {
+      order_id: orderId,
+      order_code: String(o.order_code || 'RK1000').slice(0, 16).toUpperCase(),
+      table_number: Math.max(1, Math.min(6, Number(o.table_number || 1))),
+      customer_name: String(o.customer_name || 'Guest').slice(0, 80),
+      customer_phone_normalized: phoneDigits,
+      total: Math.max(0, Math.min(500000, Number(o.total || 0))),
+      status: String(o.status || 'pending').slice(0, 32),
+      payment_status: String(o.payment_status || 'pending').slice(0, 32),
+      created_at_iso:
+        typeof o.created_at_iso === 'string' && o.created_at_iso
+          ? o.created_at_iso
+          : new Date().toISOString(),
+      updated_at_iso: new Date().toISOString(),
+    };
+    if (isEligibleRecentOrder(entry, nowMs)) {
+      orderRecoveryIndex.set(orderId, entry);
+      syncedCount += 1;
+    } else {
+      orderRecoveryIndex.delete(orderId);
+    }
+  }
+  saveOrderRecoveryIndex();
+  res.json({ success: true, syncedCount });
+});
+
+/**
+ * Owner-authenticated recovery index wipe (invoked when Owner clears Order History).
+ */
+app.delete('/api/owner/orders/clear-index', async (req, res) => {
+  const owner = await verifyOwnerIdToken(req.headers.authorization);
+  if (!owner) {
+    res.status(401).json({ success: false, error: 'Owner authentication required.' });
+    return;
+  }
+  clearOrderRecoveryStores();
+  res.json({ success: true, cleared: true });
 });
 
 /**
@@ -1796,6 +2240,22 @@ app.post('/api/bills/generate', async (req, res) => {
       },
       { forceRegenerate: Boolean(body.forceRegenerate) },
     );
+
+    const billPhoneDigits = normalizeIndianPhoneDigits(normalizedSignable.customer_mobile);
+    if (billPhoneDigits) {
+      upsertOrderRecoveryEntry({
+        order_id: stored.orderId,
+        order_code: stored.orderCode,
+        table_number: normalizedSignable.table_number,
+        customer_name: normalizedSignable.customer_name,
+        customer_phone_normalized: billPhoneDigits,
+        total: authoritative.total,
+        status: ord.status || 'accepted',
+        payment_status: ord.payment_status || 'pending',
+        created_at_iso: ord.created_at_iso || new Date().toISOString(),
+        updated_at_iso: new Date().toISOString(),
+      });
+    }
 
     res.json({
       success: true,

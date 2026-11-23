@@ -1,0 +1,14 @@
+[
+  {
+    "order_id": "ord_417154ff6f393fb5e872877690de71e5",
+    "order_code": "RK1061",
+    "table_number": 3,
+    "customer_name": "Riku Kumar",
+    "customer_phone_normalized": "6299475970",
+    "total": 80,
+    "status": "pending",
+    "payment_status": "pending",
+    "created_at_iso": "2026-11-23T11:28:27.855Z",
+    "updated_at_iso": "2026-11-23T11:28:27.855Z"
+  }
+]

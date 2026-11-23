@@ -31,6 +31,8 @@ import {
   PaymentQrSnapshot,
   PaymentSettings,
   PaymentStatus,
+  RecoverableOrderSummary,
+  RecoveredOrderTokenPayload,
   TableRecord,
   TableStatus,
   VerifiedOrderQuote,
@@ -97,6 +99,7 @@ function isStaticHostMissingEndpoint(
 const SESSION_KEY = 'rikzen_customer_session_id';
 const CUSTOMER_DETAILS_KEY = 'rikzen_customer_details_v1';
 const ACTIVE_ORDER_PREFIX = 'rikzen_active_order_table_';
+const RECENT_CUSTOMER_ORDERS_KEY = 'rikzen_customer_recent_orders_v1';
 const MENU_CACHE_KEY = 'rikzen_menu_cache_v1';
 const OFFERS_CACHE_KEY = 'rikzen_offers_cache_v1';
 
@@ -170,8 +173,34 @@ export function saveCustomerDetailsLocally(details: CustomerDetails): void {
   }
 }
 
+export function normalizeIndianPhoneDigits(raw: string): string | null {
+  const digits = String(raw || '').replace(/\D/g, '');
+  let ten = digits;
+  if (ten.length === 12 && ten.startsWith('91')) {
+    ten = ten.slice(2);
+  } else if (ten.length === 11 && ten.startsWith('0')) {
+    ten = ten.slice(1);
+  }
+  if (!/^[6-9][0-9]{9}$/.test(ten)) {
+    return null;
+  }
+  return ten;
+}
+
+export function formatIndianMobileInput(raw: string): string {
+  let digits = String(raw || '').replace(/\D/g, '');
+  if (digits.length > 10 && digits.startsWith('91')) {
+    digits = digits.slice(2);
+  } else if (digits.length > 10 && digits.startsWith('0')) {
+    digits = digits.slice(1);
+  }
+  digits = digits.slice(0, 10);
+  if (digits.length <= 5) return digits;
+  return `${digits.slice(0, 5)} ${digits.slice(5)}`;
+}
+
 export function isValidIndianMobileDigits(digits: string): boolean {
-  return /^[6-9][0-9]{9}$/.test(digits.trim());
+  return normalizeIndianPhoneDigits(digits) !== null;
 }
 
 export function formatIndianMobileDisplay(mobile: string): string {
@@ -337,6 +366,10 @@ export function normalizeOrderRecord(raw: Partial<OrderRecord>): OrderRecord {
     table_number: Number(raw.table_number || 1),
     customer_name: raw.customer_name || 'Walk-in Guest',
     customer_mobile: raw.customer_mobile || '',
+    customer_phone_normalized:
+      typeof raw.customer_phone_normalized === 'string' && raw.customer_phone_normalized
+        ? raw.customer_phone_normalized
+        : normalizeIndianPhoneDigits(raw.customer_mobile || '') || '',
     items: Array.isArray(raw.items)
       ? raw.items.map((line) => ({
           menu_item_id: line.menu_item_id,
@@ -359,6 +392,7 @@ export function normalizeOrderRecord(raw: Partial<OrderRecord>): OrderRecord {
     payment_verified_at:
       typeof raw.payment_verified_at === 'string' ? raw.payment_verified_at : '',
     confirmed_at: typeof raw.confirmed_at === 'string' ? raw.confirmed_at : '',
+    completed_at: typeof raw.completed_at === 'string' ? raw.completed_at : '',
     cancelled_at: typeof raw.cancelled_at === 'string' ? raw.cancelled_at : '',
     cancelled_by: typeof raw.cancelled_by === 'string' ? raw.cancelled_by : '',
     public_bill_id: typeof raw.public_bill_id === 'string' ? raw.public_bill_id : '',
@@ -1004,6 +1038,7 @@ async function verifyOrderAgainstFirestore(params: {
     table_number: tableNumber,
     customer_name: customerName,
     customer_mobile: customerMobile,
+    customer_phone_normalized: normalizeIndianPhoneDigits(customerMobile) || '',
     items: verifiedItems,
     subtotal,
     discount,
@@ -1121,7 +1156,10 @@ export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<s
       }
     }
 
-    await setDoc(doc(db, 'orders', quote.id), {
+    const phoneNormalized =
+      quote.customer_phone_normalized || normalizeIndianPhoneDigits(quote.customer_mobile) || '';
+
+    const docPayload: Record<string, unknown> = {
       id: quote.id,
       order_number: quote.order_number,
       order_code: quote.order_code,
@@ -1151,8 +1189,24 @@ export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<s
       notes: quote.notes.slice(0, 200),
       created_at: serverTimestamp(),
       updated_at: serverTimestamp(),
-    });
+    };
+    if (/^[6-9][0-9]{9}$/.test(phoneNormalized)) {
+      docPayload.customer_phone_normalized = phoneNormalized;
+    }
+
+    await setDoc(doc(db, 'orders', quote.id), docPayload);
     setStoredOrderIdForTable(quote.table_number, quote.id);
+    if (phoneNormalized) {
+      rememberCustomerOrderLocally({
+        order_id: quote.id,
+        order_code: quote.order_code,
+        table_number: quote.table_number,
+        customer_name: quote.customer_name.slice(0, 80),
+        customer_phone_normalized: phoneNormalized,
+        total: quote.total,
+        created_at_iso: new Date().toISOString(),
+      });
+    }
     return quote.id;
   } catch (error) {
     console.error('[RikZen Customer Order Create Error]', { path, error });
@@ -2223,6 +2277,10 @@ export async function ownerUpdateOrderStatus(
       updatePayload.confirmed_at = confirmedAt.slice(0, 64);
     }
 
+    if (nextStatus === 'completed') {
+      updatePayload.completed_at = nowIso;
+    }
+
     if (isCancelStep) {
       updatePayload.cancelled_at = nowIso;
       updatePayload.cancelled_by = currentUser.uid.slice(0, 128);
@@ -2396,7 +2454,230 @@ export async function ownerClearOrderHistory(): Promise<{ deletedCount: number }
     console.warn('[RikZen Clear History Table Reset Warning]', tableErr);
   }
 
+  // Also clear server-side Find My Order recovery index so deleted history cannot be looked up
+  try {
+    const authHeaders = await getOwnerAuthHeader();
+    await fetch(apiUrl('/api/owner/orders/clear-index'), {
+      method: 'DELETE',
+      headers: authHeaders,
+    });
+  } catch {
+    // Non-blocking on static hosting
+  }
+
   return { deletedCount };
+}
+
+// =========================================================================
+// Customer Order Recovery ("Find My Order") — Server-Backed + Local Fallback
+// =========================================================================
+
+interface LocalCustomerOrderBackup {
+  order_id: string;
+  order_code: string;
+  table_number: number;
+  customer_name: string;
+  customer_phone_normalized: string;
+  total: number;
+  created_at_iso: string;
+}
+
+function readLocalCustomerOrders(): LocalCustomerOrderBackup[] {
+  try {
+    const raw = localStorage.getItem(RECENT_CUSTOMER_ORDERS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as LocalCustomerOrderBackup[];
+    if (!Array.isArray(parsed)) return [];
+    const cutoff = Date.now() - 48 * 60 * 60 * 1000;
+    return parsed.filter(
+      (item) =>
+        item &&
+        typeof item.order_id === 'string' &&
+        /^ord_[a-zA-Z0-9_-]{20,124}$/.test(item.order_id) &&
+        Date.parse(item.created_at_iso || '0') >= cutoff,
+    );
+  } catch {
+    return [];
+  }
+}
+
+function rememberCustomerOrderLocally(entry: LocalCustomerOrderBackup): void {
+  try {
+    const existing = readLocalCustomerOrders().filter((o) => o.order_id !== entry.order_id);
+    const next = [entry, ...existing].slice(0, 15);
+    localStorage.setItem(RECENT_CUSTOMER_ORDERS_KEY, JSON.stringify(next));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+const localFallbackTokens = new Map<string, RecoveredOrderTokenPayload>();
+
+export interface LookupCustomerOrdersResult {
+  found: boolean;
+  count: number;
+  orders: RecoverableOrderSummary[];
+}
+
+/**
+ * Owner-only transparent sync of recent Firestore orders to the server recovery index
+ * so customers using Find My Order from any device always see live statuses.
+ */
+export async function syncOwnerOrderRecoveryIndex(orders: OrderRecord[]): Promise<void> {
+  try {
+    if (!auth.currentUser) return;
+    const authHeaders = await getOptionalOwnerAuthHeader();
+    if (!authHeaders.Authorization) return;
+    const cutoffMs = Date.now() - 48 * 60 * 60 * 1000;
+    const recentPayload = orders
+      .filter((o) => timestampToDate(o.created_at).getTime() >= cutoffMs)
+      .slice(0, 150)
+      .map((o) => ({
+        id: o.id,
+        order_code: o.order_code,
+        table_number: o.table_number,
+        customer_name: o.customer_name,
+        customer_mobile: o.customer_mobile,
+        customer_phone_normalized:
+          o.customer_phone_normalized || normalizeIndianPhoneDigits(o.customer_mobile) || '',
+        total: o.total,
+        status: o.status,
+        payment_status: o.payment_status,
+        created_at_iso: timestampToDate(o.created_at).toISOString(),
+      }));
+
+    await fetch(apiUrl('/api/owner/orders/sync-index'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
+      body: JSON.stringify({ orders: recentPayload }),
+    });
+  } catch {
+    // Silent background sync — never disrupts owner dashboard
+  }
+}
+
+/**
+ * Customer Find My Order lookup via secure server-side endpoint (`POST /api/orders/lookup`).
+ * Normalizes Indian mobile formats and returns opaque temporary recovery tokens (never raw URL phone params).
+ */
+export async function lookupCustomerOrdersByMobile(
+  rawMobile: string,
+): Promise<LookupCustomerOrdersResult> {
+  const normalizedDigits = normalizeIndianPhoneDigits(rawMobile);
+  if (!normalizedDigits) {
+    throw new Error('Please enter a valid 10-digit Indian mobile number.');
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(apiUrl('/api/orders/lookup'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mobile: normalizedDigits }),
+      cache: 'no-store',
+    });
+  } catch {
+    throw new Error('Connection lost. Please check your internet and try again.');
+  }
+
+  const parsed = await safeReadJson<{
+    success?: boolean;
+    found?: boolean;
+    count?: number;
+    orders?: RecoverableOrderSummary[];
+    error?: string;
+  }>(response, 'Find my order');
+
+  if (response.ok && parsed.data?.success) {
+    const orders = Array.isArray(parsed.data.orders) ? parsed.data.orders : [];
+    return {
+      found: Boolean(parsed.data.found && orders.length > 0),
+      count: orders.length,
+      orders,
+    };
+  }
+
+  // Static hosting fallback (e.g. Netlify without Express): recover ONLY this browser's own saved orders
+  if (isStaticHostMissingEndpoint(response, parsed)) {
+    const localMatches = readLocalCustomerOrders().filter(
+      (entry) => entry.customer_phone_normalized === normalizedDigits,
+    );
+    const verifiedLocal: RecoverableOrderSummary[] = [];
+    for (const item of localMatches.slice(0, 8)) {
+      try {
+        const snap = await getDoc(doc(db, 'orders', item.order_id));
+        if (!snap.exists()) continue;
+        const ord = normalizeOrderRecord(snap.data() as Partial<OrderRecord>);
+        const token = `loc_${(await sha256Hex(`${ord.id}:${Date.now()}`)).slice(0, 32)}`;
+        localFallbackTokens.set(token, {
+          order_id: ord.id,
+          order_code: ord.order_code,
+          table_number: ord.table_number,
+          customer_name: ord.customer_name,
+          status: ord.status,
+          payment_status: ord.payment_status,
+          created_at_iso: timestampToDate(ord.created_at).toISOString(),
+        });
+        verifiedLocal.push({
+          token,
+          order_code: ord.order_code,
+          table_number: ord.table_number,
+          total: ord.total,
+          status: ord.status,
+          payment_status: ord.payment_status,
+          created_at_iso: timestampToDate(ord.created_at).toISOString(),
+        });
+      } catch {
+        // Skip unreadable local entry
+      }
+    }
+    return {
+      found: verifiedLocal.length > 0,
+      count: verifiedLocal.length,
+      orders: verifiedLocal,
+    };
+  }
+
+  throw new Error(parsed.data?.error || parsed.errorMessage || 'Unable to search right now.');
+}
+
+/**
+ * Redeems a temporary server recovery token (`GET /api/orders/recovery/:token`)
+ * so the Recovered Order Page can attach a live real-time Firestore listener.
+ */
+export async function resolveRecoveryToken(token: string): Promise<RecoveredOrderTokenPayload> {
+  const cleanToken = token.trim();
+  if (!/^(rec|loc)_[A-Za-z0-9_-]{24,64}$/.test(cleanToken)) {
+    throw new Error('This order link is invalid or has expired. Please search again.');
+  }
+
+  if (cleanToken.startsWith('loc_')) {
+    const local = localFallbackTokens.get(cleanToken);
+    if (!local) {
+      throw new Error('This temporary order link has expired. Please enter your mobile number again.');
+    }
+    return local;
+  }
+
+  const res = await fetch(apiUrl(`/api/orders/recovery/${encodeURIComponent(cleanToken)}`), {
+    method: 'GET',
+    cache: 'no-store',
+  });
+  const parsed = await safeReadJson<{
+    success?: boolean;
+    order?: RecoveredOrderTokenPayload;
+    error?: string;
+  }>(res, 'Order recovery');
+
+  if (res.ok && parsed.data?.success && parsed.data.order?.order_id) {
+    return parsed.data.order;
+  }
+
+  throw new Error(
+    parsed.data?.error ||
+      parsed.errorMessage ||
+      'This order link is invalid or has expired. Please use Find My Order again.',
+  );
 }
 
 export interface OwnerDiagnosticCheckResult {

@@ -122,6 +122,7 @@ export interface OrderRecord {
   table_number: number;
   customer_name: string;
   customer_mobile: string; // +91XXXXXXXXXX
+  customer_phone_normalized?: string; // 10-digit normalized Indian mobile e.g. 6299475970
   items: OrderLineItem[];
   item_count: number;
   subtotal: number;
@@ -133,6 +134,7 @@ export interface OrderRecord {
   payment_verified_by?: string;
   payment_verified_at?: string;
   confirmed_at: string;
+  completed_at?: string;
   cancelled_at?: string;
   cancelled_by?: string;
   upi_uri: string;
@@ -168,6 +170,7 @@ export interface VerifiedOrderQuote {
   table_number: number;
   customer_name: string;
   customer_mobile: string;
+  customer_phone_normalized?: string;
   items: OrderLineItem[];
   item_count: number;
   subtotal: number;
@@ -190,6 +193,26 @@ export interface VerifiedOrderQuote {
   server_signature: string;
   notes: string;
   idempotent_replay?: boolean;
+}
+
+export interface RecoverableOrderSummary {
+  token: string;
+  order_code: string;
+  table_number: number;
+  total: number;
+  status: OrderStatus;
+  payment_status: PaymentStatus;
+  created_at_iso: string;
+}
+
+export interface RecoveredOrderTokenPayload {
+  order_id: string;
+  order_code: string;
+  table_number: number;
+  customer_name: string;
+  status: OrderStatus;
+  payment_status: PaymentStatus;
+  created_at_iso: string;
 }
 
 export interface GeneratedBillResult {

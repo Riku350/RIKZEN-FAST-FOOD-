@@ -253,6 +253,12 @@
           "maxLength": 16,
           "pattern": "^\\+91[6-9][0-9]{9}$"
         },
+        "customer_phone_normalized": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^[6-9][0-9]{9}$"
+        },
         "items": {
           "type": "array"
         },
@@ -300,6 +306,10 @@
           "maxLength": 64
         },
         "confirmed_at": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "completed_at": {
           "type": "string",
           "maxLength": 64
         },
