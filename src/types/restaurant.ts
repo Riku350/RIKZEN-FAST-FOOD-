@@ -130,6 +130,8 @@ export interface OrderRecord {
   total: number;
   status: OrderStatus;
   payment_status: PaymentStatus;
+  paymentStatus?: PaymentStatus;
+  payment_requested_at?: string;
   paid_at: string;
   payment_verified_by?: string;
   payment_verified_at?: string;

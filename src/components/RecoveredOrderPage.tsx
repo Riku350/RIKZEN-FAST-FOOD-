@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { motion, useReducedMotion } from 'motion/react';
 import { QRCodeSVG } from 'qrcode.react';
 import {
@@ -38,11 +38,8 @@ import {
   toCustomerFriendlyError,
 } from '../lib/orderService';
 import { downloadPaymentQrPng } from '../lib/paymentQrDownload';
+import { customerVoiceManager } from '../lib/customerVoiceManager';
 import { buildDynamicUpiUri, DEFAULT_PAYMENT_SETTINGS } from '../lib/upiPayment';
-import {
-  speakCustomerOrderCancelled,
-  unlockCustomerAudioOnGesture,
-} from '../lib/voiceOrderAlert';
 import {
   OrderRecord,
   OrderStatus,
@@ -51,7 +48,9 @@ import {
 } from '../types/restaurant';
 import { AmbientFoodBackdrop } from './AmbientFoodBackdrop';
 import { BillPreviewModal } from './BillPreviewModal';
+import { CustomerVoiceBanner } from './CustomerVoiceBanner';
 import { FoodArtIcon } from './FoodArtIcons';
+import { PaymentConfirmModal } from './PaymentConfirmModal';
 
 interface RecoveredOrderPageProps {
   token: string;
@@ -177,6 +176,7 @@ export const RecoveredOrderPage: React.FC<RecoveredOrderPageProps> = ({ token, o
   const [error, setError] = useState<string | null>(null);
 
   const [billModalOpen, setBillModalOpen] = useState(false);
+  const [confirmPaidOpen, setConfirmPaidOpen] = useState(false);
   const [downloadingPdf, setDownloadingPdf] = useState(false);
   const [downloadingQr, setDownloadingQr] = useState(false);
   const [requestingBill, setRequestingBill] = useState(false);
@@ -184,12 +184,10 @@ export const RecoveredOrderPage: React.FC<RecoveredOrderPageProps> = ({ token, o
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  const prevStatusRef = useRef<OrderStatus | null>(null);
-
-  // Unlock audio on first user interaction for cancellation voice alert
+  // Unlock browser audio smoothly on first interaction
   useEffect(() => {
     const unlock = () => {
-      void unlockCustomerAudioOnGesture();
+      void customerVoiceManager.unlockOnUserGesture(false);
     };
     window.addEventListener('pointerdown', unlock, { once: true });
     window.addEventListener('keydown', unlock, { once: true });
@@ -216,7 +214,6 @@ export const RecoveredOrderPage: React.FC<RecoveredOrderPageProps> = ({ token, o
     setError(null);
     setOrder(null);
     setResolvedMeta(null);
-    prevStatusRef.current = null;
 
     resolveRecoveryToken(token)
       .then((payload) => {
@@ -231,6 +228,7 @@ export const RecoveredOrderPage: React.FC<RecoveredOrderPageProps> = ({ token, o
               setLoading(false);
               return;
             }
+            customerVoiceManager.syncRealtimeOrderSnapshot(liveOrder);
             setOrder(liveOrder);
             setLoading(false);
             setError(null);
@@ -257,16 +255,6 @@ export const RecoveredOrderPage: React.FC<RecoveredOrderPageProps> = ({ token, o
       if (unsubOrder) unsubOrder();
     };
   }, [token]);
-
-  // Announce cancellation once if order becomes cancelled while viewing
-  useEffect(() => {
-    if (!order) return;
-    const prev = prevStatusRef.current;
-    prevStatusRef.current = order.status;
-    if (isCancelledOrderStatus(order.status) && prev !== null && !isCancelledOrderStatus(prev)) {
-      void speakCustomerOrderCancelled(order.id);
-    }
-  }, [order?.id, order?.status]);
 
   const showToast = (msg: string) => {
     setActionFeedback(msg);
@@ -475,14 +463,31 @@ export const RecoveredOrderPage: React.FC<RecoveredOrderPageProps> = ({ token, o
     }
   };
 
-  const handleIHavePaid = async () => {
+  const handleIHavePaid = () => {
     if (requestingPaymentVerify || isPaid || isVerificationPending || isCancelled) return;
+    setConfirmPaidOpen(true);
+  };
+
+  const handleConfirmIHavePaid = async () => {
+    if (requestingPaymentVerify || isPaid || isVerificationPending || isCancelled) {
+      setConfirmPaidOpen(false);
+      return;
+    }
     setRequestingPaymentVerify(true);
     setActionError(null);
+    void customerVoiceManager.unlockOnUserGesture(false);
     try {
       await customerRequestPaymentVerification(order.id);
-      showToast('Payment verification requested. Waiting for owner confirmation.');
+      setConfirmPaidOpen(false);
+      customerVoiceManager.announceOrderEvent({
+        orderId: order.id,
+        orderCode,
+        tableNumber: order.table_number,
+        eventKey: 'payment_verification_requested',
+      });
+      showToast('Payment request sent to RikZen Fast Food. Please wait for confirmation.');
     } catch (err) {
+      setConfirmPaidOpen(false);
       setActionError(toCustomerFriendlyError(err));
     } finally {
       setRequestingPaymentVerify(false);
@@ -565,6 +570,9 @@ export const RecoveredOrderPage: React.FC<RecoveredOrderPageProps> = ({ token, o
             <FoodArtIcon kind="burger" className="w-8 h-8 sm:w-9 sm:h-9" />
           </div>
         </motion.section>
+
+        {/* Customer Real-Time Voice Updates Control */}
+        <CustomerVoiceBanner />
 
         {/* Action Toast & Error Feedback */}
         {actionFeedback && (
@@ -698,20 +706,35 @@ export const RecoveredOrderPage: React.FC<RecoveredOrderPageProps> = ({ token, o
             <div className="min-w-0">
               <p className="text-xs font-semibold text-neutral-500">Payment Status</p>
               {isPaid ? (
-                <p className="text-sm font-extrabold text-emerald-700 inline-flex items-center gap-1.5">
-                  <CheckCircle2 className="w-4 h-4" />
-                  PAID · Payment Received
-                </p>
+                <div>
+                  <p className="text-sm font-extrabold text-emerald-700 inline-flex items-center gap-1.5">
+                    <CheckCircle2 className="w-4 h-4" />
+                    ✓ PAYMENT CONFIRMED · PAID
+                  </p>
+                  <p className="text-xs text-emerald-800 mt-0.5">
+                    Your payment has been verified by RikZen Fast Food.
+                  </p>
+                </div>
               ) : isVerificationPending ? (
-                <p className="text-sm font-extrabold text-amber-800 inline-flex items-center gap-1.5">
-                  <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-                  PAYMENT VERIFICATION PENDING
-                </p>
+                <div>
+                  <p className="text-sm font-extrabold text-amber-800 inline-flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                    Payment Verification Pending
+                  </p>
+                  <p className="text-xs text-amber-900 mt-0.5">
+                    Payment request sent to RikZen Fast Food. Please wait for confirmation.
+                  </p>
+                </div>
               ) : isNotReceived ? (
-                <p className="text-sm font-extrabold text-red-700 inline-flex items-center gap-1.5">
-                  <XCircle className="w-4 h-4" />
-                  PAYMENT NOT RECEIVED
-                </p>
+                <div>
+                  <p className="text-sm font-extrabold text-red-700 inline-flex items-center gap-1.5">
+                    <XCircle className="w-4 h-4" />
+                    Payment Not Confirmed
+                  </p>
+                  <p className="text-xs text-red-700 mt-0.5">
+                    Please check your payment and contact the shop.
+                  </p>
+                </div>
               ) : (
                 <p className="text-sm font-extrabold text-amber-800 inline-flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
@@ -1050,6 +1073,16 @@ export const RecoveredOrderPage: React.FC<RecoveredOrderPageProps> = ({ token, o
         order={billModalOpen ? order : null}
         onClose={() => setBillModalOpen(false)}
         paymentSettings={paymentSettings}
+      />
+
+      {/* Payment Confirmation Popup */}
+      <PaymentConfirmModal
+        open={confirmPaidOpen}
+        orderCode={orderCode}
+        totalAmount={order.total}
+        submitting={requestingPaymentVerify}
+        onConfirm={handleConfirmIHavePaid}
+        onCancel={() => setConfirmPaidOpen(false)}
       />
     </div>
   );

@@ -1479,6 +1479,170 @@ app.get('/api/public/cancellation-tts', async (_req, res) => {
   }
 });
 
+// Strict allowlisted customer order voice announcement TTS (natural Indian female voice, cached)
+type CustomerTtsEventKey =
+  | 'order_placed'
+  | 'order_confirmed'
+  | 'order_preparing'
+  | 'order_ready'
+  | 'order_completed'
+  | 'bill_ready'
+  | 'payment_qr_available'
+  | 'payment_verification_requested'
+  | 'payment_confirmed'
+  | 'payment_not_received'
+  | 'order_cancelled';
+
+const customerTtsCache = new Map<string, Buffer>();
+const MAX_CUSTOMER_TTS_CACHE = 120;
+
+function formatSpokenOrderCodeServer(orderCode: string): string {
+  const clean = orderCode.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+  const match = clean.match(/^([A-Z]+)(\d+)$/);
+  if (!match) return clean || 'your order';
+  const letters = match[1].split('').join(' ');
+  const digits = match[2];
+  return `${letters} ${digits}`;
+}
+
+function buildAllowlistedCustomerVoiceScript(
+  eventKey: CustomerTtsEventKey,
+  orderCode: string,
+  tableNumber: number | null,
+): string {
+  const spokenCode = formatSpokenOrderCodeServer(orderCode);
+  switch (eventKey) {
+    case 'order_placed':
+      return `Your order has been placed successfully at RikZen Fast Food. Your order number is ${spokenCode}. We have received your order and it is now waiting for confirmation. Please wait while our team confirms your order.`;
+    case 'order_confirmed':
+      return `Good news! Your order number ${spokenCode} has been confirmed by RikZen Fast Food. Our team has accepted your order and will now start preparing your food. Please wait.`;
+    case 'order_preparing':
+      return `Your order number ${spokenCode} is now being prepared. Our kitchen team is preparing your food fresh for you. Please wait a little while. Your order will be ready soon.`;
+    case 'order_ready':
+      if (tableNumber && tableNumber >= 1 && tableNumber <= 6) {
+        return `Your order number ${spokenCode} is ready now. Our team will serve your order to Table ${tableNumber}. Please wait at your table.`;
+      }
+      return `Your order number ${spokenCode} is ready now. Please collect your order from the RikZen Fast Food counter.`;
+    case 'order_completed':
+      return `Your order number ${spokenCode} has been completed successfully. Thank you for ordering from RikZen Fast Food. We hope you enjoy your meal.`;
+    case 'bill_ready':
+      return `Your bill for order number ${spokenCode} is now ready. Please open your bill to check your total amount and payment details.`;
+    case 'payment_qr_available':
+      return 'Your payment Q R code is available on your bill. Please scan the Q R code using your U P I payment app and complete the payment. After making the payment, tap the I Have Paid button to send a verification request to RikZen Fast Food.';
+    case 'payment_verification_requested':
+      return 'Your payment verification request has been sent successfully to RikZen Fast Food. Please wait while our team checks and confirms your payment.';
+    case 'payment_confirmed':
+      return `Payment received successfully. Your payment for order number ${spokenCode} has been verified and confirmed by RikZen Fast Food. Your bill is now fully paid. Thank you for your payment.`;
+    case 'payment_not_received':
+      return `We could not confirm your payment for order number ${spokenCode}. Please check your payment details and contact RikZen Fast Food if you need any help.`;
+    case 'order_cancelled':
+      return `We are sorry. Your order number ${spokenCode} has been cancelled by RikZen Fast Food. Please contact the shop if you need more information.`;
+  }
+}
+
+const VALID_CUSTOMER_TTS_EVENTS = new Set<string>([
+  'order_placed',
+  'order_confirmed',
+  'order_preparing',
+  'order_ready',
+  'order_completed',
+  'bill_ready',
+  'payment_qr_available',
+  'payment_verification_requested',
+  'payment_confirmed',
+  'payment_not_received',
+  'order_cancelled',
+]);
+
+app.post('/api/public/customer-tts', async (req, res) => {
+  try {
+    const rawEvent = typeof req.body?.eventKey === 'string' ? req.body.eventKey.trim() : '';
+    if (!VALID_CUSTOMER_TTS_EVENTS.has(rawEvent)) {
+      res.status(400).json({ success: false, error: 'Unsupported customer voice event.' });
+      return;
+    }
+    const eventKey = rawEvent as CustomerTtsEventKey;
+    const rawOrderCode = typeof req.body?.orderCode === 'string' ? req.body.orderCode.trim() : '';
+    const cleanOrderCode = /^RK[0-9]{4,8}$/i.test(rawOrderCode) ? rawOrderCode.toUpperCase() : 'RK1000';
+    const rawTable = Number(req.body?.tableNumber);
+    const tableNumber = Number.isInteger(rawTable) && rawTable >= 1 && rawTable <= 6 ? rawTable : null;
+
+    const cacheKey = `${eventKey}:${cleanOrderCode}:${tableNumber ?? 0}`;
+    const cached = customerTtsCache.get(cacheKey);
+    if (cached && cached.length > 100) {
+      res.setHeader('Content-Type', 'audio/wav');
+      res.setHeader('Content-Length', String(cached.length));
+      res.setHeader('Cache-Control', 'public, max-age=1800');
+      res.status(200).send(cached);
+      return;
+    }
+
+    const ai = getGeminiClient();
+    if (!ai) {
+      res.status(503).json({
+        success: false,
+        code: 'VOICE_TTS_NOT_CONFIGURED',
+        error: 'Server natural voice TTS unavailable; using browser Indian English voice.',
+      });
+      return;
+    }
+
+    const script = buildAllowlistedCustomerVoiceScript(eventKey, cleanOrderCode, tableNumber);
+    const toneHint =
+      eventKey === 'order_ready'
+        ? 'Slightly louder, cheerful, clear, natural Indian English female restaurant host voice.'
+        : eventKey === 'order_cancelled' || eventKey === 'payment_not_received'
+          ? 'Polite, empathetic, very clear natural Indian English female restaurant staff voice. Pronounce "cancelled" and "payment" crisply.'
+          : 'Warm, friendly, clear, loud enough to hear comfortably, natural Indian English female restaurant host voice.';
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash-lite-tts',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: script,
+              speechMetadata: {
+                style: `${toneHint} Medium speaking pace with natural polite pauses between sentences. Never robotic or rushed. Pronounce "RikZen Fast Food", "order", "confirmed", "preparing", "ready", "completed", "bill", "payment", "verified", "cancelled", and "Fries" (as "fryze") clearly.`,
+              },
+            },
+          ],
+        },
+      ],
+      config: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: 'Kore' },
+          },
+        },
+      },
+    });
+
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!base64Audio) {
+      res.status(502).json({ success: false, error: 'Empty customer voice payload.' });
+      return;
+    }
+
+    const wavBuffer = Buffer.from(base64Audio, 'base64');
+    if (customerTtsCache.size >= MAX_CUSTOMER_TTS_CACHE) {
+      const oldestKey = customerTtsCache.keys().next().value;
+      if (oldestKey) customerTtsCache.delete(oldestKey);
+    }
+    customerTtsCache.set(cacheKey, wavBuffer);
+
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Content-Length', String(wavBuffer.length));
+    res.setHeader('Cache-Control', 'public, max-age=1800');
+    res.status(200).send(wavBuffer);
+  } catch (err) {
+    console.error('[RikZen Customer TTS Error]', err);
+    res.status(502).json({ success: false, error: 'Unable to synthesize customer voice.' });
+  }
+});
+
 /**
  * Owner-authenticated safe server diagnostics (never returns secrets or full signatures).
  */

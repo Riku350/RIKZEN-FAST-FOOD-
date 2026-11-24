@@ -191,6 +191,8 @@ service cloud.firestore {
           'bill_requested', 'bill_ready', 'completed', 'rejected', 'cancelled'
         ] &&
         (!('payment_status' in data) || data.payment_status in ['not_paid', 'pending', 'verification_requested', 'paid', 'not_received', 'failed']) &&
+        (!('paymentStatus' in data) || data.paymentStatus in ['pending', 'verification_requested', 'paid', 'not_received']) &&
+        (!('payment_requested_at' in data) || (data.payment_requested_at is string && data.payment_requested_at.size() <= 64)) &&
         (!('paid_at' in data) || (data.paid_at is string && data.paid_at.size() <= 64)) &&
         (!('payment_verified_by' in data) || (data.payment_verified_by is string && data.payment_verified_by.size() <= 128)) &&
         (!('payment_verified_at' in data) || (data.payment_verified_at is string && data.payment_verified_at.size() <= 64)) &&
@@ -220,7 +222,7 @@ service cloud.firestore {
           'id', 'order_number', 'order_code', 'table_id', 'table_number',
           'customer_name', 'customer_mobile', 'customer_phone_normalized', 'items', 'item_count',
           'subtotal', 'discount', 'total', 'status',
-          'payment_status', 'paid_at', 'payment_verified_by', 'payment_verified_at',
+          'payment_status', 'paymentStatus', 'payment_requested_at', 'paid_at', 'payment_verified_by', 'payment_verified_at',
           'confirmed_at', 'completed_at', 'cancelled_at', 'cancelled_by', 'upi_uri',
           'public_bill_id', 'payment_qr_snapshot',
           'pdf_ready', 'bill_status', 'pdf_url', 'pdf_path', 'generated_at',
@@ -354,6 +356,8 @@ service cloud.firestore {
         isValidOrder(incoming(), orderId) &&
         incoming().status == 'pending' &&
         (!('payment_status' in incoming()) || incoming().payment_status in ['pending', 'not_paid']) &&
+        (!('paymentStatus' in incoming()) || incoming().paymentStatus == 'pending') &&
+        (!('payment_requested_at' in incoming()) || incoming().payment_requested_at == '') &&
         (!('paid_at' in incoming()) || incoming().paid_at == '') &&
         (!('confirmed_at' in incoming()) || incoming().confirmed_at == '') &&
         incoming().created_at == request.time &&
@@ -367,7 +371,7 @@ service cloud.firestore {
           // Tier 1: Verified Owner manages lifecycle, confirmation, cancellation, manual payment verification, and bill snapshot
           (isOwner() && incoming().diff(existing()).affectedKeys().hasOnly([
             'status', 'confirmed_at', 'completed_at', 'cancelled_at', 'cancelled_by',
-            'payment_status', 'paid_at', 'payment_verified_by', 'payment_verified_at',
+            'payment_status', 'paymentStatus', 'payment_requested_at', 'paid_at', 'payment_verified_by', 'payment_verified_at',
             'upi_uri', 'public_bill_id', 'payment_qr_snapshot',
             'pdf_ready', 'bill_status', 'pdf_url', 'pdf_path',
             'generated_at', 'updated_at'
@@ -377,11 +381,17 @@ service cloud.firestore {
             existing().status in ['accepted', 'confirmed', 'preparing', 'ready'] &&
             incoming().status == 'bill_requested' &&
             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updated_at'])) ||
-          // Tier 2b: Dine-in customer can ONLY request manual payment verification ("I HAVE PAID") — NEVER mark paid!
+          // Tier 2b: Dine-in customer can ONLY send ONE manual payment verification request ("I HAVE PAID")
+          // Strictly blocks duplicate requests while verification_requested, and NEVER allows customer to mark paid/not_received!
           (!(existing().status in ['rejected', 'cancelled']) &&
-            (!('payment_status' in existing()) || existing().payment_status != 'paid') &&
+            (!('payment_status' in existing()) || !(existing().payment_status in ['paid', 'verification_requested'])) &&
+            (!('paymentStatus' in existing()) || !(existing().paymentStatus in ['paid', 'verification_requested'])) &&
             incoming().payment_status == 'verification_requested' &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['payment_status', 'updated_at']))
+            incoming().paymentStatus == 'verification_requested' &&
+            incoming().payment_requested_at is string &&
+            incoming().payment_requested_at.size() >= 10 &&
+            incoming().payment_requested_at.size() <= 64 &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['payment_status', 'paymentStatus', 'payment_requested_at', 'updated_at']))
         );
 
       allow delete: if isValidOrderDocId(orderId) && isOwner();

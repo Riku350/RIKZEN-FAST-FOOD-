@@ -36,8 +36,14 @@ import {
   isCancelledOrderStatus,
   PublicBillPayload,
   subscribeToOrder,
+  subscribeToPaymentSettings,
 } from '../lib/orderService';
+import { customerVoiceManager } from '../lib/customerVoiceManager';
+import { buildDynamicUpiUri, DEFAULT_PAYMENT_SETTINGS } from '../lib/upiPayment';
+import { PaymentSettings } from '../types/restaurant';
+import { CustomerVoiceBanner } from './CustomerVoiceBanner';
 import { FoodArtIcon } from './FoodArtIcons';
+import { PaymentConfirmModal } from './PaymentConfirmModal';
 
 interface PublicBillPageProps {
   billId: string;
@@ -54,6 +60,16 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
   const [sharingPdf, setSharingPdf] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
   const [requestingVerify, setRequestingVerify] = useState(false);
+  const [confirmPaidOpen, setConfirmPaidOpen] = useState(false);
+  const [livePaymentSettings, setLivePaymentSettings] =
+    useState<PaymentSettings>(DEFAULT_PAYMENT_SETTINGS);
+
+  useEffect(() => {
+    const unsub = subscribeToPaymentSettings((settings) => {
+      setLivePaymentSettings(settings);
+    });
+    return () => unsub();
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -79,11 +95,12 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
   const liveOrderId =
     bill?.order_id || (/^ord_[a-zA-Z0-9_-]{20,124}$/.test(billId.trim()) ? billId.trim() : '');
 
-  // Keep payment & order status updated in real time from Firestore
+  // Keep payment & order status updated in real time from Firestore + trigger customer voice updates
   useEffect(() => {
     if (!liveOrderId) return;
     const unsub = subscribeToOrder(liveOrderId, (ord) => {
       if (!ord) return;
+      customerVoiceManager.syncRealtimeOrderSnapshot(ord);
       setBill((prev) =>
         prev
           ? {
@@ -91,6 +108,8 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
               order_id: ord.id,
               status: ord.status,
               payment_status: ord.payment_status,
+              paymentStatus: ord.paymentStatus || ord.payment_status,
+              payment_requested_at: ord.payment_requested_at || '',
             }
           : prev,
       );
@@ -162,19 +181,58 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
     }
   };
 
+  const resolvedQrSnap = bill?.payment_qr_snapshot;
+  const resolvedMode =
+    resolvedQrSnap?.mode || livePaymentSettings.payment_mode || 'dynamic_upi';
+  const resolvedMerchantName =
+    resolvedQrSnap?.merchant_name || livePaymentSettings.merchant_name || 'RikZen Fast Food';
+  const resolvedQrImageUrl =
+    resolvedQrSnap?.qr_image_url || livePaymentSettings.qr_image_url || '';
+  const resolvedUpiId = resolvedQrSnap?.upi_id || livePaymentSettings.upi_id || '';
+  const resolvedUpiUri =
+    resolvedMode === 'dynamic_upi'
+      ? resolvedQrSnap?.upi_uri ||
+        (bill
+          ? buildDynamicUpiUri({
+              upiId: resolvedUpiId,
+              merchantName: resolvedMerchantName,
+              amount: bill.total,
+              orderCode: bill.order_code,
+              tableNumber: bill.table_number,
+            })
+          : '') ||
+        ''
+      : '';
+
+  const hasUploadedQr = resolvedMode === 'uploaded_qr' && Boolean(resolvedQrImageUrl);
+  const hasDynamicUpi = resolvedMode === 'dynamic_upi' && Boolean(resolvedUpiUri);
+  const hasAnyPaymentQr = hasUploadedQr || hasDynamicUpi;
+
+  // Announce payment QR availability once per order when unpaid bill QR is displayed
+  useEffect(() => {
+    if (!bill || !liveOrderId) return;
+    const payStatus = bill.paymentStatus || bill.payment_status;
+    const cancelled = isCancelledOrderStatus(bill.status);
+    if (!cancelled && payStatus === 'pending' && hasAnyPaymentQr) {
+      customerVoiceManager.announceOrderEvent({
+        orderId: liveOrderId,
+        orderCode: bill.order_code,
+        tableNumber: bill.table_number,
+        eventKey: 'payment_qr_available',
+      });
+    }
+  }, [bill?.order_code, bill?.payment_status, bill?.paymentStatus, bill?.status, bill?.table_number, liveOrderId, hasAnyPaymentQr]);
+
   const handleDownloadQr = async () => {
-    if (!bill || downloadingQr) return;
-    const snap = bill.payment_qr_snapshot;
-    if (!snap) return;
-    const mode = snap.mode === 'uploaded_qr' && snap.qr_image_url ? 'uploaded_qr' : 'dynamic_upi';
+    if (!bill || downloadingQr || !hasAnyPaymentQr) return;
     setDownloadingQr(true);
     try {
       await downloadPaymentQrPng({
-        mode,
-        upiUri: snap.upi_uri,
-        qrImageUrl: snap.qr_image_url,
-        merchantName: snap.merchant_name || 'RikZen Fast Food',
-        upiId: snap.upi_id,
+        mode: hasUploadedQr ? 'uploaded_qr' : 'dynamic_upi',
+        upiUri: resolvedUpiUri,
+        qrImageUrl: resolvedQrImageUrl,
+        merchantName: resolvedMerchantName,
+        upiId: resolvedUpiId,
         amount: bill.total,
         orderCode: bill.order_code,
         tableNumber: bill.table_number,
@@ -230,14 +288,37 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
     window.print();
   };
 
-  const handleCustomerIHavePaid = async () => {
-    if (!liveOrderId || requestingVerify) return;
+  const handleConfirmCustomerIHavePaid = async () => {
+    if (!liveOrderId || !bill || requestingVerify) return;
+    const curPay = bill.paymentStatus || bill.payment_status;
+    if (curPay === 'paid' || curPay === 'verification_requested') {
+      setConfirmPaidOpen(false);
+      return;
+    }
     setRequestingVerify(true);
+    void customerVoiceManager.unlockOnUserGesture(false);
     try {
       await customerRequestPaymentVerification(liveOrderId);
-      setBill((prev) => (prev ? { ...prev, payment_status: 'verification_requested' } : prev));
-      showToast('Payment verification requested. Please wait for restaurant confirmation.');
+      setConfirmPaidOpen(false);
+      setBill((prev) =>
+        prev
+          ? {
+              ...prev,
+              payment_status: 'verification_requested',
+              paymentStatus: 'verification_requested',
+              payment_requested_at: new Date().toISOString(),
+            }
+          : prev,
+      );
+      customerVoiceManager.announceOrderEvent({
+        orderId: liveOrderId,
+        orderCode: bill.order_code,
+        tableNumber: bill.table_number,
+        eventKey: 'payment_verification_requested',
+      });
+      showToast('Payment request sent to RikZen Fast Food. Please wait for confirmation.');
     } catch (err) {
+      setConfirmPaidOpen(false);
       showToast(err instanceof Error ? err.message : 'Unable to request payment verification.');
     } finally {
       setRequestingVerify(false);
@@ -282,13 +363,13 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
   }
 
   const { date, time } = formatOrderDate(bill.created_at_iso);
-  const isPaid = bill.payment_status === 'paid';
-  const isVerificationPending = bill.payment_status === 'verification_requested';
-  const isNotReceived = bill.payment_status === 'not_received';
+  const currentPaymentStatus = bill.paymentStatus || bill.payment_status;
+  const isPaid = currentPaymentStatus === 'paid';
+  const isVerificationPending = currentPaymentStatus === 'verification_requested';
+  const isNotReceived = currentPaymentStatus === 'not_received';
   const isCancelled = isCancelledOrderStatus(bill.status);
-  const qrSnap = bill.payment_qr_snapshot;
-  const isUploadedQr = qrSnap?.mode === 'uploaded_qr' && Boolean(qrSnap.qr_image_url);
-  const isDynamicUpi = qrSnap?.mode === 'dynamic_upi' && Boolean(qrSnap.upi_uri);
+  const isUploadedQr = hasUploadedQr;
+  const isDynamicUpi = hasDynamicUpi;
 
   return (
     <div className="min-h-screen bg-[#FAF8F5] text-neutral-900 pb-16 print:bg-white print:pb-0">
@@ -354,6 +435,9 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
           </p>
         </motion.section>
 
+        {/* Live Voice Announcements Control */}
+        <CustomerVoiceBanner compact />
+
         {/* Action Toast Feedback */}
         {actionFeedback && (
           <div className="rounded-2xl bg-emerald-50 border border-emerald-200 px-4 py-2.5 text-xs font-bold text-emerald-800 flex items-center gap-2 print:hidden">
@@ -370,9 +454,9 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
               <CreditCard className="w-4 h-4 text-neutral-500" />
               <span className="font-bold text-neutral-600">Payment Status:</span>
               {isPaid ? (
-                <span className="inline-flex items-center gap-1 font-extrabold text-emerald-700">
-                  <CheckCircle2 className="w-4 h-4" />
-                  Payment Received
+                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg bg-emerald-700 text-white font-extrabold">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  PAID · PAYMENT CONFIRMED
                 </span>
               ) : isVerificationPending ? (
                 <span className="inline-flex items-center gap-1 font-extrabold text-amber-800">
@@ -382,12 +466,12 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
               ) : isNotReceived ? (
                 <span className="inline-flex items-center gap-1 font-extrabold text-red-700">
                   <XCircle className="w-4 h-4" />
-                  Payment Not Received
+                  Payment Not Confirmed
                 </span>
-              ) : bill.payment_status === 'failed' ? (
+              ) : currentPaymentStatus === 'failed' ? (
                 <span className="inline-flex items-center gap-1 font-extrabold text-red-700">
                   <XCircle className="w-4 h-4" />
-                  Payment Failed
+                  Payment Not Confirmed
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1 font-extrabold text-amber-800">
@@ -499,147 +583,177 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
               </div>
             </div>
 
-            {/* Honest 2-Mode Payment QR Card (Immutable Snapshot — ZERO animations or cropping on QR) */}
-            {!isCancelled && (isUploadedQr || isDynamicUpi) && (
-              <div className="rounded-2xl border-2 border-neutral-900 bg-white p-4 sm:p-5 flex flex-col sm:flex-row items-center gap-5">
-                {isUploadedQr && qrSnap?.qr_image_url ? (
-                  <div className="bg-white p-2 rounded-xl border border-neutral-200 shrink-0">
-                    <img
-                      src={qrSnap.qr_image_url}
-                      alt={`Payment QR for ${qrSnap.merchant_name || 'RikZen Fast Food'}`}
-                      className="w-44 h-44 object-contain"
-                    />
+            {/* PAYMENT SECTION: Live Confirmed / Pending / Not Received + QR + Download QR + I HAVE PAID */}
+            {!isCancelled && (
+              <div className="rounded-2xl border-2 border-neutral-900 bg-white p-5 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-neutral-100">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#151110] text-white text-xs font-extrabold tracking-wider">
+                      <QrCode className="w-3.5 h-3.5 text-amber-300" />
+                      PAYMENT
+                    </span>
+                    <span className="text-xs font-bold text-neutral-600">Scan &amp; Pay</span>
                   </div>
-                ) : isDynamicUpi && qrSnap?.upi_uri ? (
-                  <div className="bg-white p-2 rounded-xl border border-neutral-200 shrink-0">
-                    <QRCodeSVG
-                      value={qrSnap.upi_uri}
-                      size={176}
-                      level="H"
-                      includeMargin={true}
-                      fgColor="#000000"
-                      bgColor="#FFFFFF"
-                    />
-                  </div>
-                ) : null}
-
-                <div className="flex-1 text-center sm:text-left space-y-2 min-w-0">
-                  <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#151110] text-white text-[11px] font-extrabold tracking-wide">
-                    <QrCode className="w-3.5 h-3.5 text-amber-300" />
-                    SCAN TO PAY
-                  </div>
-                  <p className="font-mono text-2xl sm:text-3xl font-extrabold text-[#E5391B] tabular-nums">
+                  <span className="font-mono text-xl sm:text-2xl font-extrabold text-[#E5391B] tabular-nums">
                     {formatRupees(bill.total)}
-                  </p>
-                  <p className="text-xs font-bold text-neutral-900">
-                    {qrSnap?.merchant_name || 'RikZen Fast Food'}
-                  </p>
-                  {isVerificationPending && (
-                    <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs font-bold text-amber-900">
-                      Payment Verification Pending — Waiting for restaurant owner to verify your
-                      payment.
-                    </div>
-                  )}
-                  {isNotReceived && (
-                    <div className="rounded-xl bg-red-50 border border-red-200 px-3 py-2 text-xs font-bold text-red-800">
-                      Payment could not be verified. Please contact the restaurant.
-                    </div>
-                  )}
-                  {isDynamicUpi ? (
-                    <>
-                      <p className="text-xs font-bold text-emerald-700">
-                        Scan to pay this exact bill amount · #{bill.order_code}
-                      </p>
-                      {qrSnap?.upi_id && (
-                        <p className="text-xs font-mono text-neutral-600 truncate">
-                          UPI ID: <span className="font-bold text-neutral-900">{qrSnap.upi_id}</span>
-                        </p>
-                      )}
-                      <div className="pt-1 flex flex-wrap items-center justify-center sm:justify-start gap-2 print:hidden">
-                        {!isPaid && qrSnap?.upi_uri && (
-                          <a
-                            href={qrSnap.upi_uri}
-                            className="min-h-[42px] px-4 py-2 rounded-xl bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] inline-flex items-center gap-1.5"
-                          >
-                            <Smartphone className="w-4 h-4" />
-                            Pay Now · {formatRupees(bill.total)}
-                          </a>
-                        )}
-                        <button
-                          type="button"
-                          disabled={downloadingQr}
-                          onClick={handleDownloadQr}
-                          className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
-                        >
-                          {downloadingQr ? (
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                          ) : (
-                            <Download className="w-4 h-4" />
-                          )}
-                          {downloadingQr ? 'Saving QR...' : 'Download QR'}
-                        </button>
-                        {liveOrderId && !isPaid && !isVerificationPending && (
-                          <button
-                            type="button"
-                            disabled={requestingVerify}
-                            onClick={handleCustomerIHavePaid}
-                            className="min-h-[42px] px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold hover:bg-emerald-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
-                          >
-                            {requestingVerify ? (
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                            ) : (
-                              <CheckCircle2 className="w-4 h-4" />
-                            )}
-                            {requestingVerify ? 'Sending...' : 'I Have Paid'}
-                          </button>
-                        )}
-                      </div>
-                    </>
-                  ) : (
-                    <>
-                      <p className="text-xs font-medium text-neutral-700">
-                        Scan this QR using PhonePe, Google Pay, Paytm, or BHIM and pay{' '}
-                        <span className="font-bold text-neutral-900">
-                          {formatRupees(bill.total)}
-                        </span>
-                        .
-                      </p>
-                      <div className="pt-1 flex flex-wrap items-center justify-center sm:justify-start gap-2 print:hidden">
-                        <button
-                          type="button"
-                          disabled={downloadingQr}
-                          onClick={handleDownloadQr}
-                          className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
-                        >
-                          {downloadingQr ? (
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                          ) : (
-                            <Download className="w-4 h-4" />
-                          )}
-                          {downloadingQr ? 'Saving QR...' : 'Download QR'}
-                        </button>
-                        {liveOrderId && !isPaid && !isVerificationPending && (
-                          <button
-                            type="button"
-                            disabled={requestingVerify}
-                            onClick={handleCustomerIHavePaid}
-                            className="min-h-[42px] px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold hover:bg-emerald-800 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
-                          >
-                            {requestingVerify ? (
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                            ) : (
-                              <CheckCircle2 className="w-4 h-4" />
-                            )}
-                            {requestingVerify ? 'Sending...' : 'I Have Paid'}
-                          </button>
-                        )}
-                      </div>
-                    </>
-                  )}
-                  <p className="text-[11px] text-neutral-500">
-                    PhonePe · Google Pay · Paytm · BHIM
-                  </p>
+                  </span>
                 </div>
+
+                {/* Live Owner-Verified Payment Confirmed Card */}
+                {isPaid ? (
+                  <div className="rounded-2xl bg-emerald-50 border-2 border-emerald-300 p-5 text-center space-y-2">
+                    <div className="w-12 h-12 rounded-2xl bg-emerald-700 text-white flex items-center justify-center mx-auto">
+                      <CheckCircle2 className="w-7 h-7" />
+                    </div>
+                    <p className="text-lg font-extrabold text-emerald-900">
+                      ✓ PAYMENT CONFIRMED
+                    </p>
+                    <p className="text-sm font-medium text-emerald-800">
+                      Your payment has been verified by RikZen Fast Food.
+                    </p>
+                    <span className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-emerald-700 text-white text-xs font-extrabold tracking-wider">
+                      BILL STATUS: PAID
+                    </span>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {/* Live Status Alerts */}
+                    {isVerificationPending && (
+                      <div className="rounded-2xl bg-amber-50 border border-amber-300 px-4 py-3.5 space-y-1">
+                        <p className="text-sm font-extrabold text-amber-950 inline-flex items-center gap-2">
+                          <span className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse" />
+                          Payment Verification Pending
+                        </p>
+                        <p className="text-xs font-medium text-amber-900">
+                          Payment request sent to RikZen Fast Food. Please wait for confirmation.
+                        </p>
+                      </div>
+                    )}
+
+                    {isNotReceived && (
+                      <div className="rounded-2xl bg-red-50 border border-red-300 px-4 py-3.5 space-y-1">
+                        <p className="text-sm font-extrabold text-red-900 inline-flex items-center gap-1.5">
+                          <XCircle className="w-4 h-4 shrink-0" />
+                          Payment Not Confirmed
+                        </p>
+                        <p className="text-xs font-medium text-red-800">
+                          Please check your payment and contact the shop. You can scan the QR and
+                          try again below.
+                        </p>
+                      </div>
+                    )}
+
+                    {/* QR Display + Download QR Directly Below QR */}
+                    {(isUploadedQr || isDynamicUpi) && (
+                      <div className="flex flex-col sm:flex-row items-center gap-5">
+                        <div className="flex flex-col items-center gap-2.5 shrink-0">
+                          {isUploadedQr && resolvedQrImageUrl ? (
+                            <div className="bg-white p-2.5 rounded-2xl border border-neutral-200 shadow-xs">
+                              <img
+                                src={resolvedQrImageUrl}
+                                alt={`Payment QR for ${resolvedMerchantName}`}
+                                className="w-48 h-48 object-contain"
+                              />
+                            </div>
+                          ) : isDynamicUpi && resolvedUpiUri ? (
+                            <div className="bg-white p-2.5 rounded-2xl border border-neutral-200 shadow-xs">
+                              <QRCodeSVG
+                                value={resolvedUpiUri}
+                                size={184}
+                                level="H"
+                                includeMargin={true}
+                                fgColor="#000000"
+                                bgColor="#FFFFFF"
+                              />
+                            </div>
+                          ) : null}
+
+                          <button
+                            type="button"
+                            disabled={downloadingQr}
+                            onClick={handleDownloadQr}
+                            className="w-full min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-extrabold hover:bg-neutral-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60 print:hidden"
+                          >
+                            {downloadingQr ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                              <Download className="w-4 h-4" />
+                            )}
+                            {downloadingQr ? 'Saving QR...' : 'Download QR'}
+                          </button>
+                        </div>
+
+                        <div className="flex-1 text-center sm:text-left space-y-2.5 min-w-0">
+                          <p className="text-sm font-extrabold text-neutral-900">
+                            Scan &amp; Pay · {resolvedMerchantName}
+                          </p>
+                          {isDynamicUpi ? (
+                            <>
+                              <p className="text-xs font-bold text-emerald-700">
+                                Scan this QR using any UPI app to pay exact amount{' '}
+                                {formatRupees(bill.total)} · #{bill.order_code}
+                              </p>
+                              {resolvedUpiId && (
+                                <p className="text-xs font-mono text-neutral-600 truncate">
+                                  UPI ID:{' '}
+                                  <span className="font-bold text-neutral-900">{resolvedUpiId}</span>
+                                </p>
+                              )}
+                              {resolvedUpiUri && (
+                                <div className="pt-0.5 print:hidden">
+                                  <a
+                                    href={resolvedUpiUri}
+                                    className="min-h-[42px] px-4 py-2 rounded-xl bg-[#E5391B] text-white text-xs font-extrabold hover:bg-[#C82E14] inline-flex items-center gap-1.5"
+                                  >
+                                    <Smartphone className="w-4 h-4" />
+                                    Open UPI App · {formatRupees(bill.total)}
+                                  </a>
+                                </div>
+                              )}
+                            </>
+                          ) : (
+                            <p className="text-xs font-medium text-neutral-700 leading-relaxed">
+                              Scan this QR code using PhonePe, Google Pay, Paytm, or BHIM and pay{' '}
+                              <span className="font-bold text-neutral-900">
+                                {formatRupees(bill.total)}
+                              </span>
+                              . After completing payment, tap <span className="font-bold">I HAVE PAID</span> below.
+                            </p>
+                          )}
+                          <p className="text-[11px] text-neutral-500">
+                            PhonePe · Google Pay · Paytm · BHIM
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Big Prominent I HAVE PAID Button (with Duplicate Protection) */}
+                    {liveOrderId && (
+                      <div className="pt-2 border-t border-neutral-100 print:hidden">
+                        {isVerificationPending ? (
+                          <button
+                            type="button"
+                            disabled
+                            className="w-full min-h-[52px] px-5 py-3 rounded-2xl bg-amber-100 border border-amber-300 text-amber-900 font-extrabold text-sm inline-flex items-center justify-center gap-2 cursor-not-allowed"
+                          >
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            Payment Verification Pending
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={requestingVerify}
+                            onClick={() => setConfirmPaidOpen(true)}
+                            className="w-full min-h-[54px] px-5 py-3.5 rounded-2xl bg-emerald-700 hover:bg-emerald-800 text-white font-extrabold text-base tracking-wide active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60 shadow-sm"
+                          >
+                            <CheckCircle2 className="w-5 h-5" />
+                            I HAVE PAID
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 
@@ -720,6 +834,15 @@ export const PublicBillPage: React.FC<PublicBillPageProps> = ({ billId, onNaviga
           </div>
         </section>
       </main>
+
+      <PaymentConfirmModal
+        open={confirmPaidOpen}
+        orderCode={bill.order_code}
+        totalAmount={bill.total}
+        submitting={requestingVerify}
+        onConfirm={handleConfirmCustomerIHavePaid}
+        onCancel={() => setConfirmPaidOpen(false)}
+      />
     </div>
   );
 };

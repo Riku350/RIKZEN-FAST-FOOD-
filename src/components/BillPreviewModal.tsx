@@ -38,9 +38,11 @@ import {
   formatOrderDate,
   formatRupees,
 } from '../lib/orderService';
+import { customerVoiceManager } from '../lib/customerVoiceManager';
 import { buildDynamicUpiUri, DEFAULT_PAYMENT_SETTINGS } from '../lib/upiPayment';
 import { GeneratedBillResult, OrderRecord, PaymentSettings } from '../types/restaurant';
 import { FoodArtIcon } from './FoodArtIcons';
+import { PaymentConfirmModal } from './PaymentConfirmModal';
 
 interface BillPreviewModalProps {
   order: OrderRecord | null;
@@ -74,6 +76,7 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
   const [shareToast, setShareToast] = useState<string | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
   const [requestingPaymentVerify, setRequestingPaymentVerify] = useState(false);
+  const [confirmPaidOpen, setConfirmPaidOpen] = useState(false);
 
   const [clientPdfBlobUrl, setClientPdfBlobUrl] = useState<string>('');
 
@@ -198,14 +201,31 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
   const isNotReceived = paymentStatus === 'not_received';
   const isCancelled = order.status === 'rejected' || order.status === 'cancelled';
 
-  const handleCustomerIHavePaid = async () => {
+  const handleCustomerIHavePaid = () => {
     if (requestingPaymentVerify || isPaid || isVerificationPending || isCancelled) return;
+    setConfirmPaidOpen(true);
+  };
+
+  const handleConfirmCustomerIHavePaid = async () => {
+    if (requestingPaymentVerify || isPaid || isVerificationPending || isCancelled) {
+      setConfirmPaidOpen(false);
+      return;
+    }
     setRequestingPaymentVerify(true);
     setDownloadError(null);
+    void customerVoiceManager.unlockOnUserGesture(false);
     try {
       await customerRequestPaymentVerification(order.id);
-      showToast('Payment verification requested. Please wait for owner confirmation.');
+      setConfirmPaidOpen(false);
+      customerVoiceManager.announceOrderEvent({
+        orderId: order.id,
+        orderCode,
+        tableNumber: order.table_number,
+        eventKey: 'payment_verification_requested',
+      });
+      showToast('Payment request sent to RikZen Fast Food. Please wait for confirmation.');
     } catch (err) {
+      setConfirmPaidOpen(false);
       setDownloadError(
         err instanceof Error ? err.message : 'Unable to send payment verification request.',
       );
@@ -729,13 +749,13 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
                     <p className="text-xs font-bold text-neutral-900">{activeMerchantName}</p>
                     {isVerificationPending && (
                       <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs font-bold text-amber-900">
-                        Payment Verification Pending — Waiting for restaurant owner to verify your
-                        payment.
+                        Payment Verification Pending — Payment request sent to RikZen Fast Food.
+                        Please wait for confirmation.
                       </div>
                     )}
                     {isNotReceived && (
                       <div className="rounded-xl bg-red-50 border border-red-200 px-3 py-2 text-xs font-bold text-red-800">
-                        Payment could not be verified. Please contact the restaurant.
+                        Payment Not Confirmed — Please check your payment and contact the shop.
                       </div>
                     )}
                     {showDynamicUpiQr ? (
@@ -952,6 +972,15 @@ export const BillPreviewModal: React.FC<BillPreviewModalProps> = ({
             </div>
           </div>
         </motion.div>
+
+        <PaymentConfirmModal
+          open={confirmPaidOpen}
+          orderCode={orderCode}
+          totalAmount={order.total}
+          submitting={requestingPaymentVerify}
+          onConfirm={handleConfirmCustomerIHavePaid}
+          onCancel={() => setConfirmPaidOpen(false)}
+        />
       </div>
     </AnimatePresence>
   );

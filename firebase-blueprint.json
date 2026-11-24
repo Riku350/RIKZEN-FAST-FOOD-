@@ -293,6 +293,14 @@
           "type": "string",
           "enum": ["not_paid", "pending", "verification_requested", "paid", "not_received", "failed"]
         },
+        "paymentStatus": {
+          "type": "string",
+          "enum": ["pending", "verification_requested", "paid", "not_received"]
+        },
+        "payment_requested_at": {
+          "type": "string",
+          "maxLength": 64
+        },
         "paid_at": {
           "type": "string",
           "maxLength": 64

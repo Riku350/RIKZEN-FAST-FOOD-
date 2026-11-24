@@ -130,6 +130,7 @@ import {
   OrderStatus,
   PaymentMode,
   PaymentSettings,
+  PaymentStatus,
   TableRecord,
   TableStatus,
 } from '../types/restaurant';
@@ -310,6 +311,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
   const prefersReducedMotion = useReducedMotion();
 
   const knownOrderStatusesRef = useRef<Map<string, OrderStatus>>(new Map());
+  const knownPaymentStatusesRef = useRef<Map<string, PaymentStatus>>(new Map());
   const seenNewOrderIdsRef = useRef<Set<string>>(new Set());
   const initialOrdersLoadedRef = useRef(false);
   const voiceSettingsRef = useRef<VoiceAlertSettings>(voiceSettings);
@@ -443,6 +445,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
     if (!authReady || !user || !isOwner) {
       initialOrdersLoadedRef.current = false;
       knownOrderStatusesRef.current.clear();
+      knownPaymentStatusesRef.current.clear();
       return;
     }
 
@@ -458,10 +461,11 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
           }
         } else {
           const freshlyArrivedPending: OrderRecord[] = [];
-          let billRequestedChime = false;
+          let billOrPaymentRequestedChime = false;
 
           for (const ord of incomingOrders) {
             const prevStatus = knownOrderStatusesRef.current.get(ord.id);
+            const prevPayStatus = knownPaymentStatusesRef.current.get(ord.id);
             const isGenuinelyNewPending =
               !prevStatus &&
               ord.status === 'pending' &&
@@ -476,7 +480,12 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
               prevStatus !== 'bill_requested' &&
               ord.status === 'bill_requested'
             ) {
-              billRequestedChime = true;
+              billOrPaymentRequestedChime = true;
+            } else if (
+              prevPayStatus !== 'verification_requested' &&
+              ord.payment_status === 'verification_requested'
+            ) {
+              billOrPaymentRequestedChime = true;
             }
           }
 
@@ -491,7 +500,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
               const additions = freshlyArrivedPending.filter((o) => !existingIds.has(o.id));
               return [...additions, ...prev].slice(0, 6);
             });
-          } else if (billRequestedChime && voiceSettingsRef.current.enabled) {
+          } else if (billOrPaymentRequestedChime && voiceSettingsRef.current.enabled) {
             playKitchenAlertChime('bill');
           }
         }
@@ -499,8 +508,10 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
         // Keep live alert popup cards synced with Firestore (auto-remove once confirmed/rejected)
         const pendingById = new Map<string, OrderRecord>();
         const nextMap = new Map<string, OrderStatus>();
+        const nextPayMap = new Map<string, PaymentStatus>();
         for (const ord of incomingOrders) {
           nextMap.set(ord.id, ord.status);
+          nextPayMap.set(ord.id, ord.payment_status);
           if (ord.status === 'pending') {
             pendingById.set(ord.id, ord);
           }
@@ -512,6 +523,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
         );
 
         knownOrderStatusesRef.current = nextMap;
+        knownPaymentStatusesRef.current = nextPayMap;
         initialOrdersLoadedRef.current = true;
         setOrders(incomingOrders);
 
@@ -1991,120 +2003,157 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
               </div>
 
               {/* Manual Payment Verification Queue (Shows customer "I HAVE PAID" alerts & unpaid bills) */}
-              {paymentVerificationQueue.length > 0 && (
-                <section className="bg-white rounded-3xl border-2 border-amber-300 p-5 sm:p-6 space-y-4">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div>
-                      <h3 className="text-base font-extrabold text-neutral-900 inline-flex items-center gap-2">
-                        <CreditCard className="w-5 h-5 text-[#E5391B]" />
-                        Payment Verification ({paymentVerificationQueue.length})
-                      </h3>
-                      <p className="text-xs text-neutral-600 mt-0.5">
-                        Verify customer UPI / cash payments manually before marking Paid. Paid orders update revenue instantly.
-                      </p>
+              {paymentVerificationQueue.length > 0 && (() => {
+                const verificationRequestedCount = paymentVerificationQueue.filter(
+                  (o) => o.payment_status === 'verification_requested',
+                ).length;
+                return (
+                  <section
+                    className={`bg-white rounded-3xl border-2 p-5 sm:p-6 space-y-4 ${
+                      verificationRequestedCount > 0 ? 'border-amber-400 shadow-sm' : 'border-amber-300'
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-base font-extrabold text-neutral-900 inline-flex items-center gap-2">
+                          <CreditCard className="w-5 h-5 text-[#E5391B]" />
+                          {verificationRequestedCount > 0
+                            ? `Payment Verification Required (${verificationRequestedCount} waiting)`
+                            : `Payment Verification (${paymentVerificationQueue.length})`}
+                        </h3>
+                        <p className="text-xs text-neutral-600 mt-0.5">
+                          Check your UPI app / cash counter before confirming. Only owner-verified Paid orders count toward sales revenue.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setSection('bills')}
+                        className="text-xs font-bold text-[#E5391B] hover:underline cursor-pointer"
+                      >
+                        Open All Bills →
+                      </button>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => setSection('bills')}
-                      className="text-xs font-bold text-[#E5391B] hover:underline cursor-pointer"
-                    >
-                      Open All Bills →
-                    </button>
-                  </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
-                    {paymentVerificationQueue.slice(0, 6).map((ord) => {
-                      const isRequested = ord.payment_status === 'verification_requested';
-                      const isNotReceived = ord.payment_status === 'not_received';
-                      const isBusyPay = updatingPaymentId === ord.id;
-                      return (
-                        <div
-                          key={ord.id}
-                          className={`rounded-2xl border p-4 space-y-3 ${
-                            isRequested
-                              ? 'border-amber-400 bg-amber-50/70'
-                              : isNotReceived
-                                ? 'border-red-200 bg-red-50/40'
-                                : 'border-neutral-200 bg-neutral-50/60'
-                          }`}
-                        >
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="min-w-0">
-                              <p className="text-xs font-mono font-extrabold text-[#E5391B]">
-                                #{ord.order_code} · Table {ord.table_number}
-                              </p>
-                              <p className="text-sm font-extrabold text-neutral-900 truncate">
-                                {ord.customer_name}
-                              </p>
-                              <p className="text-xs font-mono text-neutral-600">
-                                {formatIndianMobileDisplay(ord.customer_mobile)}
-                              </p>
-                            </div>
-                            <div className="text-right shrink-0 tabular-nums">
-                              <p className="font-mono text-xl font-extrabold text-neutral-900">
-                                {formatRupees(ord.total)}
-                              </p>
-                              <span
-                                className={`inline-flex items-center gap-1 text-[11px] font-extrabold ${
-                                  isRequested
-                                    ? 'text-amber-800'
-                                    : isNotReceived
-                                      ? 'text-red-700'
-                                      : 'text-neutral-600'
-                                }`}
-                              >
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                      {paymentVerificationQueue.slice(0, 6).map((ord) => {
+                        const isRequested = ord.payment_status === 'verification_requested';
+                        const isNotReceived = ord.payment_status === 'not_received';
+                        const isBusyPay = updatingPaymentId === ord.id;
+                        const requestTimeLabel = ord.payment_requested_at
+                          ? `${formatOrderDate(ord.payment_requested_at)} (${formatRelativeTime(ord.payment_requested_at, nowMs)})`
+                          : null;
+
+                        return (
+                          <div
+                            key={ord.id}
+                            className={`rounded-2xl border p-4 space-y-3 ${
+                              isRequested
+                                ? 'border-amber-400 bg-amber-50/75'
+                                : isNotReceived
+                                  ? 'border-red-200 bg-red-50/40'
+                                  : 'border-neutral-200 bg-neutral-50/60'
+                            }`}
+                          >
+                            {/* 1-4 & 6-7: Order ID, Table, Customer Name, Mobile, Total Amount, Payment Status */}
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0">
+                                <p className="text-xs font-mono font-extrabold text-[#E5391B]">
+                                  #{ord.order_code} · Table {ord.table_number}
+                                </p>
+                                <p className="text-sm font-extrabold text-neutral-900 truncate">
+                                  {ord.customer_name}
+                                </p>
+                                <p className="text-xs font-mono text-neutral-600">
+                                  {formatIndianMobileDisplay(ord.customer_mobile)}
+                                </p>
+                              </div>
+                              <div className="text-right shrink-0 tabular-nums">
+                                <p className="font-mono text-xl font-extrabold text-neutral-900">
+                                  {formatRupees(ord.total)}
+                                </p>
                                 <span
-                                  className={`w-1.5 h-1.5 rounded-full ${
+                                  className={`inline-flex items-center gap-1 text-[11px] font-extrabold ${
                                     isRequested
-                                      ? 'bg-amber-500 animate-ping'
+                                      ? 'text-amber-800'
                                       : isNotReceived
-                                        ? 'bg-red-600'
-                                        : 'bg-amber-500'
+                                        ? 'text-red-700'
+                                        : 'text-neutral-600'
                                   }`}
-                                />
-                                {isRequested
-                                  ? 'Customer Clicked I Have Paid'
-                                  : isNotReceived
-                                    ? 'Marked Not Received'
-                                    : 'Payment Pending'}
-                              </span>
+                                >
+                                  <span
+                                    className={`w-1.5 h-1.5 rounded-full ${
+                                      isRequested
+                                        ? 'bg-amber-500 animate-ping'
+                                        : isNotReceived
+                                          ? 'bg-red-600'
+                                          : 'bg-amber-500'
+                                    }`}
+                                  />
+                                  {isRequested
+                                    ? 'Verification Requested'
+                                    : isNotReceived
+                                      ? 'Payment Not Received'
+                                      : 'Payment Pending'}
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* 5: Ordered Items */}
+                            <div className="rounded-xl bg-white/85 border border-neutral-200/80 px-3 py-2 text-xs text-neutral-800 space-y-1">
+                              <p className="text-[10px] font-extrabold uppercase tracking-wider text-neutral-500">
+                                Ordered Items ({ord.items.reduce((sum, i) => sum + i.quantity, 0)})
+                              </p>
+                              <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+                                {ord.items.map((item) => (
+                                  <span key={item.menu_item_id} className="font-semibold">
+                                    {item.quantity}× {item.name}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+
+                            {/* 8: Payment Request Time */}
+                            {requestTimeLabel && (
+                              <p className="text-[11px] font-semibold text-amber-900">
+                                Requested at: <span className="font-mono">{requestTimeLabel}</span>
+                              </p>
+                            )}
+
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setPreviewBillOrder(ord)}
+                                className="min-h-[38px] px-3 py-1.5 rounded-xl bg-white border border-neutral-200 text-neutral-800 text-xs font-bold hover:bg-neutral-100 inline-flex items-center justify-center gap-1 cursor-pointer"
+                              >
+                                <Eye className="w-3.5 h-3.5" />
+                                VIEW BILL
+                              </button>
+                              <button
+                                type="button"
+                                disabled={isBusyPay}
+                                onClick={() => handleMarkPaid(ord)}
+                                className="flex-1 min-h-[38px] px-3 py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 whitespace-nowrap"
+                              >
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                                {isBusyPay ? 'Updating...' : '✓ PAYMENT RECEIVED'}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={isBusyPay}
+                                onClick={() => handleMarkPaymentNotReceived(ord)}
+                                className="min-h-[38px] px-3 py-1.5 rounded-xl border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 whitespace-nowrap"
+                              >
+                                <XCircle className="w-3.5 h-3.5" />
+                                ✕ PAYMENT NOT RECEIVED
+                              </button>
                             </div>
                           </div>
-
-                          <div className="flex flex-wrap gap-2">
-                            <button
-                              type="button"
-                              onClick={() => setPreviewBillOrder(ord)}
-                              className="min-h-[38px] px-3 py-1.5 rounded-xl bg-white border border-neutral-200 text-neutral-800 text-xs font-bold hover:bg-neutral-100 inline-flex items-center justify-center gap-1 cursor-pointer"
-                            >
-                              <Eye className="w-3.5 h-3.5" />
-                              VIEW BILL
-                            </button>
-                            <button
-                              type="button"
-                              disabled={isBusyPay}
-                              onClick={() => handleMarkPaid(ord)}
-                              className="flex-1 min-h-[38px] px-3 py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 whitespace-nowrap"
-                            >
-                              <CheckCircle2 className="w-3.5 h-3.5" />
-                              {isBusyPay ? 'Updating...' : 'PAYMENT RECEIVED'}
-                            </button>
-                            <button
-                              type="button"
-                              disabled={isBusyPay}
-                              onClick={() => handleMarkPaymentNotReceived(ord)}
-                              className="min-h-[38px] px-3 py-1.5 rounded-xl border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-extrabold inline-flex items-center justify-center gap-1 cursor-pointer disabled:opacity-60 whitespace-nowrap"
-                            >
-                              <XCircle className="w-3.5 h-3.5" />
-                              NOT RECEIVED
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </section>
-              )}
+                        );
+                      })}
+                    </div>
+                  </section>
+                );
+              })()}
 
               {/* 5 Large Simple POS Queue Filter Cards */}
               <div ref={liveOrdersRef} className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 sm:gap-4">

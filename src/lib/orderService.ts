@@ -337,12 +337,13 @@ export function normalizeOrderRecord(raw: Partial<OrderRecord>): OrderRecord {
     billStatus = raw.pdf_ready ? 'generated' : 'not_generated';
   }
 
+  const rawPayStatus = raw.paymentStatus || raw.payment_status;
   const defaultPaymentStatus: PaymentStatus =
-    raw.payment_status &&
+    rawPayStatus &&
     ['pending', 'verification_requested', 'paid', 'not_received', 'failed'].includes(
-      raw.payment_status,
+      rawPayStatus,
     )
-      ? raw.payment_status
+      ? rawPayStatus
       : 'pending';
 
   const rawSnapshot = raw.payment_qr_snapshot as PaymentQrSnapshot | null | undefined;
@@ -386,6 +387,14 @@ export function normalizeOrderRecord(raw: Partial<OrderRecord>): OrderRecord {
     total: Number(raw.total || 0),
     status: (raw.status || 'pending') as OrderStatus,
     payment_status: defaultPaymentStatus,
+    paymentStatus:
+      defaultPaymentStatus === 'paid' ||
+      defaultPaymentStatus === 'verification_requested' ||
+      defaultPaymentStatus === 'not_received'
+        ? defaultPaymentStatus
+        : 'pending',
+    payment_requested_at:
+      typeof raw.payment_requested_at === 'string' ? raw.payment_requested_at : '',
     paid_at: typeof raw.paid_at === 'string' ? raw.paid_at : '',
     payment_verified_by:
       typeof raw.payment_verified_by === 'string' ? raw.payment_verified_by : '',
@@ -1174,6 +1183,8 @@ export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<s
       total: quote.total,
       status: 'pending',
       payment_status: 'pending',
+      paymentStatus: 'pending',
+      payment_requested_at: '',
       paid_at: '',
       confirmed_at: '',
       public_bill_id: quote.public_bill_id || quote.id,
@@ -1232,6 +1243,8 @@ export interface PublicBillPayload {
   notes: string;
   status: OrderStatus;
   payment_status: PaymentStatus;
+  paymentStatus?: PaymentStatus;
+  payment_requested_at?: string;
   created_at_iso: string;
   confirmed_at: string;
   generated_at: string;
@@ -1314,6 +1327,8 @@ export async function fetchPublicBillById(billId: string): Promise<PublicBillPay
         notes: ord.notes,
         status: ord.status,
         payment_status: ord.payment_status,
+        paymentStatus: ord.paymentStatus || ord.payment_status,
+        payment_requested_at: ord.payment_requested_at || '',
         created_at_iso: timestampToDate(ord.created_at).toISOString(),
         confirmed_at: ord.confirmed_at || '',
         generated_at: ord.generated_at || '',
@@ -1694,6 +1709,8 @@ export async function customerRequestPaymentVerification(orderId: string): Promi
   try {
     await updateDoc(doc(db, 'orders', orderId), {
       payment_status: 'verification_requested',
+      paymentStatus: 'verification_requested',
+      payment_requested_at: new Date().toISOString(),
       updated_at: serverTimestamp(),
     });
   } catch (error) {
@@ -2379,8 +2396,16 @@ export async function ownerUpdatePaymentStatus(
       throw new Error(`Order #${order.order_code} no longer exists.`);
     }
 
+    const normalizedCamelStatus: 'pending' | 'verification_requested' | 'paid' | 'not_received' =
+      paymentStatus === 'paid' ||
+      paymentStatus === 'verification_requested' ||
+      paymentStatus === 'not_received'
+        ? paymentStatus
+        : 'pending';
+
     await updateDoc(doc(db, 'orders', order.id), {
       payment_status: paymentStatus,
+      paymentStatus: normalizedCamelStatus,
       paid_at: paymentStatus === 'paid' ? nowIso : '',
       payment_verified_by: currentUser.uid.slice(0, 128),
       payment_verified_at: nowIso,

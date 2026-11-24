@@ -59,10 +59,7 @@ import {
   verifyOrderOnServer,
 } from '../lib/orderService';
 import { buildDynamicUpiUri, DEFAULT_PAYMENT_SETTINGS } from '../lib/upiPayment';
-import {
-  speakCustomerOrderCancelled,
-  unlockCustomerAudioOnGesture,
-} from '../lib/voiceOrderAlert';
+import { customerVoiceManager } from '../lib/customerVoiceManager';
 import {
   CartItem,
   CustomerDetails,
@@ -77,8 +74,10 @@ import {
 } from '../types/restaurant';
 import { AmbientFoodBackdrop } from './AmbientFoodBackdrop';
 import { BillPreviewModal } from './BillPreviewModal';
+import { CustomerVoiceBanner } from './CustomerVoiceBanner';
 import { FoodArtIcon } from './FoodArtIcons';
 import { FoodImage } from './FoodImage';
+import { PaymentConfirmModal } from './PaymentConfirmModal';
 import { ThankYouScreen } from './ThankYouScreen';
 
 interface CustomerOrderingAppProps {
@@ -137,6 +136,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
   const [downloadingPdf, setDownloadingPdf] = useState(false);
   const [downloadingQr, setDownloadingQr] = useState(false);
   const [requestingPaymentVerify, setRequestingPaymentVerify] = useState(false);
+  const [confirmPaidOpen, setConfirmPaidOpen] = useState(false);
   const [paymentSettings, setPaymentSettings] = useState<PaymentSettings>(DEFAULT_PAYMENT_SETTINGS);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const prevOrderStatusRef = useRef<OrderStatus | null>(null);
@@ -150,9 +150,11 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     prevOrderStatusRef.current = null;
   }, [tableNumber]);
 
-  // Unlock browser audio on first customer touch/click so order-cancelled voice plays reliably
+  // Unlock browser audio on first customer touch/click so real-time order voice announcements play reliably
   useEffect(() => {
-    const unlock = () => unlockCustomerAudioOnGesture();
+    const unlock = () => {
+      void customerVoiceManager.unlockOnUserGesture(false);
+    };
     window.addEventListener('pointerdown', unlock, { passive: true });
     window.addEventListener('touchstart', unlock, { passive: true });
     window.addEventListener('click', unlock, { passive: true });
@@ -190,7 +192,14 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
       activeOrderId,
       (order) => {
         setActiveOrder(order);
-        if (!order) {
+        if (order) {
+          customerVoiceManager.syncRealtimeOrderSnapshot(order);
+          const prev = prevOrderStatusRef.current;
+          prevOrderStatusRef.current = order.status;
+          if (isCancelledOrderStatus(order.status) && prev !== order.status) {
+            setActiveTab('order');
+          }
+        } else {
           setStoredOrderIdForTable(tableNumber, null);
           setActiveOrderId(null);
           prevOrderStatusRef.current = null;
@@ -203,17 +212,6 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     );
     return () => unsub();
   }, [activeOrderId, tableNumber]);
-
-  // Real-time customer cancellation voice alert (speaks once per cancelled order)
-  useEffect(() => {
-    if (!activeOrder) return;
-    const prev = prevOrderStatusRef.current;
-    prevOrderStatusRef.current = activeOrder.status;
-    if (isCancelledOrderStatus(activeOrder.status) && prev !== activeOrder.status) {
-      setActiveTab('order');
-      void speakCustomerOrderCancelled(activeOrder.id);
-    }
-  }, [activeOrder?.id, activeOrder?.status]);
 
   const activeOffers = useMemo(() => offers.filter((o) => o.active), [offers]);
 
@@ -359,6 +357,8 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
 
   const handleConfirmOrder = async () => {
     if (cartList.length === 0 || isSubmitting || submittingLockRef.current) return;
+    // Unlock audio immediately inside the user's Place Order gesture
+    void customerVoiceManager.unlockOnUserGesture(false);
     submittingLockRef.current = true;
     setIsSubmitting(true);
     setSubmitError(null);
@@ -374,8 +374,9 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
       );
       const orderId = await createConfirmedOrder(verifiedQuote);
       checkoutRequestIdRef.current = '';
+      const placedCode = verifiedQuote.order_code || `RK${verifiedQuote.order_number}`;
       setJustPlacedOrder({
-        code: verifiedQuote.order_code || `RK${verifiedQuote.order_number}`,
+        code: placedCode,
         total: verifiedQuote.total,
         tableNumber: verifiedQuote.table_number,
       });
@@ -384,6 +385,13 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
       setCheckoutStage('cart');
       setShowThankYouManual(false);
       setActiveTab('order');
+      // Only announce Order Placed AFTER Firestore confirms order creation
+      customerVoiceManager.announceOrderEvent({
+        orderId,
+        orderCode: placedCode,
+        tableNumber: verifiedQuote.table_number,
+        eventKey: 'order_placed',
+      });
     } catch (err) {
       console.error('[Customer Place Order Error]', err);
       setSubmitError(toCustomerFriendlyError(err));
@@ -469,7 +477,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     }
   };
 
-  const handleCustomerIHavePaid = async () => {
+  const handleOpenIHavePaidConfirm = () => {
     if (!activeOrder || requestingPaymentVerify) return;
     if (
       activeOrder.payment_status === 'paid' ||
@@ -478,24 +486,49 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     ) {
       return;
     }
+    void customerVoiceManager.unlockOnUserGesture(false);
+    setConfirmPaidOpen(true);
+  };
+
+  const handleConfirmCustomerIHavePaid = async () => {
+    if (!activeOrder || requestingPaymentVerify) return;
+    if (
+      activeOrder.payment_status === 'paid' ||
+      activeOrder.payment_status === 'verification_requested' ||
+      isCancelledOrderStatus(activeOrder.status)
+    ) {
+      setConfirmPaidOpen(false);
+      return;
+    }
     setRequestingPaymentVerify(true);
     setOrderSyncError(null);
     try {
       await customerRequestPaymentVerification(activeOrder.id);
-      const msg = 'Payment verification requested. Please wait for owner confirmation.';
+      setConfirmPaidOpen(false);
+      const msg = 'Payment request sent to RikZen Fast Food. Please wait for confirmation.';
       setShareFeedback(msg);
       window.setTimeout(() => {
         setShareFeedback((cur) => (cur === msg ? null : cur));
-      }, 4000);
+      }, 5000);
+      customerVoiceManager.announceOrderEvent({
+        orderId: activeOrder.id,
+        orderCode: activeOrder.order_code || `RK${activeOrder.order_number}`,
+        tableNumber: activeOrder.table_number,
+        eventKey: 'payment_verification_requested',
+      });
     } catch (err) {
       console.error('[Customer Payment Verification Request Error]', err);
       setOrderSyncError(toCustomerFriendlyError(err));
+      setConfirmPaidOpen(false);
     } finally {
       setRequestingPaymentVerify(false);
     }
   };
 
   const handleStartNewOrder = () => {
+    if (activeOrderId) {
+      customerVoiceManager.clearOrderBaseline(activeOrderId);
+    }
     setStoredOrderIdForTable(tableNumber, null);
     setActiveOrderId(null);
     setActiveOrder(null);
@@ -1425,15 +1458,22 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                   </div>
                 </div>
               )
-            ) : activeOrder.status === 'completed' || showThankYouManual ? (
-              <ThankYouScreen
-                tableNumber={activeOrder.table_number}
-                orderNumber={activeOrder.order_number}
-                total={activeOrder.total}
-                onStartNewOrder={handleStartNewOrder}
-              />
+            ) : (activeOrder.status === 'completed' && activeOrder.payment_status === 'paid') ||
+              showThankYouManual ? (
+              <div className="space-y-4">
+                <CustomerVoiceBanner />
+                <ThankYouScreen
+                  tableNumber={activeOrder.table_number}
+                  orderNumber={activeOrder.order_number}
+                  total={activeOrder.total}
+                  onStartNewOrder={handleStartNewOrder}
+                />
+              </div>
             ) : (
               <>
+                <div className="mb-4">
+                  <CustomerVoiceBanner />
+                </div>
                 <motion.div
                   key={activeOrder.status}
                   initial={{ opacity: 0, y: 8 }}
@@ -1570,6 +1610,23 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                       </h2>
                       <p className="font-mono text-4xl font-extrabold text-neutral-900 tabular-nums pt-1">
                         {formatRupees(activeOrder.total)}
+                      </p>
+                    </div>
+                  )}
+
+                  {activeOrder.status === 'completed' && activeOrder.payment_status !== 'paid' && (
+                    <div className="text-center space-y-2 py-1">
+                      <div className="w-14 h-14 rounded-2xl bg-emerald-50 text-emerald-700 flex items-center justify-center mx-auto mb-3">
+                        <CheckCircle2 className="w-7 h-7" />
+                      </div>
+                      <p className="text-xs font-bold tracking-wide text-emerald-700">
+                        Order Served · Complete Payment Below
+                      </p>
+                      <h2 className="text-2xl sm:text-3xl font-extrabold text-neutral-900">
+                        Order Completed
+                      </h2>
+                      <p className="text-sm text-neutral-600">
+                        Please scan the payment QR below and tap <strong>I HAVE PAID</strong> once done.
                       </p>
                     </div>
                   )}
@@ -1741,157 +1798,166 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                           </div>
                         </div>
 
-                        {/* Honest 2-Mode Payment QR Box (Zero Cropping, Distortion, or Animation over QR) */}
-                        {(showUploadedQr || showDynamicUpi) && !isPaid && (
-                          <div className="rounded-2xl border-2 border-neutral-900 bg-white p-4 sm:p-5 flex flex-col sm:flex-row items-center gap-5">
-                            {showUploadedQr ? (
-                              <div className="bg-white p-2 rounded-xl border border-neutral-200 shrink-0">
-                                <img
-                                  src={activeQrImg}
-                                  alt={`Payment QR for ${activeMerchant}`}
-                                  className="w-44 h-44 object-contain"
-                                />
-                              </div>
-                            ) : (
-                              <div className="bg-white p-2 rounded-xl border border-neutral-200 shrink-0">
-                                <QRCodeSVG
-                                  value={dynamicUpiUri}
-                                  size={184}
-                                  level="H"
-                                  includeMargin={true}
-                                  fgColor="#000000"
-                                  bgColor="#FFFFFF"
-                                />
-                              </div>
-                            )}
+                        {/* Live Payment Confirmed Card */}
+                        {isPaid && (
+                          <div className="rounded-2xl border-2 border-emerald-300 bg-emerald-50 p-5 text-center space-y-2">
+                            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-700 text-white text-xs font-extrabold tracking-wide">
+                              <CheckCircle2 className="w-4 h-4" />
+                              ✓ PAYMENT CONFIRMED
+                            </div>
+                            <p className="text-sm font-bold text-emerald-950">
+                              Your payment has been verified by RikZen Fast Food.
+                            </p>
+                            <p className="text-xs font-extrabold uppercase tracking-wider text-emerald-700">
+                              PAID · {formatRupees(activeOrder.total)}
+                            </p>
+                          </div>
+                        )}
 
-                            <div className="flex-1 text-center sm:text-left space-y-2 min-w-0">
-                              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#151110] text-white text-[11px] font-extrabold tracking-wide">
-                                <QrCode className="w-3.5 h-3.5 text-amber-300" />
-                                SCAN TO PAY
+                        {/* Honest 2-Mode Manual Payment QR Section */}
+                        {(showUploadedQr || showDynamicUpi) && !isPaid && (
+                          <div className="rounded-2xl border-2 border-neutral-900 bg-white p-4 sm:p-5 space-y-4">
+                            <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-neutral-100">
+                              <div>
+                                <p className="text-xs font-black uppercase tracking-wider text-neutral-900">
+                                  PAYMENT
+                                </p>
+                                <p className="text-xs font-bold text-[#E5391B]">Scan &amp; Pay</p>
                               </div>
                               <p className="font-mono text-2xl sm:text-3xl font-extrabold text-[#E5391B] tabular-nums">
                                 {formatRupees(activeOrder.total)}
                               </p>
-                              <p className="text-xs font-bold text-neutral-900">{activeMerchant}</p>
-                              {isVerificationPending && (
-                                <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs font-bold text-amber-900">
-                                  Payment Verification Pending — Waiting for restaurant owner to
-                                  verify your payment.
+                            </div>
+
+                            <div className="flex flex-col sm:flex-row items-center gap-5">
+                              {/* QR Column + Download QR Directly Below */}
+                              <div className="flex flex-col items-center gap-2.5 shrink-0">
+                                {showUploadedQr ? (
+                                  <div className="bg-white p-2 rounded-xl border border-neutral-200">
+                                    <img
+                                      src={activeQrImg}
+                                      alt={`Payment QR for ${activeMerchant}`}
+                                      className="w-48 h-48 object-contain"
+                                    />
+                                  </div>
+                                ) : (
+                                  <div className="bg-white p-2 rounded-xl border border-neutral-200">
+                                    <QRCodeSVG
+                                      value={dynamicUpiUri}
+                                      size={192}
+                                      level="H"
+                                      includeMargin={true}
+                                      fgColor="#000000"
+                                      bgColor="#FFFFFF"
+                                    />
+                                  </div>
+                                )}
+                                <button
+                                  type="button"
+                                  disabled={downloadingQr}
+                                  onClick={() =>
+                                    handleDownloadPaymentQr({
+                                      mode: showUploadedQr ? 'uploaded_qr' : 'dynamic_upi',
+                                      upiUri: showDynamicUpi ? dynamicUpiUri : undefined,
+                                      qrImageUrl: showUploadedQr ? activeQrImg : undefined,
+                                      merchantName: activeMerchant,
+                                      upiId: activeUpiId,
+                                      amount: activeOrder.total,
+                                      orderCode: activeOrderCode,
+                                      tableNumber: activeOrder.table_number,
+                                    })
+                                  }
+                                  className="w-full min-h-[40px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                                >
+                                  <Download className="w-4 h-4" />
+                                  {downloadingQr ? 'Downloading...' : 'Download QR'}
+                                </button>
+                              </div>
+
+                              {/* Instructions & I HAVE PAID Action Column */}
+                              <div className="flex-1 text-center sm:text-left space-y-2.5 min-w-0 w-full">
+                                <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#151110] text-white text-[11px] font-extrabold tracking-wide">
+                                  <QrCode className="w-3.5 h-3.5 text-amber-300" />
+                                  SCAN &amp; PAY · {activeMerchant}
                                 </div>
-                              )}
-                              {isNotReceived && (
-                                <div className="rounded-xl bg-red-50 border border-red-200 px-3 py-2 text-xs font-bold text-red-800">
-                                  Payment could not be verified. Please contact the restaurant.
-                                </div>
-                              )}
-                              {showDynamicUpi ? (
-                                <>
-                                  <p className="text-xs font-bold text-emerald-700">
-                                    Scan to pay this exact amount · No need to type amount
-                                  </p>
-                                  {activeUpiId && (
-                                    <p className="text-xs font-mono text-neutral-600 truncate">
-                                      UPI ID:{' '}
-                                      <span className="font-bold text-neutral-900">
-                                        {activeUpiId}
-                                      </span>
+
+                                {isVerificationPending && (
+                                  <div className="rounded-xl bg-amber-50 border border-amber-300 px-3.5 py-2.5 text-xs font-bold text-amber-900">
+                                    Payment request sent to RikZen Fast Food. Please wait for
+                                    confirmation.
+                                  </div>
+                                )}
+
+                                {isNotReceived && (
+                                  <div className="rounded-xl bg-red-50 border border-red-200 px-3.5 py-2.5 text-xs text-red-900 space-y-0.5">
+                                    <p className="font-extrabold">Payment Not Confirmed</p>
+                                    <p className="font-medium">
+                                      Please check your payment and contact the shop.
                                     </p>
-                                  )}
-                                  <div className="pt-1 flex flex-wrap items-center justify-center sm:justify-start gap-2">
+                                  </div>
+                                )}
+
+                                {showDynamicUpi ? (
+                                  <>
+                                    <p className="text-xs font-bold text-emerald-700">
+                                      Scan to pay {formatRupees(activeOrder.total)} using any UPI app
+                                    </p>
+                                    {activeUpiId && (
+                                      <p className="text-xs font-mono text-neutral-600 truncate">
+                                        UPI ID:{' '}
+                                        <span className="font-bold text-neutral-900">
+                                          {activeUpiId}
+                                        </span>
+                                      </p>
+                                    )}
                                     <a
                                       href={dynamicUpiUri}
-                                      className="min-h-[42px] px-4 py-2 rounded-xl bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] inline-flex items-center justify-center gap-1.5"
+                                      className="w-full sm:w-auto min-h-[42px] px-4 py-2 rounded-xl bg-[#E5391B] text-white text-xs font-bold hover:bg-[#C82E14] inline-flex items-center justify-center gap-1.5"
                                     >
                                       <Smartphone className="w-4 h-4" />
-                                      Pay Now · {formatRupees(activeOrder.total)}
+                                      Open UPI App · {formatRupees(activeOrder.total)}
                                     </a>
-                                    <button
-                                      type="button"
-                                      disabled={downloadingQr}
-                                      onClick={() =>
-                                        handleDownloadPaymentQr({
-                                          mode: 'dynamic_upi',
-                                          upiUri: dynamicUpiUri,
-                                          merchantName: activeMerchant,
-                                          upiId: activeUpiId,
-                                          amount: activeOrder.total,
-                                          orderCode: activeOrderCode,
-                                          tableNumber: activeOrder.table_number,
-                                        })
-                                      }
-                                      className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
-                                    >
-                                      <Download className="w-4 h-4" />
-                                      {downloadingQr ? 'Saving QR...' : 'Download QR'}
-                                    </button>
-                                    {!isVerificationPending && (
-                                      <button
-                                        type="button"
-                                        disabled={requestingPaymentVerify}
-                                        onClick={handleCustomerIHavePaid}
-                                        className="min-h-[42px] px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold hover:bg-emerald-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
-                                      >
-                                        {requestingPaymentVerify ? (
-                                          <Loader2 className="w-4 h-4 animate-spin" />
-                                        ) : (
-                                          <CheckCircle2 className="w-4 h-4" />
-                                        )}
-                                        {requestingPaymentVerify ? 'Notifying...' : 'I Have Paid'}
-                                      </button>
-                                    )}
-                                  </div>
-                                </>
-                              ) : (
-                                <>
+                                  </>
+                                ) : (
                                   <p className="text-xs font-medium text-neutral-700">
-                                    Scan this QR using any UPI app and pay{' '}
+                                    Scan &amp; Pay{' '}
                                     <span className="font-bold text-neutral-900">
                                       {formatRupees(activeOrder.total)}
-                                    </span>
-                                    .
+                                    </span>{' '}
+                                    using any UPI app (PhonePe, GPay, Paytm, BHIM), then tap{' '}
+                                    <strong>I HAVE PAID</strong> below.
                                   </p>
-                                  <div className="pt-1 flex flex-wrap items-center justify-center sm:justify-start gap-2">
-                                    <button
-                                      type="button"
-                                      disabled={downloadingQr}
-                                      onClick={() =>
-                                        handleDownloadPaymentQr({
-                                          mode: 'uploaded_qr',
-                                          qrImageUrl: activeQrImg,
-                                          merchantName: activeMerchant,
-                                          upiId: activeUpiId,
-                                          amount: activeOrder.total,
-                                          orderCode: activeOrderCode,
-                                          tableNumber: activeOrder.table_number,
-                                        })
-                                      }
-                                      className="min-h-[42px] px-4 py-2 rounded-xl bg-neutral-900 text-white text-xs font-bold hover:bg-neutral-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
-                                    >
-                                      <Download className="w-4 h-4" />
-                                      {downloadingQr ? 'Saving QR...' : 'Download QR'}
-                                    </button>
-                                    {!isVerificationPending && (
-                                      <button
-                                        type="button"
-                                        disabled={requestingPaymentVerify}
-                                        onClick={handleCustomerIHavePaid}
-                                        className="min-h-[42px] px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold hover:bg-emerald-800 inline-flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
-                                      >
-                                        {requestingPaymentVerify ? (
-                                          <Loader2 className="w-4 h-4 animate-spin" />
-                                        ) : (
-                                          <CheckCircle2 className="w-4 h-4" />
-                                        )}
-                                        {requestingPaymentVerify ? 'Notifying...' : 'I Have Paid'}
-                                      </button>
+                                )}
+
+                                {isVerificationPending ? (
+                                  <button
+                                    type="button"
+                                    disabled
+                                    className="w-full min-h-[48px] px-5 py-3 rounded-xl bg-amber-100 border border-amber-300 text-amber-900 text-sm font-extrabold inline-flex items-center justify-center gap-2 cursor-not-allowed"
+                                  >
+                                    <Clock className="w-4 h-4" />
+                                    Payment Verification Pending
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    disabled={requestingPaymentVerify}
+                                    onClick={handleOpenIHavePaidConfirm}
+                                    className="w-full min-h-[50px] px-5 py-3 rounded-xl bg-emerald-700 text-white text-sm font-extrabold hover:bg-emerald-800 active:scale-[0.98] transition-all inline-flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60 shadow-sm"
+                                  >
+                                    {requestingPaymentVerify ? (
+                                      <Loader2 className="w-5 h-5 animate-spin" />
+                                    ) : (
+                                      <CheckCircle2 className="w-5 h-5" />
                                     )}
-                                  </div>
-                                </>
-                              )}
-                              <p className="text-[11px] text-neutral-500">
-                                PhonePe · Google Pay · Paytm · BHIM
-                              </p>
+                                    {requestingPaymentVerify ? 'Sending...' : 'I HAVE PAID'}
+                                  </button>
+                                )}
+
+                                <p className="text-[11px] text-neutral-500">
+                                  PhonePe · Google Pay · Paytm · BHIM · Manual Owner Confirmation
+                                </p>
+                              </div>
                             </div>
                           </div>
                         )}
@@ -2132,6 +2198,18 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
           paymentSettings={paymentSettings}
         />
       )}
+
+      {/* Manual Payment Confirmation Popup */}
+      <PaymentConfirmModal
+        open={confirmPaidOpen}
+        orderCode={activeOrderCode}
+        totalAmount={activeOrder?.total ?? 0}
+        submitting={requestingPaymentVerify}
+        onConfirm={handleConfirmCustomerIHavePaid}
+        onCancel={() => {
+          if (!requestingPaymentVerify) setConfirmPaidOpen(false);
+        }}
+      />
     </div>
   );
 };
