@@ -356,7 +356,28 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
   };
 
   const handleConfirmOrder = async () => {
-    if (cartList.length === 0 || isSubmitting || submittingLockRef.current) return;
+    if (isSubmitting || submittingLockRef.current) return;
+    if (cartList.length === 0) {
+      setSubmitError('Your cart is empty.');
+      return;
+    }
+    const cleanName = customerDetails.name.trim();
+    const cleanDigits = customerDetails.mobileDigits.replace(/\D/g, '');
+    if (cleanName.length < 2) {
+      setSubmitError('Please enter your name before placing your order.');
+      setCheckoutStage('details');
+      return;
+    }
+    if (!isValidIndianMobileDigits(cleanDigits)) {
+      setSubmitError('Please enter a valid 10-digit mobile number.');
+      setCheckoutStage('details');
+      return;
+    }
+    if (!Number.isInteger(tableNumber) || tableNumber < 1 || tableNumber > 6) {
+      setSubmitError('Invalid table number. Please scan your table QR code again.');
+      return;
+    }
+
     // Unlock audio immediately inside the user's Place Order gesture
     void customerVoiceManager.unlockOnUserGesture(false);
     submittingLockRef.current = true;
@@ -369,7 +390,11 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
       const verifiedQuote = await verifyOrderOnServer(
         tableNumber,
         cartList,
-        customerDetails,
+        {
+          name: cleanName,
+          mobileDigits: cleanDigits,
+          notes: customerDetails.notes.trim().slice(0, 200),
+        },
         checkoutRequestIdRef.current,
       );
       const orderId = await createConfirmedOrder(verifiedQuote);
@@ -393,7 +418,16 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
         eventKey: 'order_placed',
       });
     } catch (err) {
-      console.error('[Customer Place Order Error]', err);
+      console.error('[Customer Place Order Error]', {
+        tableNumber,
+        itemCount: cartList.length,
+        code:
+          typeof err === 'object' && err !== null && 'code' in err
+            ? (err as { code?: unknown }).code
+            : undefined,
+        message: err instanceof Error ? err.message : String(err),
+        err,
+      });
       setSubmitError(toCustomerFriendlyError(err));
     } finally {
       submittingLockRef.current = false;

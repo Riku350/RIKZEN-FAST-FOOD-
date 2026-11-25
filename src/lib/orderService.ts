@@ -89,11 +89,16 @@ function isStaticHostMissingEndpoint(
   const isHtmlFallback =
     !ct.includes('application/json') &&
     Boolean(parsed.errorMessage?.includes('unexpected HTML page'));
-  const isEmpty404 =
-    (res.status === 404 || res.status === 405) &&
-    (!parsed.data || parsed.errorMessage?.includes('empty response'));
-  const isNotFoundNonJson = (res.status === 404 || res.status === 405) && !ct.includes('application/json');
-  return isHtmlFallback || isEmpty404 || isNotFoundNonJson;
+  const isMissingRouteStatus =
+    res.status === 404 ||
+    res.status === 405 ||
+    res.status === 501 ||
+    res.status === 502 ||
+    res.status === 503 ||
+    res.status === 504;
+  const isEmptyResponse = !parsed.data && Boolean(parsed.errorMessage?.includes('empty response'));
+  const isNotFoundNonJson = isMissingRouteStatus && !ct.includes('application/json');
+  return isHtmlFallback || isMissingRouteStatus || isEmptyResponse || isNotFoundNonJson;
 }
 
 const SESSION_KEY = 'rikzen_customer_session_id';
@@ -294,29 +299,50 @@ export function toCustomerFriendlyError(err: unknown): string {
   if (typeof navigator !== 'undefined' && navigator.onLine === false) {
     return 'Connection lost. Please check your internet and try again.';
   }
+  const errCode =
+    typeof err === 'object' && err !== null && 'code' in err
+      ? String((err as { code?: unknown }).code || '').toLowerCase()
+      : '';
   const raw = err instanceof Error ? err.message : String(err || '');
   const lower = raw.toLowerCase();
+
   if (
+    errCode === 'unavailable' ||
     lower.includes('network') ||
     lower.includes('failed to fetch') ||
     lower.includes('offline') ||
-    lower.includes('unavailable')
+    lower.includes('client is offline')
   ) {
     return 'Connection lost. Please check your internet and try again.';
   }
   if (
+    lower.includes('no longer available') ||
+    lower.includes('currently unavailable') ||
+    lower.includes('no longer active')
+  ) {
+    return 'Some items in your cart are no longer available. Please update your cart.';
+  }
+  if (
+    errCode === 'permission-denied' ||
+    errCode === 'failed-precondition' ||
+    errCode === 'invalid-argument' ||
     lower.includes('missing or insufficient permissions') ||
     lower.includes('permission-denied') ||
+    lower.includes('permission_denied') ||
     lower.includes('firestore') ||
     lower.includes('operationtype') ||
-    lower.includes('authinfo')
+    lower.includes('authinfo') ||
+    lower.includes('returned an empty response') ||
+    lower.includes('unexpected html page') ||
+    lower.includes('http 404') ||
+    lower.includes('http 500')
   ) {
-    return 'Something went wrong. Please try again.';
+    return 'Unable to place your order right now. Please try again.';
   }
   if (raw.trim().length > 0 && raw.trim().length < 160 && !raw.trim().startsWith('{')) {
     return raw.trim();
   }
-  return 'Something went wrong. Please try again.';
+  return 'Unable to place your order right now. Please try again.';
 }
 
 export function normalizeOrderRecord(raw: Partial<OrderRecord>): OrderRecord {
@@ -969,10 +995,13 @@ async function verifyOrderAgainstFirestore(params: {
     if (entry.kind === 'offer') {
       const offer = offerMap.get(entry.id);
       if (!offer || !offer.active) {
-        throw new Error(`Offer "${offer?.title || entry.id}" is no longer active.`);
+        throw new Error('Some items in your cart are no longer available. Please update your cart.');
       }
-      const regularPrice = Math.round(offer.regular_price);
-      const unitPrice = Math.round(offer.offer_price);
+      const regularPrice = Math.round(Number(offer.regular_price));
+      const unitPrice = Math.round(Number(offer.offer_price));
+      if (!Number.isFinite(regularPrice) || regularPrice < 1 || !Number.isFinite(unitPrice) || unitPrice < 1) {
+        throw new Error('Some items in your cart are no longer available. Please update your cart.');
+      }
       const lineTotal = unitPrice * entry.quantity;
       subtotal += regularPrice * entry.quantity;
       total += lineTotal;
@@ -988,11 +1017,15 @@ async function verifyOrderAgainstFirestore(params: {
     } else {
       const item = menuMap.get(entry.id);
       if (!item || !item.available) {
-        throw new Error(`${item?.name || entry.id} is currently unavailable.`);
+        throw new Error('Some items in your cart are no longer available. Please update your cart.');
       }
-      const regularPrice = Math.round(item.price);
-      const hasOffer = item.offer_price > 0 && item.offer_price < item.price;
-      const unitPrice = hasOffer ? Math.round(item.offer_price) : regularPrice;
+      const regularPrice = Math.round(Number(item.price));
+      const rawOfferPrice = Number(item.offer_price || 0);
+      const hasOffer = Number.isFinite(rawOfferPrice) && rawOfferPrice > 0 && rawOfferPrice < regularPrice;
+      const unitPrice = hasOffer ? Math.round(rawOfferPrice) : regularPrice;
+      if (!Number.isFinite(regularPrice) || regularPrice < 1 || !Number.isFinite(unitPrice) || unitPrice < 1) {
+        throw new Error('Some items in your cart are no longer available. Please update your cart.');
+      }
       const lineTotal = unitPrice * entry.quantity;
       subtotal += regularPrice * entry.quantity;
       total += lineTotal;
@@ -1119,22 +1152,10 @@ export async function verifyOrderOnServer(
       body: JSON.stringify(payload),
     });
   } catch (err) {
-    console.error('[RikZen Order Verify Network Error]', err);
-    throw new Error('Connection lost. Please check your internet and try again.');
-  }
-
-  const parsed = await safeReadJson<VerifiedOrderQuote & { error?: string }>(
-    response,
-    'Order verification',
-  );
-
-  if (response.ok && parsed.data && parsed.data.id) {
-    return parsed.data;
-  }
-
-  // If deployed on static hosting (e.g. Netlify) where `/api/orders/verify` returns 404/405/HTML,
-  // run real authoritative verification against live Firestore menu & offers collections.
-  if (isStaticHostMissingEndpoint(response, parsed)) {
+    console.warn('[RikZen Order Verify Backend Unreachable - Falling back to Live Firestore Catalog]', err);
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      throw new Error('Connection lost. Please check your internet and try again.');
+    }
     return verifyOrderAgainstFirestore({
       tableNumber,
       cartItems,
@@ -1146,7 +1167,59 @@ export async function verifyOrderOnServer(
     });
   }
 
-  throw new Error(parsed.data?.error || parsed.errorMessage || 'Something went wrong. Please try again.');
+  const parsed = await safeReadJson<VerifiedOrderQuote & { error?: string }>(
+    response,
+    'Order verification',
+  );
+
+  if (response.ok && parsed.data && parsed.data.id) {
+    return parsed.data;
+  }
+
+  // If deployed on static hosting / preview proxy where `/api/orders/verify` returns 404/405/5xx/HTML/empty,
+  // run real authoritative verification directly against live Firestore `menu_items` and `offers`.
+  if (isStaticHostMissingEndpoint(response, parsed)) {
+    console.warn('[RikZen Order Verify Static/404 Fallback -> Live Firestore]', {
+      status: response.status,
+      contentType: response.headers.get('content-type'),
+      errorMessage: parsed.errorMessage,
+    });
+    return verifyOrderAgainstFirestore({
+      tableNumber,
+      cartItems,
+      customerName: cleanName,
+      customerMobile,
+      customerSessionId,
+      clientRequestId,
+      notes,
+    });
+  }
+
+  // If server's in-memory catalog lagged behind a newly owner-added/edited Firestore menu item,
+  // re-verify against live Firestore `menu_items` & `offers` as the authoritative source of truth.
+  const serverErrText = String(parsed.data?.error || parsed.errorMessage || '');
+  if (
+    response.status === 400 &&
+    (serverErrText.toLowerCase().includes('unavailable') ||
+      serverErrText.toLowerCase().includes('no longer available') ||
+      serverErrText.toLowerCase().includes('no longer active'))
+  ) {
+    return verifyOrderAgainstFirestore({
+      tableNumber,
+      cartItems,
+      customerName: cleanName,
+      customerMobile,
+      customerSessionId,
+      clientRequestId,
+      notes,
+    });
+  }
+
+  console.error('[RikZen Order Verify Rejected]', {
+    status: response.status,
+    error: serverErrText,
+  });
+  throw new Error(serverErrText || 'Unable to place your order right now. Please try again.');
 }
 
 /**
@@ -1168,36 +1241,63 @@ export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<s
     const phoneNormalized =
       quote.customer_phone_normalized || normalizeIndianPhoneDigits(quote.customer_mobile) || '';
 
+    // Strictly sanitize & guarantee finite numeric values (no undefined, no NaN) before Firestore write
+    const sanitizedItems = (Array.isArray(quote.items) ? quote.items : []).map((line) => {
+      const qty = Math.max(1, Math.min(20, Math.round(Number(line.quantity))));
+      const regPrice = Math.max(1, Math.round(Number(line.regular_price)));
+      const uPrice = Math.max(1, Math.min(regPrice, Math.round(Number(line.unit_price))));
+      return {
+        menu_item_id: String(line.menu_item_id || '').trim().slice(0, 64),
+        name: String(line.name || 'Menu Item').trim().slice(0, 80),
+        regular_price: regPrice,
+        unit_price: uPrice,
+        quantity: qty,
+        line_total: uPrice * qty,
+      };
+    });
+
+    if (sanitizedItems.length === 0) {
+      throw new Error('Your cart is empty.');
+    }
+
+    const computedItemCount = sanitizedItems.reduce((sum, l) => sum + l.quantity, 0);
+    const computedSubtotal = sanitizedItems.reduce((sum, l) => sum + l.regular_price * l.quantity, 0);
+    const computedTotal = sanitizedItems.reduce((sum, l) => sum + l.line_total, 0);
+    const computedDiscount = Math.max(0, computedSubtotal - computedTotal);
+    const safeTableNumber = Math.max(1, Math.min(6, Math.round(Number(quote.table_number))));
+    const safeOrderNumber = Math.max(1000, Math.round(Number(quote.order_number)));
+    const safeOrderCode = String(quote.order_code || `RK${safeOrderNumber}`).toUpperCase().slice(0, 16);
+
     const docPayload: Record<string, unknown> = {
-      id: quote.id,
-      order_number: quote.order_number,
-      order_code: quote.order_code,
-      table_id: quote.table_id,
-      table_number: quote.table_number,
-      customer_name: quote.customer_name.slice(0, 80),
-      customer_mobile: quote.customer_mobile,
-      items: quote.items,
-      item_count: quote.item_count,
-      subtotal: quote.subtotal,
-      discount: quote.discount,
-      total: quote.total,
+      id: String(quote.id || '').trim(),
+      order_number: safeOrderNumber,
+      order_code: safeOrderCode,
+      table_id: `table_${safeTableNumber}`,
+      table_number: safeTableNumber,
+      customer_name: String(quote.customer_name || '').trim().slice(0, 80),
+      customer_mobile: String(quote.customer_mobile || '').trim(),
+      items: sanitizedItems,
+      item_count: computedItemCount,
+      subtotal: computedSubtotal,
+      discount: computedDiscount,
+      total: computedTotal,
       status: 'pending',
       payment_status: 'pending',
       paymentStatus: 'pending',
       payment_requested_at: '',
       paid_at: '',
       confirmed_at: '',
-      public_bill_id: quote.public_bill_id || quote.id,
-      payment_qr_snapshot: quote.payment_qr_snapshot || null,
-      upi_uri: quote.upi_uri || '',
-      pdf_ready: Boolean(quote.pdf_ready),
-      bill_status: quote.bill_status || 'not_generated',
-      pdf_url: quote.pdf_url || '',
-      pdf_path: quote.pdf_path || '',
-      generated_at: quote.generated_at || '',
-      customer_session_id: quote.customer_session_id,
-      server_signature: quote.server_signature,
-      notes: quote.notes.slice(0, 200),
+      public_bill_id: String(quote.public_bill_id || quote.id || '').trim().slice(0, 64),
+      payment_qr_snapshot: null,
+      upi_uri: typeof quote.upi_uri === 'string' && quote.upi_uri.startsWith('upi://pay?') ? quote.upi_uri.slice(0, 500) : '',
+      pdf_ready: false,
+      bill_status: 'not_generated',
+      pdf_url: '',
+      pdf_path: '',
+      generated_at: '',
+      customer_session_id: String(quote.customer_session_id || '').trim().slice(0, 128),
+      server_signature: String(quote.server_signature || '').trim().slice(0, 128),
+      notes: String(quote.notes || '').trim().slice(0, 200),
       created_at: serverTimestamp(),
       updated_at: serverTimestamp(),
     };
@@ -1205,22 +1305,50 @@ export async function createConfirmedOrder(quote: VerifiedOrderQuote): Promise<s
       docPayload.customer_phone_normalized = phoneNormalized;
     }
 
+    if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) {
+      console.debug('[RikZen Order Create Payload]', {
+        path,
+        orderCode: docPayload.order_code,
+        tableNumber: docPayload.table_number,
+        customerName: docPayload.customer_name,
+        itemCount: docPayload.item_count,
+        subtotal: docPayload.subtotal,
+        discount: docPayload.discount,
+        total: docPayload.total,
+        status: docPayload.status,
+        paymentStatus: docPayload.paymentStatus,
+      });
+    }
+
     await setDoc(doc(db, 'orders', quote.id), docPayload);
-    setStoredOrderIdForTable(quote.table_number, quote.id);
+    setStoredOrderIdForTable(safeTableNumber, quote.id);
     if (phoneNormalized) {
       rememberCustomerOrderLocally({
         order_id: quote.id,
-        order_code: quote.order_code,
-        table_number: quote.table_number,
-        customer_name: quote.customer_name.slice(0, 80),
+        order_code: safeOrderCode,
+        table_number: safeTableNumber,
+        customer_name: String(quote.customer_name || '').trim().slice(0, 80),
         customer_phone_normalized: phoneNormalized,
-        total: quote.total,
+        total: computedTotal,
         created_at_iso: new Date().toISOString(),
       });
     }
     return quote.id;
   } catch (error) {
-    console.error('[RikZen Customer Order Create Error]', { path, error });
+    const errCode =
+      typeof error === 'object' && error !== null && 'code' in error
+        ? String((error as { code?: unknown }).code || 'unknown')
+        : 'unknown';
+    const errMessage = error instanceof Error ? error.message : String(error);
+    console.error('[RikZen Customer Order Create Error]', {
+      operation: 'CREATE',
+      path,
+      code: errCode,
+      message: errMessage,
+      projectId: FIREBASE_PROJECT_ID,
+      databaseId: FIREBASE_DATABASE_ID,
+      error,
+    });
     throw new Error(toCustomerFriendlyError(error));
   }
 }

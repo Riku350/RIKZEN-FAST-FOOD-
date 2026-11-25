@@ -1943,7 +1943,10 @@ app.post('/api/orders/verify', async (req, res) => {
       if (entry.kind === 'offer') {
         const offer = liveOfferMap.get(id);
         if (!offer || !offer.active) {
-          res.status(400).json({ success: false, error: `Offer "${offer?.title || id}" is no longer active.` });
+          res.status(400).json({
+            success: false,
+            error: 'Some items in your cart are no longer available. Please update your cart.',
+          });
           return;
         }
         const regularPrice = Math.round(offer.regular_price);
@@ -1964,7 +1967,10 @@ app.post('/api/orders/verify', async (req, res) => {
       } else {
         const catalogItem = liveMenuMap.get(id);
         if (!catalogItem || !catalogItem.available) {
-          res.status(400).json({ success: false, error: `${catalogItem?.name || id} is currently unavailable.` });
+          res.status(400).json({
+            success: false,
+            error: 'Some items in your cart are no longer available. Please update your cart.',
+          });
           return;
         }
         const regularPrice = Math.round(catalogItem.price);
@@ -2040,6 +2046,8 @@ app.post('/api/orders/verify', async (req, res) => {
       item_count: itemCount,
       status: 'pending',
       payment_status: 'pending',
+      paymentStatus: 'pending',
+      payment_requested_at: '',
       paid_at: '',
       confirmed_at: '',
       public_bill_id: publicBillId,

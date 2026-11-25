@@ -20,11 +20,11 @@ service cloud.firestore {
     }
 
     function isValidId(id) {
-      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_-]+$');
     }
 
     function isValidOrderDocId(id) {
-      return id is string && id.size() >= 24 && id.size() <= 128 && id.matches('^ord_[a-zA-Z0-9_\\-]+$');
+      return id is string && id.size() >= 24 && id.size() <= 128 && id.matches('^ord_[a-zA-Z0-9_-]+$');
     }
 
     function isSafeImageUrl(url) {
@@ -34,12 +34,12 @@ service cloud.firestore {
 
     function isSafeBillUrl(url) {
       return url is string && url.size() <= 400 &&
-        (url == '' || url.matches('^/api/bills/file/ord_[a-zA-Z0-9_\\-]+/RikZen-Fast-Food-Bill-RK[0-9]{4,8}\\.pdf\\?sig=[a-fA-F0-9]{64}$'));
+        (url == '' || url.matches('^/api/bills/file/ord_[a-zA-Z0-9_-]+/RikZen-Fast-Food-Bill-RK[0-9]{4,8}\\.pdf\\?sig=[a-fA-F0-9]{64}$'));
     }
 
     function isSafeBillPath(p) {
       return p is string && p.size() <= 240 &&
-        (p == '' || p.matches('^/bills/ord_[a-zA-Z0-9_\\-]+/RikZen-Fast-Food-Bill-RK[0-9]{4,8}\\.pdf$'));
+        (p == '' || p.matches('^/bills/ord_[a-zA-Z0-9_-]+/RikZen-Fast-Food-Bill-RK[0-9]{4,8}\\.pdf$'));
     }
 
     function isSafeUpiUri(uri) {
@@ -87,7 +87,7 @@ service cloud.firestore {
     function isValidUser(data, userId) {
       return data.keys().hasAll(['uid', 'email', 'display_name', 'role', 'created_at', 'updated_at']) &&
         data.keys().hasOnly(['uid', 'email', 'display_name', 'role', 'created_at', 'updated_at']) &&
-        data.uid is string && data.uid == userId && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.uid is string && data.uid == userId && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_-]+$') &&
         data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
         data.display_name is string && data.display_name.size() >= 1 && data.display_name.size() <= 80 &&
         data.role in ['owner', 'staff'] &&
@@ -98,7 +98,7 @@ service cloud.firestore {
     function isValidAdminDoc(data, adminId) {
       return data.keys().hasAll(['uid', 'email', 'created_at']) &&
         data.keys().hasOnly(['uid', 'email', 'created_at']) &&
-        data.uid is string && data.uid == adminId && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.uid is string && data.uid == adminId && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_-]+$') &&
         data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
         data.created_at is timestamp;
     }
@@ -112,7 +112,7 @@ service cloud.firestore {
           'id', 'name', 'category', 'description', 'price', 'offer_price',
           'image', 'available', 'is_veg', 'featured', 'prep_minutes', 'created_at', 'updated_at'
         ]) &&
-        data.id is string && data.id == itemId && data.id.size() <= 64 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.id is string && data.id == itemId && data.id.size() <= 64 && data.id.matches('^[a-zA-Z0-9_-]+$') &&
         data.name is string && data.name.size() >= 2 && data.name.size() <= 80 &&
         data.category in ['rolls', 'burgers', 'snacks', 'chicken', 'fast_food', 'drinks', 'lassi', 'desserts', 'special'] &&
         data.description is string && data.description.size() >= 1 && data.description.size() <= 220 &&
@@ -136,7 +136,7 @@ service cloud.firestore {
           'id', 'title', 'description', 'image', 'regular_price', 'offer_price',
           'active', 'created_at', 'updated_at'
         ]) &&
-        data.id is string && data.id == offerId && data.id.size() <= 64 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.id is string && data.id == offerId && data.id.size() <= 64 && data.id.matches('^[a-zA-Z0-9_-]+$') &&
         data.title is string && data.title.size() >= 2 && data.title.size() <= 80 &&
         data.description is string && data.description.size() >= 1 && data.description.size() <= 200 &&
         isSafeImageUrl(data.image) &&
@@ -166,7 +166,7 @@ service cloud.firestore {
         data.id is string && data.id == 'payment' &&
         data.payment_mode in ['uploaded_qr', 'dynamic_upi'] &&
         data.upi_id is string && data.upi_id.size() <= 120 &&
-        (data.upi_id == '' || data.upi_id.matches('^[a-zA-Z0-9._\\-]{2,80}@[a-zA-Z0-9.\\-]{2,64}$')) &&
+        (data.upi_id == '' || data.upi_id.matches('^[a-zA-Z0-9._-]{2,80}@[a-zA-Z0-9.-]{2,64}$')) &&
         data.merchant_name is string && data.merchant_name.size() >= 2 && data.merchant_name.size() <= 80 &&
         data.qr_image_url is string && data.qr_image_url.size() <= 500 &&
         (data.qr_image_url == '' || isSafeImageUrl(data.qr_image_url)) &&
@@ -201,7 +201,7 @@ service cloud.firestore {
         (!('cancelled_at' in data) || (data.cancelled_at is string && data.cancelled_at.size() <= 64)) &&
         (!('cancelled_by' in data) || (data.cancelled_by is string && data.cancelled_by.size() <= 128)) &&
         (!('upi_uri' in data) || isSafeUpiUri(data.upi_uri)) &&
-        (!('public_bill_id' in data) || (data.public_bill_id is string && data.public_bill_id.size() <= 64 && (data.public_bill_id == '' || data.public_bill_id.matches('^[a-zA-Z0-9_\\-]+$')))) &&
+        (!('public_bill_id' in data) || (data.public_bill_id is string && data.public_bill_id.size() <= 64 && (data.public_bill_id == '' || data.public_bill_id.matches('^[a-zA-Z0-9_-]+$')))) &&
         (!('payment_qr_snapshot' in data) || data.payment_qr_snapshot == null || isValidPaymentQrSnapshot(data.payment_qr_snapshot)) &&
         (!('pdf_ready' in data) || data.pdf_ready is bool) &&
         (!('bill_status' in data) || data.bill_status in ['not_generated', 'generating', 'generated', 'sending', 'sent', 'failed', 'retrying']) &&
@@ -211,7 +211,7 @@ service cloud.firestore {
         data.updated_at is timestamp;
     }
 
-    function isValidOrder(data, orderId) {
+    function isValidNewOrder(data, orderId) {
       return data.keys().hasAll([
           'id', 'order_number', 'order_code', 'table_id', 'table_number',
           'customer_name', 'customer_mobile', 'items', 'item_count',
@@ -222,40 +222,44 @@ service cloud.firestore {
           'id', 'order_number', 'order_code', 'table_id', 'table_number',
           'customer_name', 'customer_mobile', 'customer_phone_normalized', 'items', 'item_count',
           'subtotal', 'discount', 'total', 'status',
-          'payment_status', 'paymentStatus', 'payment_requested_at', 'paid_at', 'payment_verified_by', 'payment_verified_at',
-          'confirmed_at', 'completed_at', 'cancelled_at', 'cancelled_by', 'upi_uri',
-          'public_bill_id', 'payment_qr_snapshot',
+          'payment_status', 'paymentStatus', 'payment_requested_at', 'paid_at', 'confirmed_at',
+          'public_bill_id', 'payment_qr_snapshot', 'upi_uri',
           'pdf_ready', 'bill_status', 'pdf_url', 'pdf_path', 'generated_at',
-          'sent_at', 'send_status', 'whatsapp_status', 'whatsapp_error',
           'customer_session_id', 'server_signature', 'notes', 'created_at', 'updated_at'
         ]) &&
-        data.id is string && data.id == orderId &&
+        data.id == orderId &&
         data.order_number is int && data.order_number >= 1000 && data.order_number <= 99999999 &&
-        data.order_code is string && data.order_code.size() <= 16 && data.order_code.matches('^RK[0-9]{4,8}$') &&
-        data.table_id in ['table_1', 'table_2', 'table_3', 'table_4', 'table_5', 'table_6'] &&
+        data.order_code is string && data.order_code.size() >= 6 && data.order_code.size() <= 16 &&
         data.table_number is int && data.table_number >= 1 && data.table_number <= 6 &&
         data.table_id == 'table_' + string(data.table_number) &&
         data.customer_name is string && data.customer_name.size() >= 2 && data.customer_name.size() <= 80 &&
-        data.customer_mobile is string && data.customer_mobile.size() <= 16 && data.customer_mobile.matches('^\\+91[6-9][0-9]{9}$') &&
-        (!('customer_phone_normalized' in data) || (data.customer_phone_normalized is string && data.customer_phone_normalized.size() == 10 && data.customer_phone_normalized.matches('^[6-9][0-9]{9}$') && '+91' + data.customer_phone_normalized == data.customer_mobile)) &&
+        data.customer_mobile is string && data.customer_mobile.size() == 13 && data.customer_mobile.matches('^\\+91[6-9][0-9]{9}$') &&
+        (!('customer_phone_normalized' in data) || (data.customer_phone_normalized is string && data.customer_phone_normalized.size() == 10 && '+91' + data.customer_phone_normalized == data.customer_mobile)) &&
         data.items is list && data.items.size() >= 1 && data.items.size() <= 20 &&
         isValidOrderLineItem(data.items[0]) &&
         data.item_count is int && data.item_count >= 1 && data.item_count <= 100 &&
         data.subtotal is number && data.subtotal >= 1 && data.subtotal <= 50000 &&
         data.discount is number && data.discount >= 0 && data.discount < data.subtotal &&
         data.total is number && data.total == data.subtotal - data.discount &&
-        isValidOrderMutableFields(data) &&
-        (!('sent_at' in data) || (data.sent_at is string && data.sent_at.size() <= 64)) &&
-        (!('send_status' in data) || data.send_status in ['not_sent', 'sending', 'retrying', 'sent', 'failed']) &&
-        (!('whatsapp_status' in data) || data.whatsapp_status in ['not_sent', 'sending', 'retrying', 'sent', 'failed']) &&
-        (!('whatsapp_error' in data) || (data.whatsapp_error is string && data.whatsapp_error.size() <= 240)) &&
+        data.status == 'pending' &&
+        (!('payment_status' in data) || data.payment_status == 'pending') &&
+        (!('paymentStatus' in data) || data.paymentStatus == 'pending') &&
+        (!('payment_requested_at' in data) || data.payment_requested_at == '') &&
+        (!('paid_at' in data) || data.paid_at == '') &&
+        (!('confirmed_at' in data) || data.confirmed_at == '') &&
+        (!('public_bill_id' in data) || (data.public_bill_id is string && data.public_bill_id.size() <= 64)) &&
+        (!('payment_qr_snapshot' in data) || data.payment_qr_snapshot == null) &&
+        (!('upi_uri' in data) || isSafeUpiUri(data.upi_uri)) &&
+        data.pdf_ready == false &&
+        (!('bill_status' in data) || data.bill_status == 'not_generated') &&
+        (!('pdf_url' in data) || data.pdf_url == '') &&
+        (!('pdf_path' in data) || data.pdf_path == '') &&
+        (!('generated_at' in data) || data.generated_at == '') &&
         data.customer_session_id is string && data.customer_session_id.size() >= 16 && data.customer_session_id.size() <= 128 &&
-        data.customer_session_id.matches('^[a-zA-Z0-9_\\-]+$') &&
         data.server_signature is string && data.server_signature.size() >= 32 && data.server_signature.size() <= 128 &&
-        data.server_signature.matches('^[a-fA-F0-9]+$') &&
         data.notes is string && data.notes.size() <= 200 &&
-        data.created_at is timestamp &&
-        data.updated_at is timestamp;
+        data.created_at == request.time &&
+        data.updated_at == request.time;
     }
 
     // =========================================================================
@@ -353,15 +357,7 @@ service cloud.firestore {
 
       // Customers create verified pending orders (never pre-marked as paid or confirmed).
       allow create: if isValidOrderDocId(orderId) &&
-        isValidOrder(incoming(), orderId) &&
-        incoming().status == 'pending' &&
-        (!('payment_status' in incoming()) || incoming().payment_status in ['pending', 'not_paid']) &&
-        (!('paymentStatus' in incoming()) || incoming().paymentStatus == 'pending') &&
-        (!('payment_requested_at' in incoming()) || incoming().payment_requested_at == '') &&
-        (!('paid_at' in incoming()) || incoming().paid_at == '') &&
-        (!('confirmed_at' in incoming()) || incoming().confirmed_at == '') &&
-        incoming().created_at == request.time &&
-        incoming().updated_at == request.time;
+        isValidNewOrder(incoming(), orderId);
 
       // Partial-update rule: strictly locks all immutable order fields via affectedKeys().hasOnly(...)
       // while validating every mutable field written by Owner (Tier 1) or Customer Actions (Tier 2).

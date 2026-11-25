@@ -8,7 +8,7 @@
         "uid": {
           "type": "string",
           "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$"
+          "pattern": "^[a-zA-Z0-9_-]+$"
         },
         "email": {
           "type": "string",
@@ -42,7 +42,7 @@
         "uid": {
           "type": "string",
           "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$"
+          "pattern": "^[a-zA-Z0-9_-]+$"
         },
         "email": {
           "type": "string",
@@ -64,7 +64,7 @@
         "id": {
           "type": "string",
           "maxLength": 64,
-          "pattern": "^[a-zA-Z0-9_\\-]+$"
+          "pattern": "^[a-zA-Z0-9_-]+$"
         },
         "name": {
           "type": "string",
@@ -141,7 +141,7 @@
         "id": {
           "type": "string",
           "maxLength": 64,
-          "pattern": "^[a-zA-Z0-9_\\-]+$"
+          "pattern": "^[a-zA-Z0-9_-]+$"
         },
         "title": {
           "type": "string",
@@ -226,7 +226,7 @@
         "id": {
           "type": "string",
           "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$"
+          "pattern": "^[a-zA-Z0-9_-]+$"
         },
         "order_number": {
           "type": "number"
@@ -336,7 +336,7 @@
         "public_bill_id": {
           "type": "string",
           "maxLength": 64,
-          "pattern": "^[a-zA-Z0-9_\\-]+$"
+          "pattern": "^[a-zA-Z0-9_-]+$"
         },
         "payment_qr_snapshot": {
           "type": "object"
@@ -388,7 +388,7 @@
           "type": "string",
           "minLength": 16,
           "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$"
+          "pattern": "^[a-zA-Z0-9_-]+$"
         },
         "server_signature": {
           "type": "string",
