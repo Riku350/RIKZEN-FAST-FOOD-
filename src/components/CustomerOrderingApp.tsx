@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { QRCodeSVG } from 'qrcode.react';
 import {
+  AlertCircle,
   ArrowLeft,
   ArrowRight,
   Check,
@@ -16,6 +17,7 @@ import {
   Loader2,
   Lock,
   Minus,
+  PackageSearch,
   Phone,
   Plus,
   QrCode,
@@ -40,6 +42,8 @@ import {
   customerRequestPaymentVerification,
   downloadOrderBillPdf,
   formatIndianMobileDisplay,
+  formatIndianMobileInput,
+  formatOrderDate,
   formatRelativeTime,
   formatRupees,
   getCachedMenuItems,
@@ -48,6 +52,7 @@ import {
   getStoredOrderIdForTable,
   isCancelledOrderStatus,
   isValidIndianMobileDigits,
+  lookupCustomerOrdersByMobile,
   requestOrderBill,
   saveCustomerDetailsLocally,
   setStoredOrderIdForTable,
@@ -71,6 +76,7 @@ import {
   OrderRecord,
   OrderStatus,
   PaymentSettings,
+  RecoverableOrderSummary,
 } from '../types/restaurant';
 import { AmbientFoodBackdrop } from './AmbientFoodBackdrop';
 import { BillPreviewModal } from './BillPreviewModal';
@@ -122,6 +128,37 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
     total: number;
     tableNumber: number;
   } | null>(null);
+
+  const [historyMobile, setHistoryMobile] = useState(() => customerDetails.mobileDigits || '');
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyResult, setHistoryResult] = useState<{
+    found: boolean;
+    count: number;
+    orders: RecoverableOrderSummary[];
+  } | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+
+  const handleFetchOrderHistory = async () => {
+    const cleaned = historyMobile.replace(/\D/g, '').slice(0, 10);
+    if (cleaned.length !== 10) {
+      setHistoryError('Please enter a valid 10-digit mobile number.');
+      return;
+    }
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const res = await lookupCustomerOrdersByMobile(cleaned);
+      setHistoryResult(res);
+      if (!res.found) {
+        setHistoryError('No previous orders found for this mobile number.');
+      }
+    } catch (err) {
+      setHistoryError(err instanceof Error ? err.message : 'Unable to fetch order history.');
+      setHistoryResult(null);
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
 
   // Active real-time order state
   const [activeOrderId, setActiveOrderId] = useState<string | null>(() =>
@@ -2071,7 +2108,7 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
         {/* TAB 4: SHOP INFO                                             */}
         {/* ============================================================ */}
         {activeTab === 'info' && (
-          <div className="max-w-2xl mx-auto">
+          <div className="max-w-2xl mx-auto space-y-6">
             <div className="bg-white rounded-3xl border border-neutral-200 p-6 sm:p-8 space-y-5">
               <div>
                 <p className="text-xs font-semibold text-[#E5391B] mb-1">About Us</p>
@@ -2122,6 +2159,101 @@ export const CustomerOrderingApp: React.FC<CustomerOrderingAppProps> = ({
                   Owner Dashboard
                 </button>
               </div>
+            </div>
+
+            {/* Order History Section */}
+            <div className="bg-white rounded-3xl border border-neutral-200 p-6 sm:p-8 space-y-5">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-orange-50 text-[#E5391B] flex items-center justify-center shrink-0">
+                  <PackageSearch className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-extrabold text-neutral-900">Your Order History</h3>
+                  <p className="text-xs text-neutral-500">View previous orders placed with your mobile number</p>
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                <label className="block text-xs font-bold text-neutral-700">Mobile Number</label>
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm font-semibold text-neutral-500">
+                      +91
+                    </span>
+                    <input
+                      type="tel"
+                      value={historyMobile}
+                      onChange={(e) => setHistoryMobile(formatIndianMobileInput(e.target.value))}
+                      placeholder="62994 75970"
+                      maxLength={12}
+                      className="w-full min-h-[44px] pl-12 pr-4 py-2.5 rounded-xl border border-neutral-300 text-sm font-semibold text-neutral-900 focus:outline-none focus:ring-2 focus:ring-[#E5391B]"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleFetchOrderHistory}
+                    disabled={historyLoading}
+                    className="min-h-[44px] px-5 py-2.5 rounded-xl bg-[#E5391B] hover:bg-[#C82E14] text-white text-xs font-extrabold inline-flex items-center gap-2 cursor-pointer disabled:opacity-60 whitespace-nowrap"
+                  >
+                    {historyLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                    Fetch Orders
+                  </button>
+                </div>
+              </div>
+
+              {historyError && (
+                <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-xs font-semibold text-amber-900 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
+                  {historyError}
+                </div>
+              )}
+
+              {historyResult && historyResult.orders.length > 0 && (
+                <div className="space-y-3 pt-2">
+                  <p className="text-xs font-bold text-neutral-500 uppercase tracking-wider">
+                    Found {historyResult.orders.length} Order{historyResult.orders.length === 1 ? '' : 's'}
+                  </p>
+                  <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
+                    {historyResult.orders.map((ord) => (
+                      <div
+                        key={ord.token || ord.order_code}
+                        className="rounded-2xl border border-neutral-200 bg-neutral-50/60 p-4 space-y-2 hover:border-neutral-300 transition-colors"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-mono font-extrabold text-sm text-neutral-900">
+                            #{ord.order_code}
+                          </span>
+                          <span className="text-xs font-bold text-neutral-600">
+                            Table {ord.table_number}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-neutral-500">
+                            {(() => {
+                              const dt = formatOrderDate(ord.created_at_iso);
+                              return `${dt.date} · ${dt.time}`;
+                            })()}
+                          </span>
+                          <span className="font-extrabold text-neutral-900">{formatRupees(ord.total)}</span>
+                        </div>
+                        <div className="flex items-center justify-between pt-1 border-t border-neutral-200/60">
+                          <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 capitalize">
+                            {ord.status}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => onNavigate(`/bill/${ord.token}`)}
+                            className="text-xs font-extrabold text-[#E5391B] hover:underline inline-flex items-center gap-1 cursor-pointer"
+                          >
+                            View Bill &amp; Status
+                            <ArrowRight className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
