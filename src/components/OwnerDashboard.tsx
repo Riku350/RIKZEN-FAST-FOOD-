@@ -116,6 +116,7 @@ import { buildDynamicUpiUri, DEFAULT_PAYMENT_SETTINGS, isValidUpiId } from '../l
 import {
   playOrderNotificationBell,
   VoiceAlertSettings,
+  VoiceLanguageMode,
   voiceOrderAlertManager,
   VoiceQueueState,
   VoiceSpeed,
@@ -633,6 +634,11 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
 
   const handleChangeVoiceSpeed = (nextSpeed: VoiceSpeed) => {
     const updated = voiceOrderAlertManager.updateSettings({ speed: nextSpeed });
+    setVoiceSettings(updated);
+  };
+
+  const handleChangeVoiceLanguage = (nextLang: VoiceLanguageMode) => {
+    const updated = voiceOrderAlertManager.updateSettings({ language: nextLang });
     setVoiceSettings(updated);
   };
 
@@ -3420,14 +3426,38 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                   </button>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                  {/* Language Selection */}
+                  <div className="rounded-2xl border border-neutral-200 bg-neutral-50 p-4 space-y-2.5">
+                    <p className="text-xs font-bold text-neutral-500">Announcement Language</p>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {(['en', 'hi', 'both'] as const).map((lng) => {
+                        const active = (voiceSettings.language || 'both') === lng;
+                        return (
+                          <button
+                            key={lng}
+                            type="button"
+                            onClick={() => handleChangeVoiceLanguage(lng)}
+                            className={`min-h-[38px] rounded-xl text-xs font-extrabold uppercase cursor-pointer border transition-colors ${
+                              active
+                                ? 'bg-[#E5391B] border-[#E5391B] text-white'
+                                : 'bg-white border-neutral-200 text-neutral-700 hover:bg-neutral-100'
+                            }`}
+                          >
+                            {lng === 'en' ? 'EN' : lng === 'hi' ? 'हिंदी' : 'Both'}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[11px] text-neutral-500">Speaks in English, Hindi, or Both.</p>
+                  </div>
+
                   {/* Voice Selection */}
                   <div className="rounded-2xl border border-neutral-200 bg-neutral-50 p-4 space-y-1.5">
                     <p className="text-xs font-bold text-neutral-500">Voice</p>
                     <p className="text-sm font-extrabold text-neutral-900">Indian Female</p>
                     <p className="text-[11px] text-neutral-600 leading-relaxed">
-                      Natural polite Indian English restaurant staff voice (with automatic browser
-                      en-IN female fallback). Customer mobile numbers are never spoken aloud.
+                      Natural polite Indian staff voice. Customer mobile numbers are never spoken aloud.
                     </p>
                   </div>
 
@@ -3453,7 +3483,7 @@ export const OwnerDashboard: React.FC<OwnerDashboardProps> = ({ onNavigate }) =>
                         );
                       })}
                     </div>
-                    <p className="text-[11px] text-neutral-500">Default: Normal (0.95× natural pace)</p>
+                    <p className="text-[11px] text-neutral-500">Default: Normal (0.95× pace)</p>
                   </div>
 
                   {/* Volume Control */}

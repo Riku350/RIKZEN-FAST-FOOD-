@@ -13,6 +13,8 @@ export type CustomerVoiceEventKey =
   | 'payment_not_received'
   | 'order_cancelled';
 
+export type CustomerVoiceLanguageMode = 'en' | 'hi' | 'both';
+
 export interface CustomerVoiceState {
   enabled: boolean;
   audioUnlocked: boolean;
@@ -24,6 +26,7 @@ export interface CustomerVoiceState {
   lastSpokenText: string | null;
   queueLength: number;
   lastError: string | null;
+  language: CustomerVoiceLanguageMode;
 }
 
 interface CustomerVoiceQueueItem {
@@ -33,7 +36,7 @@ interface CustomerVoiceQueueItem {
   tableNumber: number | null;
   eventKey: CustomerVoiceEventKey;
   eventLabel: string;
-  segments: string[];
+  segments: Array<{ text: string; lang: 'en-IN' | 'hi-IN' }>;
   displayText: string;
   louder?: boolean;
 }
@@ -45,6 +48,7 @@ interface OrderBaselineSnapshot {
 }
 
 const CUSTOMER_VOICE_ENABLED_KEY = 'rikzen_customer_voice_enabled_v1';
+const CUSTOMER_VOICE_LANG_KEY = 'rikzen_customer_voice_lang_v1';
 const CUSTOMER_ANNOUNCED_KEYS_STORAGE = 'rikzen_customer_voice_announced_events_v2';
 const MAX_STORED_ANNOUNCED_KEYS = 250;
 
@@ -83,126 +87,102 @@ function buildCustomerAnnouncementSegments(
   eventKey: CustomerVoiceEventKey,
   orderCode: string,
   tableNumber: number | null,
-): { segments: string[]; displayText: string; louder?: boolean } {
+  language: CustomerVoiceLanguageMode = 'both',
+): { segments: Array<{ text: string; lang: 'en-IN' | 'hi-IN' }>; displayText: string; louder?: boolean } {
   const cleanCode = (orderCode || 'RK1000').toUpperCase();
   const spokenCode = formatSpokenOrderNumber(cleanCode);
 
+  let enText = '';
+  let hiText = '';
+  let louder = false;
+
   switch (eventKey) {
     case 'order_placed':
-      return {
-        segments: [
-          'Your order has been placed successfully at RikZen Fast Food.',
-          `Your order number is ${spokenCode}.`,
-          'We have received your order and it is now waiting for confirmation.',
-          'Please wait while our team confirms your order.',
-        ],
-        displayText: `Your order has been placed successfully at RikZen Fast Food. Your order number is ${cleanCode}. We have received your order and it is now waiting for confirmation.`,
-      };
+      enText = `Your order has been successfully booked. Your order number is ${cleanCode}. Please keep checking your order status.`;
+      hiText = `आपका ऑर्डर सफलतापूर्वक बुक हो गया है। आपका ऑर्डर नंबर ${cleanCode} है। कृपया अपने ऑर्डर की स्थिति चेक करते रहें।`;
+      break;
     case 'order_confirmed':
-      return {
-        segments: [
-          'Good news!',
-          `Your order number ${spokenCode} has been confirmed by RikZen Fast Food.`,
-          'Our team has accepted your order and will now start preparing your food.',
-          'Please wait.',
-        ],
-        displayText: `Good news! Your order number ${cleanCode} has been confirmed by RikZen Fast Food. Our team has accepted your order and will now start preparing your food.`,
-      };
+      enText = `Good news! Your order number ${cleanCode} has been confirmed by RikZen Fast Food.`;
+      hiText = `आपका ऑर्डर स्वीकार कर लिया गया है।`;
+      break;
     case 'order_preparing':
-      return {
-        segments: [
-          `Your order number ${spokenCode} is now being prepared.`,
-          'Our kitchen team is preparing your food fresh for you.',
-          'Please wait a little while.',
-          'Your order will be ready soon.',
-        ],
-        displayText: `Your order number ${cleanCode} is now being prepared. Our kitchen team is preparing your food fresh for you. Your order will be ready soon.`,
-      };
+      enText = `Your order number ${cleanCode} is now being prepared. Our kitchen team is preparing your food fresh.`;
+      hiText = `आपके खाने की तैयारी शुरू हो गई है।`;
+      break;
     case 'order_ready':
+      louder = true;
       if (tableNumber && tableNumber >= 1 && tableNumber <= 6) {
-        return {
-          louder: true,
-          segments: [
-            `Your order number ${spokenCode} is ready now.`,
-            `Our team will serve your order to Table ${tableNumber}.`,
-            'Please wait at your table.',
-          ],
-          displayText: `Your order number ${cleanCode} is ready now. Our team will serve your order to Table ${tableNumber}. Please wait at your table.`,
-        };
+        enText = `Your order number ${cleanCode} is ready now. Our team will serve your order to Table ${tableNumber}.`;
+        hiText = `आपका ऑर्डर तैयार है। टेबल नंबर ${tableNumber} पर सर्व किया जाएगा।`;
+      } else {
+        enText = `Your order number ${cleanCode} is ready now. Please collect your order from the counter.`;
+        hiText = `आपका ऑर्डर तैयार है। कृपया काउंटर से अपना ऑर्डर प्राप्त करें।`;
       }
-      return {
-        louder: true,
-        segments: [
-          `Your order number ${spokenCode} is ready now.`,
-          'Please collect your order from the RikZen Fast Food counter.',
-        ],
-        displayText: `Your order number ${cleanCode} is ready now. Please collect your order from the RikZen Fast Food counter.`,
-      };
+      break;
     case 'order_completed':
-      return {
-        segments: [
-          `Your order number ${spokenCode} has been completed successfully.`,
-          'Thank you for ordering from RikZen Fast Food.',
-          'We hope you enjoy your meal.',
-        ],
-        displayText: `Your order number ${cleanCode} has been completed successfully. Thank you for ordering from RikZen Fast Food. We hope you enjoy your meal.`,
-      };
+      enText = `Your order has been completed successfully. Thank you for visiting RikZen Fast Food.`;
+      hiText = `आपका ऑर्डर पूरा हो गया है। RIKZEN FAST FOOD में आने के लिए धन्यवाद।`;
+      break;
     case 'bill_ready':
-      return {
-        segments: [
-          `Your bill for order number ${spokenCode} is now ready.`,
-          'Please open your bill to check your total amount and payment details.',
-        ],
-        displayText: `Your bill for order number ${cleanCode} is now ready. Please open your bill to check your total amount and payment details.`,
-      };
+      enText = `Your bill for order number ${cleanCode} is now ready. Please open your bill to check details.`;
+      hiText = `आपका बिल तैयार है। कृपया बिल और भुगतान विवरण देखें।`;
+      break;
     case 'payment_qr_available':
-      return {
-        segments: [
-          'Your payment QR code is available on your bill.',
-          'Please scan the QR code using your UPI payment app and complete the payment.',
-          'After making the payment, tap the I Have Paid button to send a verification request to RikZen Fast Food.',
-        ],
-        displayText:
-          'Your payment QR code is available on your bill. Please scan the QR code using your UPI payment app, then tap I Have Paid to send a verification request.',
-      };
+      enText = `Your payment QR code is available on your bill. Please scan and pay using UPI, then tap I Have Paid.`;
+      hiText = `आपका पेमेंट QR कोड तैयार है। स्कैन करके भुगतान करें और I Have Paid बटन दबाएं।`;
+      break;
     case 'payment_verification_requested':
-      return {
-        segments: [
-          'Your payment verification request has been sent successfully to RikZen Fast Food.',
-          'Please wait while our team checks and confirms your payment.',
-        ],
-        displayText:
-          'Your payment verification request has been sent successfully to RikZen Fast Food. Please wait while our team checks and confirms your payment.',
-      };
+      enText = `Your payment verification request has been sent successfully to RikZen Fast Food. Please wait.`;
+      hiText = `आपका पेमेंट वेरिफिकेशन अनुरोध भेज दिया गया है। कृपया पुष्टि की प्रतीक्षा करें।`;
+      break;
     case 'payment_confirmed':
-      return {
-        louder: true,
-        segments: [
-          'Payment received successfully.',
-          `Your payment for order number ${spokenCode} has been verified and confirmed by RikZen Fast Food.`,
-          'Your bill is now fully paid.',
-          'Thank you for your payment.',
-        ],
-        displayText: `Payment received successfully. Your payment for order number ${cleanCode} has been verified and confirmed by RikZen Fast Food. Your bill is now fully paid.`,
-      };
+      louder = true;
+      enText = `Payment received successfully. Your payment for order number ${cleanCode} has been verified and confirmed.`;
+      hiText = `भुगतान सफलतापूर्वक प्राप्त हो गया है। आपका बिल पूरी तरह से चुकता हो गया है।`;
+      break;
     case 'payment_not_received':
-      return {
-        segments: [
-          `We could not confirm your payment for order number ${spokenCode}.`,
-          'Please check your payment details and contact RikZen Fast Food if you need any help.',
-        ],
-        displayText: `We could not confirm your payment for order number ${cleanCode}. Please check your payment details and contact RikZen Fast Food if you need any help.`,
-      };
+      enText = `We could not confirm your payment for order number ${cleanCode}. Please check your payment details.`;
+      hiText = `आपका भुगतान सत्यापित नहीं हो पाया है। कृपया सहायता के लिए संपर्क करें।`;
+      break;
     case 'order_cancelled':
-      return {
-        louder: true,
-        segments: [
-          'We are sorry.',
-          `Your order number ${spokenCode} has been cancelled by RikZen Fast Food.`,
-          'Please contact the shop if you need more information.',
-        ],
-        displayText: `We are sorry. Your order number ${cleanCode} has been cancelled by RikZen Fast Food. Please contact the shop if you need more information.`,
-      };
+      louder = true;
+      enText = `Your order number ${cleanCode} has been cancelled by RikZen Fast Food.`;
+      hiText = `हमें खेद है। आपका ऑर्डर रद्द कर दिया गया है।`;
+      break;
+  }
+
+  const segments: Array<{ text: string; lang: 'en-IN' | 'hi-IN' }> = [];
+  if (language === 'en' || language === 'both') {
+    segments.push({ text: enText, lang: 'en-IN' });
+  }
+  if (language === 'hi' || language === 'both') {
+    segments.push({ text: hiText, lang: 'hi-IN' });
+  }
+
+  return {
+    segments,
+    displayText: language === 'hi' ? hiText : enText,
+    louder,
+  };
+}
+
+function loadLanguagePreference(): CustomerVoiceLanguageMode {
+  if (typeof window === 'undefined') return 'both';
+  try {
+    const raw = window.localStorage.getItem(CUSTOMER_VOICE_LANG_KEY);
+    if (raw === 'en' || raw === 'hi' || raw === 'both') return raw;
+    return 'both';
+  } catch {
+    return 'both';
+  }
+}
+
+function saveLanguagePreference(lang: CustomerVoiceLanguageMode): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(CUSTOMER_VOICE_LANG_KEY, lang);
+  } catch {
+    // Ignore storage errors
   }
 }
 
@@ -428,7 +408,44 @@ class CustomerVoiceAnnouncementManager {
       lastSpokenText: null,
       queueLength: 0,
       lastError: null,
+      language: loadLanguagePreference(),
     };
+  }
+
+  public setLanguage(lang: CustomerVoiceLanguageMode): void {
+    saveLanguagePreference(lang);
+    this.updateState({ language: lang });
+  }
+
+  public getLanguage(): CustomerVoiceLanguageMode {
+    return this.state.language;
+  }
+
+  public async playTestVoice(): Promise<void> {
+    await this.unlockOnUserGesture(false);
+    const testSegments =
+      this.state.language === 'en'
+        ? [{ text: 'Test order voice announcement. Your order number is RK1000. Voice is working correctly.', lang: 'en-IN' as const }]
+        : this.state.language === 'hi'
+        ? [{ text: 'टेस्ट ऑर्डर वॉयस अनाउंसमेंट। आपका ऑर्डर नंबर आर के एक हजार है। आवाज बिल्कुल सही काम कर रही है।', lang: 'hi-IN' as const }]
+        : [
+            { text: 'Test order voice announcement. Your order number is RK1000.', lang: 'en-IN' as const },
+            { text: 'टेस्ट ऑर्डर वॉयस अनाउंसमेंट। आपका ऑर्डर नंबर आर के एक हजार है।', lang: 'hi-IN' as const },
+          ];
+
+    this.queue.push({
+      dedupKey: `test_${Date.now()}`,
+      orderId: 'test_order',
+      orderCode: 'RK1000',
+      tableNumber: 3,
+      eventKey: 'order_confirmed',
+      eventLabel: 'Test Voice',
+      segments: testSegments,
+      displayText: 'Test order voice announcement. Voice is working correctly.',
+      louder: true,
+    });
+    this.updateState({ queueLength: this.queue.length });
+    void this.processQueue();
   }
 
   public getState(): CustomerVoiceState {
@@ -551,7 +568,7 @@ class CustomerVoiceAnnouncementManager {
           tableNumber: null,
           eventKey: 'order_confirmed',
           eventLabel: 'Voice Updates Enabled',
-          segments: ['Order voice updates are now enabled for RikZen Fast Food.'],
+          segments: [{ text: 'Order voice updates are now enabled for RikZen Fast Food.', lang: 'en-IN' }],
           displayText: 'Order voice updates are now enabled for RikZen Fast Food.',
         });
         this.updateState({ queueLength: this.queue.length });
@@ -636,6 +653,7 @@ class CustomerVoiceAnnouncementManager {
       eventKey,
       orderCode,
       tableNumber,
+      this.state.language,
     );
 
     if (!allowRepeatIfNotReceived) {
@@ -988,6 +1006,7 @@ class CustomerVoiceAnnouncementManager {
   private speakSingleBrowserSegment(
     synth: SpeechSynthesis,
     text: string,
+    lang: 'en-IN' | 'hi-IN',
     voice: SpeechSynthesisVoice | null,
     louder: boolean,
   ): Promise<'played' | 'blocked' | 'error'> {
@@ -1005,8 +1024,8 @@ class CustomerVoiceAnnouncementManager {
 
       const normalized = normalizePronunciationForBrowserSpeech(text);
       const utterance = new SpeechSynthesisUtterance(normalized);
-      utterance.lang = voice?.lang || 'en-IN';
-      if (voice) utterance.voice = voice;
+      utterance.lang = lang;
+      if (voice && lang === 'en-IN') utterance.voice = voice;
       utterance.volume = 1.0;
       utterance.rate = louder ? 0.92 : 0.95;
       utterance.pitch = 1.03;
@@ -1079,15 +1098,16 @@ class CustomerVoiceAnnouncementManager {
         const seg = item.segments[i];
         let result = await this.speakSingleBrowserSegment(
           synth,
-          seg,
+          seg.text,
+          seg.lang,
           preferredVoice,
           Boolean(item.louder),
         );
 
         // Safe single retry with default system voice if selected voice failed
-        if (result === 'error' && preferredVoice) {
+        if (result === 'error' && preferredVoice && seg.lang === 'en-IN') {
           preferredVoice = null;
-          result = await this.speakSingleBrowserSegment(synth, seg, null, Boolean(item.louder));
+          result = await this.speakSingleBrowserSegment(synth, seg.text, seg.lang, null, Boolean(item.louder));
         }
 
         if (result === 'blocked') return 'blocked';

@@ -3,6 +3,7 @@ import type { OrderRecord } from '../types/restaurant';
 
 export type VoiceSpeed = 'slow' | 'normal' | 'fast';
 export type VoiceProfile = 'indian_female';
+export type VoiceLanguageMode = 'en' | 'hi' | 'both';
 export type VoiceEngineUsed = 'natural_indian_female' | 'browser_indian_female' | 'unavailable';
 
 export interface VoiceAlertSettings {
@@ -11,6 +12,7 @@ export interface VoiceAlertSettings {
   speed: VoiceSpeed;
   voiceProfile: VoiceProfile;
   soundActivated: boolean;
+  language: VoiceLanguageMode;
 }
 
 export interface VoiceQueueState {
@@ -30,12 +32,12 @@ export interface VoiceQueueItem {
   orderId: string;
   tableNumber: number;
   label: string;
-  segments: string[];
+  segments: Array<{ text: string; lang: 'en-IN' | 'hi-IN' }>;
   fullScript: string;
   isTest?: boolean;
 }
 
-const SETTINGS_STORAGE_KEY = 'rikzen_owner_voice_settings_v1';
+const SETTINGS_STORAGE_KEY = 'rikzen_owner_voice_settings_v2';
 const ANNOUNCED_IDS_STORAGE_KEY = 'rikzen_owner_voice_announced_ids_v1';
 const MAX_STORED_ANNOUNCED_IDS = 400;
 
@@ -45,17 +47,17 @@ export const DEFAULT_VOICE_SETTINGS: VoiceAlertSettings = {
   speed: 'normal',
   voiceProfile: 'indian_female',
   soundActivated: false,
+  language: 'both',
 };
 
-export const TEST_ANNOUNCEMENT_SEGMENTS = [
-  'Attention please. Test announcement.',
-  'New order received. Table three.',
-  'Customer Riku Kumar has ordered two Chicken Rolls and one French Fries.',
-  'Total amount is two hundred and twenty rupees.',
-  'Please confirm the order.',
+export const TEST_ANNOUNCEMENT_SEGMENTS: Array<{ text: string; lang: 'en-IN' | 'hi-IN' }> = [
+  { text: 'Attention please. New order received.', lang: 'en-IN' },
+  { text: 'नया ऑर्डर आया है। टेबल नंबर 3 से ऑर्डर प्राप्त हुआ है।', lang: 'hi-IN' },
+  { text: 'Customer Riku Kumar has ordered Chicken Roll and French Fries.', lang: 'en-IN' },
+  { text: 'कुल बिल चार सौ तिरानबे रुपये है। कृपया स्वीकार करें।', lang: 'hi-IN' },
 ];
 
-export const TEST_ANNOUNCEMENT_SCRIPT = TEST_ANNOUNCEMENT_SEGMENTS.join(' ');
+export const TEST_ANNOUNCEMENT_SCRIPT = TEST_ANNOUNCEMENT_SEGMENTS.map(s => s.text).join(' ');
 
 export function loadVoiceAlertSettings(): VoiceAlertSettings {
   if (typeof window === 'undefined') return { ...DEFAULT_VOICE_SETTINGS };
@@ -71,12 +73,17 @@ export function loadVoiceAlertSettings(): VoiceAlertSettings {
       typeof parsed.volume === 'number' && Number.isFinite(parsed.volume)
         ? Math.max(0, Math.min(100, Math.round(parsed.volume)))
         : 100;
+    const language: VoiceLanguageMode =
+      parsed.language === 'en' || parsed.language === 'hi' || parsed.language === 'both'
+        ? parsed.language
+        : 'both';
     return {
       enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : true,
       volume,
       speed,
       voiceProfile: 'indian_female',
       soundActivated: Boolean(parsed.soundActivated),
+      language,
     };
   } catch {
     return { ...DEFAULT_VOICE_SETTINGS };
@@ -278,56 +285,82 @@ function sanitizeCustomerNameForSpeech(rawName: string | undefined | null): stri
   return stripped.slice(0, 60);
 }
 
+const HINDI_ITEM_MAP: Record<string, string> = {
+  chicken_roll: 'चिकन रोल',
+  double_chicken_egg_roll: 'डबल एग चिकन रोल',
+  paneer_tikka_roll: 'पनीर टिक्का रोल',
+  crispy_chicken_burger: 'क्रिस्पी चिकन बर्गर',
+  classic_veg_cheese_burger: 'क्लासिक वेज चीज बर्गर',
+  french_fries: 'फ्रेंच फ्राइज',
+  peri_peri_fries: 'पेरी-पेरी फ्राइज',
+  crispy_fried_chicken: 'क्रिस्पी फ्राइड चिकन',
+  chicken_popcorn: 'चिकन पॉपकॉर्न',
+  hakka_noodles: 'हक्का नूडल्स',
+  veg_manchurian: 'वेज मंचूरियन',
+  cold_coffee: 'कोल्ड कॉफी',
+  mango_lassi: 'मैंगो लस्सी',
+  chocolate_shake: 'चॉकलेट शेक',
+  choco_lava_cake: 'चोको लावा केक',
+};
+
+const HINDI_DIGITS = ['शून्य', 'एक', 'दो', 'तीन', 'चार', 'पाँच', 'छह', 'सात', 'आठ', 'नौ', 'दस', 'ग्यारह', 'बारह', 'तेरह', 'चौदह', 'पंद्रह', 'सोलह', 'सत्रह', 'अठारह', 'उन्नीस', 'बीस'];
+function numberToHindi(n: number): string {
+  const num = Math.floor(Math.abs(n));
+  if (num <= 20) return HINDI_DIGITS[num] || String(num);
+  return String(num);
+}
+
 /**
  * Builds the clear, natural restaurant announcement segments for an order.
- * Always announces Table first, Customer Name (never phone), EVERY item & quantity,
- * the verified final total in rupees, and "Please confirm the order."
+ * Supports English, Hindi, and Both language modes.
  */
-export function buildOrderAnnouncement(order: OrderRecord): {
-  segments: string[];
+export function buildOrderAnnouncement(
+  order: OrderRecord,
+  language: VoiceLanguageMode = 'both',
+): {
+  segments: Array<{ text: string; lang: 'en-IN' | 'hi-IN' }>;
   fullScript: string;
 } {
   const safeTable = Number.isInteger(order.table_number) ? order.table_number : 1;
   const tableWord = numberToIndianEnglishWords(safeTable);
-  const safeName = sanitizeCustomerNameForSpeech(order.customer_name);
+  const safeName = sanitizeCustomerNameForSpeech(order.customer_name) || 'Guest';
+  const totalAmount = Math.round(Number(order.total) || 0);
 
-  const itemPhrases = (order.items || []).map((line) => {
+  const itemLines = (order.items || []).map((line) => {
     const qty = Math.max(1, Math.round(Number(line.quantity) || 1));
-    const qtyWord = numberToIndianEnglishWords(qty);
-    const itemName = pluralizeItemForSpeech(line.name, qty);
-    return `${qtyWord} ${itemName}`;
+    const enName = pluralizeItemForSpeech(line.name, qty);
+    const hiName = HINDI_ITEM_MAP[line.menu_item_id || ''] || cleanSpokenItemName(line.name);
+    return { qty, enName, hiName };
   });
 
-  let itemsJoined = '';
-  if (itemPhrases.length === 1) {
-    itemsJoined = itemPhrases[0];
-  } else if (itemPhrases.length === 2) {
-    itemsJoined = `${itemPhrases[0]} and ${itemPhrases[1]}`;
-  } else if (itemPhrases.length > 2) {
-    itemsJoined = `${itemPhrases.slice(0, -1).join(', ')}, and ${itemPhrases[itemPhrases.length - 1]}`;
+  const enItemsJoined =
+    itemLines.length === 1
+      ? `${numberToIndianEnglishWords(itemLines[0].qty)} ${itemLines[0].enName}`
+      : itemLines.map((i) => `${numberToIndianEnglishWords(i.qty)} ${i.enName}`).join(', ');
+
+  const hiItemsJoined =
+    itemLines.length === 1
+      ? `${numberToHindi(itemLines[0].qty)} पीस ${itemLines[0].hiName}`
+      : itemLines.map((i) => `${numberToHindi(i.qty)} पीस ${i.hiName}`).join(', ');
+
+  const segments: Array<{ text: string; lang: 'en-IN' | 'hi-IN' }> = [];
+
+  if (language === 'en' || language === 'both') {
+    segments.push({ text: 'Attention please. New order received.', lang: 'en-IN' });
+    segments.push({ text: `Table number ${safeTable}. Customer ${safeName}.`, lang: 'en-IN' });
+    segments.push({ text: `Ordered items: ${enItemsJoined}.`, lang: 'en-IN' });
+    segments.push({ text: `Total bill ${totalAmount} rupees. Please confirm the order.`, lang: 'en-IN' });
   }
 
-  const orderSentence = itemsJoined
-    ? safeName
-      ? `Customer ${safeName} has ordered ${itemsJoined}.`
-      : `Ordered items are ${itemsJoined}.`
-    : safeName
-      ? `Customer ${safeName} has placed an order.`
-      : 'Ordered items are listed on your dashboard.';
-
-  const totalInWords = formatRupeesInWords(order.total);
-
-  const segments = [
-    'Attention please. New order received.',
-    `Table ${tableWord}.`,
-    orderSentence,
-    `Total amount is ${totalInWords}.`,
-    'Please confirm the order.',
-  ];
+  if (language === 'hi' || language === 'both') {
+    segments.push({ text: `नया ऑर्डर आया है। टेबल नंबर ${safeTable} से ऑर्डर प्राप्त हुआ है।`, lang: 'hi-IN' });
+    segments.push({ text: `ग्राहक का नाम ${safeName} है। ऑर्डर में ${hiItemsJoined} है।`, lang: 'hi-IN' });
+    segments.push({ text: `कुल बिल ${totalAmount} रुपये है। कृपया नया ऑर्डर चेक करें और स्वीकार करें।`, lang: 'hi-IN' });
+  }
 
   return {
     segments,
-    fullScript: segments.join(' '),
+    fullScript: segments.map((s) => s.text).join(' '),
   };
 }
 
@@ -975,6 +1008,7 @@ class VoiceOrderAnnouncementManager {
   private speakSingleSegment(
     synth: SpeechSynthesis,
     segmentText: string,
+    lang: 'en-IN' | 'hi-IN',
     preferredVoice: SpeechSynthesisVoice | null,
     speechRate: number,
     vol: number,
@@ -992,8 +1026,8 @@ class VoiceOrderAnnouncementManager {
       };
 
       const utterance = new SpeechSynthesisUtterance(segmentText);
-      utterance.lang = preferredVoice?.lang || 'en-IN';
-      if (preferredVoice) {
+      utterance.lang = lang;
+      if (preferredVoice && lang === 'en-IN') {
         utterance.voice = preferredVoice;
       }
       utterance.rate = speechRate;
@@ -1028,7 +1062,7 @@ class VoiceOrderAnnouncementManager {
   }
 
   private async trySpeakViaBrowserSynthesis(
-    segments: string[],
+    segments: Array<{ text: string; lang: 'en-IN' | 'hi-IN' }>,
   ): Promise<'played' | 'autoplay_blocked' | 'unavailable'> {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
       return 'unavailable';
@@ -1066,20 +1100,21 @@ class VoiceOrderAnnouncementManager {
     try {
       for (let i = 0; i < segments.length; i++) {
         if (this.cancelledCurrent) return 'played';
-        const segmentText = segments[i];
+        const seg = segments[i];
 
         let result = await this.speakSingleSegment(
           synth,
-          segmentText,
+          seg.text,
+          seg.lang,
           preferredVoice,
           speechRate,
           vol,
         );
 
         // If a specific selected voice errored on this device, retry once with default system voice
-        if (result === 'error' && preferredVoice) {
+        if (result === 'error' && preferredVoice && seg.lang === 'en-IN') {
           preferredVoice = null;
-          result = await this.speakSingleSegment(synth, segmentText, null, speechRate, vol);
+          result = await this.speakSingleSegment(synth, seg.text, seg.lang, null, speechRate, vol);
         }
 
         if (result === 'blocked') return 'autoplay_blocked';

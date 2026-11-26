@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { CheckCircle2, Volume2, VolumeX } from 'lucide-react';
-import { customerVoiceManager, CustomerVoiceState } from '../lib/customerVoiceManager';
+import { CheckCircle2, Volume2, VolumeX, Sparkles } from 'lucide-react';
+import { customerVoiceManager, CustomerVoiceState, CustomerVoiceLanguageMode } from '../lib/customerVoiceManager';
 
 interface CustomerVoiceBannerProps {
   compact?: boolean;
@@ -29,6 +29,14 @@ export const CustomerVoiceBanner: React.FC<CustomerVoiceBannerProps> = ({ compac
     } else {
       void customerVoiceManager.unlockOnUserGesture(false);
     }
+  };
+
+  const handleTestVoice = async () => {
+    await customerVoiceManager.playTestVoice();
+  };
+
+  const handleLanguageChange = (lang: CustomerVoiceLanguageMode) => {
+    customerVoiceManager.setLanguage(lang);
   };
 
   return (
@@ -79,45 +87,71 @@ export const CustomerVoiceBanner: React.FC<CustomerVoiceBannerProps> = ({ compac
                   {voiceState.lastError || 'Tap here to enable order voice updates.'}
                 </p>
                 <p className="text-[11px] opacity-80">
-                  Hear live voice announcements for confirmed, preparing, ready &amp; payment status.
+                  Hear live voice announcements in English &amp; Hindi for your order.
                 </p>
               </>
             ) : voiceState.audioUnlocked && voiceState.enabled ? (
               <>
                 <p className="text-xs sm:text-sm font-extrabold text-emerald-800 inline-flex items-center gap-1.5">
                   <CheckCircle2 className="w-4 h-4 shrink-0" />
-                  Voice Updates Enabled
+                  Voice Updates Enabled ({voiceState.language.toUpperCase()})
                 </p>
                 <p className="text-[11px] text-neutral-500">
                   {voiceState.lastSpokenText
-                    ? `Last update: "${voiceState.lastSpokenText.slice(0, 72)}${voiceState.lastSpokenText.length > 72 ? '…' : ''}"`
-                    : 'You will hear live updates automatically as your order progresses.'}
+                    ? `Last: "${voiceState.lastSpokenText.slice(0, 60)}…"`
+                    : 'Listening for real-time kitchen &amp; delivery updates.'}
                 </p>
               </>
             ) : (
               <>
                 <p className="text-xs sm:text-sm font-extrabold">
-                  Live Order Voice Announcements
+                  Live Order Voice Announcements (English / हिंदी)
                 </p>
                 <p className="text-[11px] text-neutral-300">
-                  Tap once to hear real-time voice alerts for kitchen &amp; payment updates.
+                  Tap to enable real-time voice updates for your food order.
                 </p>
               </>
             )}
           </div>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {/* Language Selector */}
+          <div className="inline-flex rounded-xl bg-neutral-100 p-0.5 border border-neutral-200 text-xs font-bold">
+            {(['en', 'hi', 'both'] as const).map((l) => (
+              <button
+                key={l}
+                type="button"
+                onClick={() => handleLanguageChange(l)}
+                className={`px-2.5 py-1 rounded-lg uppercase transition-colors cursor-pointer ${
+                  voiceState.language === l
+                    ? 'bg-[#E5391B] text-white shadow-sm'
+                    : 'text-neutral-700 hover:text-neutral-900'
+                }`}
+              >
+                {l === 'en' ? 'EN' : l === 'hi' ? 'हिंदी' : 'Both'}
+              </button>
+            ))}
+          </div>
+
+          <button
+            type="button"
+            onClick={handleTestVoice}
+            title="Test Voice Announcement"
+            className="min-h-[36px] px-3 py-1.5 rounded-xl border border-neutral-200 bg-neutral-50 hover:bg-neutral-100 text-neutral-800 text-xs font-extrabold inline-flex items-center gap-1 cursor-pointer transition-colors"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-amber-500" />
+            Test Voice
+          </button>
+
           {needsEnableTap ? (
             <button
               type="button"
               onClick={handleEnableClick}
-              className="min-h-[40px] px-4 py-2 rounded-xl bg-[#E5391B] hover:bg-[#C82E14] text-white text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer transition-colors whitespace-nowrap"
+              className="min-h-[36px] px-3.5 py-1.5 rounded-xl bg-[#E5391B] hover:bg-[#C82E14] text-white text-xs font-extrabold inline-flex items-center gap-1.5 cursor-pointer transition-colors whitespace-nowrap"
             >
-              <Volume2 className="w-4 h-4" />
-              {voiceState.autoplayBlocked
-                ? 'Tap to Enable Voice Updates'
-                : 'Enable Voice Updates'}
+              <Volume2 className="w-3.5 h-3.5" />
+              Enable
             </button>
           ) : (
             <button
